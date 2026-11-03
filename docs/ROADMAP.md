@@ -4,7 +4,7 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 
 ## P0 — Foundation
 - [x] Scaffold, paper/live config, `account`, review fixes
-- [ ] ⛔ Alpaca paper keys in `.env`; `cargo run -- account` prints a validated account
+- [x] Alpaca paper keys (Keychain or `.env`); `cargo run -- account` prints a validated account
 - [ ] ⛔ OmniRoute and Anthropic test calls (needed by P4, not P1)
 
 ## P1 — Research lab

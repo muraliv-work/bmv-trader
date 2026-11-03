@@ -181,6 +181,17 @@ pub fn trend(bars: &[Bar], min_bars: usize) -> Trend {
 /// earlier bars today. Bad bars, out-of-order bars, or bad params mean no candidate.
 pub fn orb_long(symbol: &str, session_open: i64, bars: &[Bar], p: &OrbParams) -> Option<Candidate> {
     let v = Today::after_range(session_open, bars, p)?;
+    let avg_volume = first_breakout(&v)?;
+    let atr = atr(bars, p.atr_len)?;
+    let reason = format!(
+        "ORB{} long: close {:.2} > OR high {:.2}; volume {} > avg {:.0}; ATR {:.2}",
+        p.or_minutes, v.cur.close, v.or_high, v.cur.volume, avg_volume, atr
+    );
+    long_with_exits(symbol, v.cur.close, v.or_low, atr, p, reason)
+}
+
+/// `v.cur` is the first close above the range high, on above-average volume: returns that average.
+fn first_breakout(v: &Today) -> Option<f64> {
     let broke_out_before = v
         .earlier
         .iter()
@@ -190,15 +201,108 @@ pub fn orb_long(symbol: &str, session_open: i64, bars: &[Bar], p: &OrbParams) ->
     }
     let avg_volume =
         v.earlier.iter().map(|b| b.volume as f64).sum::<f64>() / v.earlier.len() as f64;
-    if v.cur.volume as f64 <= avg_volume {
+    (v.cur.volume as f64 > avg_volume).then_some(avg_volume)
+}
+
+/// Gap-and-go (DESIGN §7b, trial 4): only on a day the first bar opens at least `GAP_MIN_FRAC` above
+/// yesterday's last regular-hours close. Then the ORB rule over a 5-minute range (at least 3 bars),
+/// and the gap still open at the signal (close above yesterday's close). ATR over today's bars so
+/// far (up to `atr_len`, at least 4). Same stop rule, target and sizing.
+pub fn gap_long(
+    symbol: &str,
+    session_open: i64,
+    bars: &[Bar],
+    prev_close: f64,
+    p: &OrbParams,
+) -> Option<Candidate> {
+    const GAP_MIN_FRAC: f64 = 0.01;
+    let range = OrbParams {
+        or_minutes: 5,
+        min_or_bars: 3,
+        ..p.clone()
+    };
+    let v = Today::after_range(session_open, bars, &range)?;
+    if !(prev_close.is_finite() && prev_close > 0.0) {
         return None;
     }
-    let atr = atr(bars, p.atr_len)?;
+    let gap = bars[0].open / prev_close - 1.0;
+    if gap < GAP_MIN_FRAC || v.cur.close <= prev_close {
+        return None;
+    }
+    let avg_volume = first_breakout(&v)?;
+    // The breakout usually comes before 14 true ranges exist: use what today has, at least 4.
+    let atr = atr(bars, p.atr_len.min(bars.len() - 1)).filter(|_| bars.len() > 4)?;
     let reason = format!(
-        "ORB{} long: close {:.2} > OR high {:.2}; volume {} > avg {:.0}; ATR {:.2}",
-        p.or_minutes, v.cur.close, v.or_high, v.cur.volume, avg_volume, atr
+        "gap-and-go long: gap {:.2}% over {prev_close:.2}; close {:.2} > 5-min high {:.2}; volume {} > avg {avg_volume:.0}; ATR {atr:.2}",
+        gap * 100.0,
+        v.cur.close,
+        v.or_high,
+        v.cur.volume
     );
     long_with_exits(symbol, v.cur.close, v.or_low, atr, p, reason)
+}
+
+/// VWAP pullback (DESIGN §7c, trial 5), on the first bar of the day, from 10:00 on, where:
+/// today trends up (close above VWAP and the first open), one of the 3 bars before it touched
+/// VWAP (low at or below VWAP then), and it closes above VWAP and the previous bar's high.
+/// Stop: the closer of the 3-bar pullback low and close − k × ATR. Same target and sizing as ORB.
+pub fn vwap_pullback_long(
+    symbol: &str,
+    session_open: i64,
+    bars: &[Bar],
+    p: &OrbParams,
+) -> Option<Candidate> {
+    const LOOKBACK: usize = 3;
+    // 30 minutes before any signal, at least 20 bars of them: VWAP and the trend need history.
+    let warmup = OrbParams {
+        or_minutes: 30,
+        min_or_bars: 20,
+        ..p.clone()
+    };
+    let v = Today::after_range(session_open, bars, &warmup)?;
+    let vwap = running_vwap(bars)?;
+    let first_open = bars[0].open;
+    let signal = |i: usize| {
+        let b = &bars[i];
+        i >= LOOKBACK
+            && b.ts >= v.or_end
+            && b.close > vwap[i]
+            && b.close > first_open
+            && b.close > bars[i - 1].high
+            && (i - LOOKBACK..i).any(|j| bars[j].low <= vwap[j])
+    };
+    let last = bars.len() - 1;
+    if !signal(last) || (0..last).any(signal) {
+        return None;
+    }
+    let pullback_low = bars[last - LOOKBACK..last]
+        .iter()
+        .map(|b| b.low)
+        .reduce(f64::min)?;
+    let atr = atr(bars, p.atr_len)?;
+    let reason = format!(
+        "VWAP pullback long: close {:.2} > VWAP {:.2} and prior high {:.2}; pullback low {pullback_low:.2}; ATR {atr:.2}",
+        v.cur.close,
+        vwap[last],
+        bars[last - 1].high
+    );
+    long_with_exits(symbol, v.cur.close, pullback_low, atr, p, reason)
+}
+
+/// VWAP after each bar (typical price × volume); None if no volume has traded by the last bar.
+/// Before the first traded volume, VWAP is the bar's typical price.
+fn running_vwap(bars: &[Bar]) -> Option<Vec<f64>> {
+    let (mut pv, mut vol) = (0.0, 0.0);
+    let out: Vec<f64> = bars
+        .iter()
+        .map(|b| {
+            let typical = (b.high + b.low + b.close) / 3.0;
+            pv += typical * b.volume as f64;
+            vol += b.volume as f64;
+            if vol > 0.0 { pv / vol } else { typical }
+        })
+        .collect();
+    (vol > 0.0).then_some(out)
 }
 
 /// Random-entry control for the P1 gate (DESIGN §13): the same day, data checks, stop, target and
@@ -359,6 +463,78 @@ mod tests {
 
     fn run(bars: &[Bar]) -> Option<Candidate> {
         orb_long("SPY", OPEN, bars, &OrbParams::default())
+    }
+
+    fn gap(bars: &[Bar], prev_close: f64) -> Option<Candidate> {
+        gap_long("SPY", OPEN, bars, prev_close, &OrbParams::default())
+    }
+
+    /// 5 range bars between 100.00 and 101.00 (first open 100.50), then a breakout at minute 5.
+    fn gap_day() -> Vec<Bar> {
+        let mut bars: Vec<Bar> = (0..5).map(|m| bar(m, 101.0, 100.0, 100.5, 1000)).collect();
+        bars.push(bar(5, 101.6, 100.9, 101.5, 3000));
+        bars
+    }
+
+    #[test]
+    fn gap_and_go_needs_a_gap_of_one_percent_still_open() {
+        let c = gap(&gap_day(), 99.0).expect("1.5% gap and a breakout should fire");
+        // ATR(4) = (3 × 1.00 + 1.10) / 4 = 1.025 → ATR stop 99.96 < range low 100.00
+        assert_eq!(cents(&c), (10_150, 10_000, 10_450));
+        assert!(c.reason().contains("gap 1.52%"), "{}", c.reason());
+        assert_eq!(gap(&gap_day(), 100.0), None, "0.5% is no gap");
+        assert_eq!(gap(&gap_day(), 101.6), None, "gap down / filled");
+        assert_eq!(gap(&gap_day(), f64::NAN), None);
+        assert_eq!(gap(&gap_day(), 0.0), None);
+        assert_eq!(
+            gap(&gap_day()[..5], 99.0),
+            None,
+            "no signal inside the range"
+        );
+        let mut late = gap_day();
+        late.insert(5, bar(5, 101.3, 100.9, 101.2, 3000)); // an earlier breakout took the day
+        for (m, b) in late.iter_mut().enumerate() {
+            b.ts = OPEN + m as i64 * 60;
+        }
+        assert_eq!(gap(&late, 99.0), None);
+    }
+
+    fn vwap(bars: &[Bar]) -> Option<Candidate> {
+        vwap_pullback_long("SPY", OPEN, bars, &OrbParams::default())
+    }
+
+    /// 30 flat bars around 100.00 (each touches VWAP), then an up bar at `minute`.
+    fn vwap_day(minute: i64) -> Vec<Bar> {
+        let mut bars: Vec<Bar> = (0..minute)
+            .map(|m| bar(m, 100.5, 99.5, 100.0, 1000))
+            .collect();
+        bars.push(bar(minute, 101.0, 100.2, 100.9, 1000));
+        bars
+    }
+
+    #[test]
+    fn vwap_pullback_fires_on_the_first_resumption_after_ten() {
+        let c = vwap(&vwap_day(30)).expect("resumption above VWAP after a touch");
+        // pullback low 99.50 vs ATR stop 100.90 − 1.5 × 1.00 = 99.40: the closer is 99.50
+        assert_eq!(cents(&c), (10_090, 9_950, 10_370));
+        assert!(c.reason().starts_with("VWAP pullback"), "{}", c.reason());
+        assert_eq!(vwap(&vwap_day(20)), None, "not before 10:00");
+        let mut second = vwap_day(30);
+        second.push(bar(31, 100.8, 99.9, 100.3, 1000));
+        second.push(bar(32, 101.4, 100.4, 101.3, 1000));
+        assert_eq!(vwap(&second), None, "only the first signal of the day");
+        let mut down = vwap_day(30);
+        let last = down.last_mut().unwrap();
+        (last.high, last.low, last.close) = (100.6, 99.0, 99.2);
+        assert_eq!(vwap(&down), None, "below VWAP and the first open");
+        let mut no_touch: Vec<Bar> = (0..30)
+            .map(|m| {
+                let p = 100.0 + m as f64 * 0.5; // a steady climb never comes back to VWAP
+                bar(m, p + 0.2, p - 0.1, p + 0.1, 1000)
+            })
+            .collect();
+        no_touch.push(bar(30, 115.5, 115.1, 115.4, 1000));
+        assert_eq!(vwap(&no_touch), None, "no pullback, no trade");
     }
 
     #[test]

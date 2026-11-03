@@ -49,6 +49,10 @@ pub enum Entry {
     Orb,
     /// The P1 control: same exits and sizing, no signal (research only; refused in live mode).
     Random { seed: u64 },
+    /// Gap-and-go (DESIGN §7b): needs `Event::PrevClose`, which only the backtest sends yet.
+    Gap,
+    /// VWAP pullback (DESIGN §7c).
+    VwapPullback,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +66,11 @@ pub enum Event {
     },
     /// The clock, so time-based rules fire even when no bars arrive.
     Tick(i64),
+    /// Yesterday's last regular-hours close for a symbol, after SessionStart (gap-and-go only).
+    PrevClose {
+        symbol: String,
+        close: f64,
+    },
     Bar {
         symbol: String,
         bar: Bar,
@@ -223,6 +232,8 @@ pub struct State {
     now: i64,
     bars: BTreeMap<String, Vec<Bar>>,
     marks: BTreeMap<String, Price>,
+    /// Today's `Event::PrevClose` values; cleared at SessionStart.
+    prev_close: BTreeMap<String, f64>,
     trades: BTreeMap<String, Trade>,
     seq: u32,
     kill_switch: bool,
@@ -240,7 +251,10 @@ impl State {
         risk::self_test(&limits)?;
         settings.orb.validate()?;
         if limits.mode() == crate::config::Mode::Live && settings.entry != Entry::Orb {
-            return Err("the random-entry baseline is for research only, never live".into());
+            return Err(format!(
+                "only ORB may trade live; {:?} is research only",
+                settings.entry
+            ));
         }
         Ok(State {
             limits,
@@ -249,6 +263,7 @@ impl State {
             now: 0,
             bars: BTreeMap::new(),
             marks: BTreeMap::new(),
+            prev_close: BTreeMap::new(),
             trades: BTreeMap::new(),
             seq: 0,
             kill_switch: false,
@@ -332,6 +347,11 @@ impl State {
             Event::Tick(ts) => {
                 self.now = self.now.max(ts);
                 self.housekeeping(&mut out);
+            }
+            Event::PrevClose { symbol, close } => {
+                if self.session.is_some() {
+                    self.prev_close.insert(symbol, close);
+                }
             }
             Event::Bar { symbol, bar } => self.on_bar(symbol, bar, &mut out),
             Event::Vetted { id, verdict } => self.on_vetted(id, verdict, &mut out),
@@ -427,6 +447,7 @@ impl State {
         self.now = open;
         self.bars.clear();
         self.marks.clear();
+        self.prev_close.clear();
         self.seq = 0;
         self.realized = Usd::ZERO;
         self.consecutive_losses = 0;
@@ -504,6 +525,11 @@ impl State {
         let candidate = match self.settings.entry {
             Entry::Orb => strategy::orb_long(&symbol, open, bars, p),
             Entry::Random { seed } => strategy::random_long(&symbol, open, bars, p, seed),
+            Entry::Gap => self
+                .prev_close
+                .get(&symbol)
+                .and_then(|&pc| strategy::gap_long(&symbol, open, bars, pc, p)),
+            Entry::VwapPullback => strategy::vwap_pullback_long(&symbol, open, bars, p),
         };
         if let Some(c) = candidate {
             self.on_candidate(c, out);

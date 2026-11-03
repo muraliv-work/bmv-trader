@@ -145,6 +145,8 @@ pub fn run(days: &[Day], settings: Settings, model: FillModel) -> Result<Vec<Day
         day: DayResult::default(),
     };
     let mut results = Vec::with_capacity(days.len());
+    // Each symbol's last close of the previous loaded day; a symbol without bars that day has none.
+    let mut prev_close: BTreeMap<String, f64> = BTreeMap::new();
     for day in days {
         sim.day = DayResult {
             date: day.date.clone(),
@@ -160,6 +162,9 @@ pub fn run(days: &[Day], settings: Settings, model: FillModel) -> Result<Vec<Day
                 buying_power: sim.model.buying_power,
             },
         );
+        for (symbol, close) in std::mem::take(&mut prev_close) {
+            sim.drive(&mut engine, Event::PrevClose { symbol, close });
+        }
         let mut bars = day.bars.clone();
         bars.sort_by(|(sa, a), (sb, b)| a.ts.cmp(&b.ts).then_with(|| sa.cmp(sb)));
         for minute in bars.chunk_by(|(_, a), (_, b)| a.ts == b.ts) {
@@ -191,6 +196,7 @@ pub fn run(days: &[Day], settings: Settings, model: FillModel) -> Result<Vec<Day
             ));
         }
         sim.day.halted = engine.halted();
+        prev_close = sim.last_close.clone();
         results.push(std::mem::take(&mut sim.day));
     }
     Ok(results)

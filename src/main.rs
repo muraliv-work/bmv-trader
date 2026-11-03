@@ -14,7 +14,7 @@ const USAGE: &str = "usage:
   bmv-trader run      [--symbols ...] [--trend] [--marketable]   one paper session (PAPER ONLY; live is P5)
   bmv-trader flatten                      close every position and confirm (any mode)
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
-  bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--symbols ...] [--fold-days 21]
+  bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--strategy orb|gap|vwap] [--symbols ...] [--fold-days 21]
                       [--seeds 5] [--holdout] [--holdout-again] [--trend] [--marketable]
 
 The holdout start date is pinned in data/holdout_from on the first backtest (the last 63 sessions
@@ -30,7 +30,8 @@ const MAX_SEEDS: usize = 50;
 
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
-const VALUE_FLAGS: [&str; 6] = [
+const VALUE_FLAGS: [&str; 7] = [
+    "--strategy",
     "--from",
     "--to",
     "--symbols",
@@ -154,6 +155,16 @@ fn main() {
                     holdout_again: args.has("--holdout-again"),
                     trend: args.has("--trend"),
                     orb: orb_params(&args),
+                    strategy: match args.get("--strategy").unwrap_or("orb") {
+                        "orb" => Strategy::Orb,
+                        "gap" => Strategy::Gap,
+                        "vwap" => Strategy::Vwap,
+                        other => {
+                            return Err(format!(
+                                "--strategy must be orb, gap or vwap, got {other:?}"
+                            ));
+                        }
+                    },
                 };
                 run_backtest(&from, &to, &args.symbols()?, &opts)
             }
@@ -395,6 +406,33 @@ struct Opts {
     /// Only trade while SPY and the symbol trend up today; a separate trial from plain ORB.
     trend: bool,
     orb: OrbParams,
+    strategy: Strategy,
+}
+
+/// Which entry rule a backtest trial uses (DESIGN §7, §7b, §7c). Exits and sizing are shared.
+#[derive(Clone, Copy, Debug)]
+enum Strategy {
+    Orb,
+    Gap,
+    Vwap,
+}
+
+impl Strategy {
+    fn entry(self) -> Entry {
+        match self {
+            Strategy::Orb => Entry::Orb,
+            Strategy::Gap => Entry::Gap,
+            Strategy::Vwap => Entry::VwapPullback,
+        }
+    }
+    /// The trial name prefix in data/trials.jsonl.
+    fn name(self) -> &'static str {
+        match self {
+            Strategy::Orb => "orb",
+            Strategy::Gap => "gap",
+            Strategy::Vwap => "vwap",
+        }
+    }
 }
 
 /// The one pre-registered entry variant: a fixed buffer, not a tunable knob, so it's one trial.
@@ -481,7 +519,8 @@ fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<()
         let seen = std::fs::read_to_string(&log)
             .unwrap_or_default()
             .lines()
-            .any(|l| l.contains("\"orb-holdout\"") && l.contains(&cut_date));
+            // any strategy's look at this holdout spends it
+            .any(|l| l.contains("-holdout\"") && l.contains(&cut_date));
         if seen && !o.holdout_again {
             return Err(format!(
                 "the holdout from {cut_date} was already evaluated (see {}); pass --holdout-again only if you mean to spend it twice",
@@ -499,7 +538,7 @@ fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<()
         trend_filter: o.trend,
     };
     let span = if o.holdout { &days[..] } else { research_days };
-    let results = backtest::run(span, settings(Entry::Orb), FillModel::default())?;
+    let results = backtest::run(span, settings(o.strategy.entry()), FillModel::default())?;
     let (research, holdout) = results.split_at(cut);
     let mut baseline = Vec::new();
     for seed in 1..=o.seeds as u64 {
@@ -514,9 +553,10 @@ fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<()
     let ci = stats::bootstrap_expectancy(&stats::r_by_day(research), 2_000, 0.05, 42);
     let period = format!("{}..{}", research_days[0].date, research_days[cut - 1].date);
     let when = chrono::Utc::now().to_rfc3339();
-    let params = format!("{orb:?} trend_filter={}", o.trend);
+    let params = format!("{:?} {orb:?} trend_filter={}", o.strategy, o.trend);
     let strategy_name = format!(
-        "orb{}{}",
+        "{}{}{}",
+        o.strategy.name(),
         if o.trend { "+trend" } else { "" },
         if o.orb.entry_buffer_bps > 0 {
             "+mkt"

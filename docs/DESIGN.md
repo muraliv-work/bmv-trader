@@ -205,6 +205,31 @@ On a half-day (close at 13:00), all of this shifts automatically.
 - **Optional trend filter (`--trend`, its own trial):** a breakout is taken only while both SPY and the symbol trend **up** today: last close above today's VWAP and above today's first open. Too few bars, bad bars, no volume or missing SPY bars mean "can't tell", so no trade. The random baseline uses the same filter, so the comparison still isolates the entry signal.
 - **Shorts:** off in v1
 
+## 7b. Trial 4: gap-and-go (pre-registered 2026-11-03, before any run)
+
+- **Universe, exits, sizing, costs, fill model:** as ORB (§7, §13). Long only.
+- **Yesterday's close:** the last regular-hours close of the previous loaded day. This is the one exception to "today's bars only". A symbol with no bars that day has no close, so no trade. Only the backtest provides it (`Event::PrevClose`); `run` stays ORB-only.
+- **Gap:** today's first bar opens **at least +1.0%** above yesterday's close.
+- **Entry:** the ORB rule over a **5-minute range (at least 3 bars)**. The first close above the range high, on volume above today's average so far, with the close still above yesterday's close (gap not filled).
+- **Stop:** the closer of the 5-minute range low and entry − 1.5 × ATR. ATR uses today's bars so far: up to 14 true ranges, and at least 4.
+- **Target:** 2R.
+- No parameter search: these values are fixed before the first run.
+
+## 7c. Trial 5: VWAP pullback (pre-registered 2026-11-03, before any run)
+
+- **Universe, exits, sizing, costs, fill model:** as ORB. Long only.
+- **Warm-up:** no signal before **10:00 ET**, and at least 20 bars in the first 30 minutes.
+- **Signal bar**, which must be the **first** bar of the day to meet all of these:
+  - it closes above today's running VWAP (typical price × volume)
+  - it closes above today's first open (day trending up)
+  - it closes above the previous bar's high (the move resumed)
+  - one of the 3 bars before it had a low at or below VWAP at that time (it pulled back to VWAP)
+- **Stop:** the closer of the 3-bar pullback low and entry − 1.5 × ATR(14).
+- **Target:** 2R.
+- No parameter search.
+
+**Both trials count toward the gate.** With trials 1–3, that makes 5 trials, and the Bonferroni correction applies to all of them. Neither gets a `--trend` or `--marketable` variant unless that is pre-registered as a further trial.
+
 ## 8. Decision pipeline (one candidate)
 
 1. **Strategy** emits a `Candidate`, which is journaled.
