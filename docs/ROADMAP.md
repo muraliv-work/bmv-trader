@@ -18,7 +18,7 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 - [x] `history.rs`: Alpaca bars `feed=iex`, throttled, resumable cache in `data/`; tested on saved responses (tier 2)
 - [x] CLI: `fetch`, `backtest` (tier 3)
 - [x] Download history: IEX 2020-08-03 → 2025-12-31, 1,361 sessions, 1 gap day (2025-03-10)
-- [ ] ⛔ P1 gate: **not passed** by 6 trials: ORB (1), ORB + trend (2), ORB + marketable (3), gap-and-go on mega-caps (4), VWAP pullback (5), gap-and-go on scanned gappers (6, −0.26R). Intraday long-only rules closed for now; owner decides the direction (DECISION R8)
+- [ ] ⛔ P1 gate: **not passed** by 7 trials: ORB (1), ORB + trend (2), ORB + marketable (3), gap-and-go on mega-caps (4), VWAP pullback (5), gap-and-go on scanned gappers (6, −0.26R), monthly 12-1 momentum (7, CAGR 9.9% vs SPY 14.9%). Intraday long-only rules and plain momentum closed; owner decides the direction (DECISION R8)
 
 ## P2 — Safety core
 - [x] Broker orders: bracket submit (idempotent client_order_id), cancel, `close_all`, OCO for partial fills, typed Order/Position (tier 1). Send-once `Bracket`, `Exits` token for the OCO, typed `Cancel`, `close_position`; Alpaca error codes still **[verify codes]**
