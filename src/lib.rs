@@ -13,3 +13,4 @@ pub mod safety;
 pub mod stats;
 pub mod strategy;
 pub mod vetting;
+pub mod watch;

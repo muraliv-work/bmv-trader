@@ -9,6 +9,7 @@ use std::process::exit;
 const USAGE: &str = "usage:
   bmv-trader account
   bmv-trader status                       account, positions and open orders (read-only)
+  bmv-trader watch                        live read-only monitor, refreshes every 5 s (Ctrl-C quits)
   bmv-trader run      [--symbols ...] [--trend] [--marketable]   one paper session (PAPER ONLY; live is P5)
   bmv-trader flatten                      close every position and confirm (any mode)
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
@@ -128,6 +129,7 @@ fn main() {
         match all.first().map(String::as_str) {
             Some("account") => account(),
             Some("status") => status(),
+            Some("watch") => watch(),
             Some("flatten") => flatten(),
             Some("run") => run(&args.symbols()?, args.has("--trend"), orb_params(&args)),
             Some("fetch") => {
@@ -200,6 +202,100 @@ fn status() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Read-only monitor. Alpaca errors are shown and retried next refresh, never fatal.
+fn watch() -> Result<(), String> {
+    use bmv_trader::{safety, watch};
+    let mode = format!("{:?}", config::load()?.mode()).to_uppercase();
+    let a = connect()?;
+    let home = config::home()?;
+    let (journal, stop) = (live::journal_path(&home), safety::stop_path(&home));
+    loop {
+        let mut out = String::from("\x1b[2J\x1b[H"); // clear screen, cursor home
+        let now = chrono::Utc::now().timestamp();
+        let text = match std::fs::read_to_string(&journal) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => format!("{{\"unreadable journal\": \"{e}\"}}"),
+        };
+        let s = watch::summarize(&text, 12);
+        let stop_file = match safety::kill_switch(&stop) {
+            safety::KillSwitch::Clear => "clear".to_string(),
+            safety::KillSwitch::Engaged(why) => format!("ENGAGED ({why})"),
+        };
+        out += &format!(
+            "bmv-trader watch · {} ET · {mode} · read-only (Ctrl-C quits)\n\n",
+            watch::et(now)
+        );
+        out += &format!(
+            "  state: {}   session: {}   STOP file: {stop_file}\n",
+            s.state(),
+            s.session.as_deref().unwrap_or("-")
+        );
+        if let Some(why) = &s.halted {
+            out += &format!("  halt reason: {why}\n");
+        }
+        if !s.unresolved.is_empty() {
+            let keys: Vec<&str> = s.unresolved.iter().map(String::as_str).collect();
+            out += &format!("  unresolved: {}\n", keys.join(", "));
+        }
+        if s.unreadable > 0 {
+            out += &format!("  WARNING: {} unreadable journal lines\n", s.unreadable);
+        }
+        out += &format!(
+            "  today: {} candidates · {} rejected · {} orders · {} fills · {} exits\n\n",
+            s.candidates, s.rejections, s.orders, s.fills, s.exits
+        );
+        match a.account() {
+            Ok(acct) => {
+                out += &format!(
+                    "  equity {}   today P&L {}   buying power {}\n",
+                    acct.equity,
+                    acct.equity - acct.last_equity,
+                    acct.buying_power
+                )
+            }
+            Err(e) => out += &format!("  account: ERROR {e}\n"),
+        }
+        match a.positions() {
+            Ok(ps) if ps.is_empty() => out += "  positions: none\n",
+            Ok(ps) => {
+                out += "  positions:\n";
+                for p in ps {
+                    out += &format!("    {:>6} {:>6} @ {}\n", p.symbol, p.qty, p.avg_entry_price);
+                }
+            }
+            Err(e) => out += &format!("  positions: ERROR {e}\n"),
+        }
+        match live::open_orders(&a) {
+            Ok(os) if os.is_empty() => out += "  open orders: none\n",
+            Ok(os) => {
+                out += "  open orders:\n";
+                for o in os {
+                    out += &format!(
+                        "    {} {} {} {} {}/{}\n",
+                        o.client_order_id, o.symbol, o.side, o.status, o.filled_qty, o.qty
+                    );
+                }
+            }
+            Err(e) => out += &format!("  open orders: ERROR {e}\n"),
+        }
+        out += "\n  recent journal:\n";
+        for l in &s.recent {
+            let detail: String = l.detail.chars().take(70).collect();
+            out += &format!(
+                "    {} {:<12} {:<22} {detail}\n",
+                watch::et(l.ts),
+                l.kind,
+                l.id
+            );
+        }
+        print!("{out}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
 }
 
 /// The emergency exit, allowed in both modes.
