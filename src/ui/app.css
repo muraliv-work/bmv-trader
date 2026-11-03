@@ -112,3 +112,26 @@ button:disabled { cursor: not-allowed; color: var(--muted); background: transpar
 .result { font-weight: 600; min-height: 1.5em; }
 body.stale main { opacity: 0.45; }
 .result.bad { color: var(--danger); }
+
+a { color: inherit; text-underline-offset: 0.2em; }
+.howto { margin-left: auto; align-self: flex-start; color: var(--muted); }
+
+/* How-to page: same panel, reading width, no signal colour except the legend dots. */
+.help main, .help-head { max-width: 46rem; }
+.help-head { margin: 0 auto; padding: 2rem 1rem 1rem; border-bottom: 2px solid var(--rule); }
+.help-head h1 { margin: 0 0 0.3rem; font-size: clamp(1.75rem, 5vw, 2.5rem); font-weight: 800; letter-spacing: -0.01em; }
+.help-head p { margin: 0; color: var(--muted); }
+.help h2 { font-size: 1.3rem; margin-bottom: 0.5rem; scroll-margin-top: 1rem; }
+.help section { margin: 2.25rem 0; }
+.help td { white-space: normal; vertical-align: top; }
+.help p, .help li { max-width: 40rem; }
+.toc { display: flex; flex-wrap: wrap; gap: 0.4rem 1.1rem; margin: 1.25rem 0 0; }
+.toc a { color: var(--muted); }
+pre { margin: 0.5rem 0 0.9rem; padding: 0.6rem 0.8rem; background: var(--surface); border-left: 4px solid var(--rule); overflow-x: auto; }
+code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.92em; }
+.steps li { margin-bottom: 0.9rem; }
+.note { color: var(--muted); }
+.dot { display: inline-block; width: 0.75rem; height: 0.75rem; border-radius: 50%; margin-right: 0.5rem; vertical-align: -0.05rem; background: var(--off); }
+.dot.go { background: var(--go); }
+.dot.caution { background: var(--caution); }
+.dot.danger { background: var(--danger); }

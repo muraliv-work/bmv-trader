@@ -23,12 +23,14 @@ const REQUEST_SECS: u64 = 5;
 const MAX_CONNECTIONS: usize = 32;
 
 const INDEX: &str = include_str!("ui/index.html");
+const HELP: &str = include_str!("ui/help.html");
 const APP_JS: &str = include_str!("ui/app.js");
 const APP_CSS: &str = include_str!("ui/app.css");
 
 /// Every route there is. A test pins it, so a new control can't slip in unreviewed.
-pub const ROUTES: [(&str, &str); 6] = [
+pub const ROUTES: [(&str, &str); 7] = [
     ("GET", "/"),
+    ("GET", "/help"),
     ("GET", "/app.js"),
     ("GET", "/app.css"),
     ("GET", "/api/state"),
@@ -213,6 +215,7 @@ pub fn route(req: &Request, ctx: &Ctx) -> Response {
     }
     match req.path.as_str() {
         "/" => return Response::ok("text/html; charset=utf-8", INDEX),
+        "/help" => return Response::ok("text/html; charset=utf-8", HELP),
         "/app.js" => return Response::ok("text/javascript; charset=utf-8", APP_JS),
         "/app.css" => return Response::ok("text/css; charset=utf-8", APP_CSS),
         _ => {}
@@ -526,6 +529,7 @@ mod tests {
             paths,
             [
                 "GET /",
+                "GET /help",
                 "GET /app.js",
                 "GET /app.css",
                 "GET /api/state",
@@ -539,6 +543,12 @@ mod tests {
     fn static_files_need_only_the_right_host() {
         assert_eq!(call(&req("GET", "/", &[], "")).0.status, 200);
         assert_eq!(call(&req("GET", "/app.js", &[], "")).0.status, 200);
+        let help = call(&req("GET", "/help", &[], "")).0;
+        assert_eq!(help.status, 200);
+        assert!(
+            !help.body.contains("<script"),
+            "the how-to page runs no code"
+        );
         let other = [("host", "localhost:8765")];
         assert_eq!(call(&req("GET", "/app.css", &other, "")).0.status, 200);
     }

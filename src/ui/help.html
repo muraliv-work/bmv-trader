@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>bmv-trader how-to</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body class="help">
+<header class="help-head">
+  <h1>How to run bmv-trader</h1>
+  <p>Every command runs in Terminal from the project folder. <a href="/">Back to the console</a></p>
+  <pre><code>cd ~/Documents/projects/bmv/bmv-trader</code></pre>
+</header>
+
+<main>
+<nav aria-label="On this page" class="toc">
+  <a href="#day">A trading day</a>
+  <a href="#start">Start a session</a>
+  <a href="#watch">Watch it</a>
+  <a href="#stop">Stop new trades</a>
+  <a href="#clear">Clear STOP</a>
+  <a href="#flatten">Close everything</a>
+  <a href="#crash">The engine stopped</a>
+  <a href="#research">Research a strategy</a>
+  <a href="#keys">Keys</a>
+  <a href="#errors">When it refuses to start</a>
+</nav>
+
+<section id="day">
+  <h2>A trading day</h2>
+  <p>Times are New York time. On a half-day everything moves earlier; the engine reads the real times from Alpaca.</p>
+  <table>
+    <thead><tr><th>When</th><th>You</th><th>The engine</th></tr></thead>
+    <tbody>
+      <tr><td>Before 09:25</td><td>Check the account, start <code>run</code>, open the console</td><td>Startup checks; refuses to start if anything is off</td></tr>
+      <tr><td>09:30–09:45</td><td>Nothing</td><td>Builds the 15-minute opening range</td></tr>
+      <tr><td>09:45–15:30</td><td>Watch the lamp</td><td>Takes breakouts that pass the risk gate; Alpaca holds each stop and target</td></tr>
+      <tr><td>15:30</td><td>Nothing</td><td>No new entries after this</td></tr>
+      <tr><td>15:55</td><td>Nothing</td><td>Closes everything, checks the account is flat, exits</td></tr>
+      <tr><td>After</td><td>Read the journal; leave <code>run</code> stopped until tomorrow</td><td>Not running</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="start">
+  <h2>Start a paper session</h2>
+  <ol class="steps">
+    <li>Check the account is reachable and flat:
+      <pre><code>cargo run --release -- status</code></pre>
+    </li>
+    <li>Start the engine and keep the Mac awake. Leave this window open all day:
+      <pre><code>caffeinate -i cargo run --release -- run</code></pre>
+      Options, each logged as its own trial: <code>--trend</code> (only while SPY and the symbol trend up), <code>--marketable</code> (entry a little above the close so it fills), <code>--symbols SPY,QQQ,...</code>.
+    </li>
+    <li>In a second window, open the console:
+      <pre><code>cargo run --release -- ui</code></pre>
+      Open the link it prints. The link is the key to STOP and flatten, so don't share it. It changes every time you start <code>ui</code>.
+    </li>
+  </ol>
+  <p class="note">Start once per day. A second <code>run</code> the same day is refused, because the engine can't yet rebuild today's trades and losses.</p>
+</section>
+
+<section id="watch">
+  <h2>Watch it</h2>
+  <p>The console and <code>cargo run --release -- watch</code> (terminal) show the same reading. Neither can change anything except through STOP and flatten.</p>
+  <table>
+    <thead><tr><th>Lamp</th><th>Means</th><th>Do</th></tr></thead>
+    <tbody>
+      <tr><td><span class="dot go"></span>Trading</td><td>Engine running, nothing unresolved</td><td>Nothing</td></tr>
+      <tr><td><span class="dot caution"></span>Paused</td><td>Something can't be confirmed yet (for example market data); no new entries until it resolves</td><td>Usually clears by itself; check the banner</td></tr>
+      <tr><td><span class="dot caution"></span>Engine not running</td><td>No heartbeat from <code>run</code> for a minute</td><td>Look at the <code>run</code> window. Normal after 15:55</td></tr>
+      <tr><td><span class="dot danger"></span>Stopped</td><td>The STOP file exists</td><td>Nothing, unless you want to <a href="#clear">clear it</a></td></tr>
+      <tr><td><span class="dot danger"></span>Halted</td><td>A daily limit hit, or something unexplained; the engine closed everything</td><td>Read the halt reason. No more trading today</td></tr>
+      <tr><td><span class="dot danger"></span>Engine down, positions open</td><td>Positions exist but no engine manages them</td><td>Alpaca still holds their stops and targets. <a href="#flatten">Close everything</a> if you want out now</td></tr>
+      <tr><td><span class="dot danger"></span>Unknown</td><td>The journal can't be read</td><td>Check disk space and <code>data/journal.jsonl</code></td></tr>
+      <tr><td><span class="dot off"></span>No session today</td><td>No <code>run</code> today, or a weekend or holiday</td><td>Nothing</td></tr>
+      <tr><td><span class="dot off"></span>Stale reading</td><td>The last reading is over 20 s old; Alpaca or the console is slow</td><td>Wait; if it stays, check your connection</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="stop">
+  <h2>Stop new trades</h2>
+  <p>In the console: type <code>STOP</code> under Emergency controls and press the button. Or in Terminal:</p>
+  <pre><code>touch data/STOP</code></pre>
+  <p>A running engine sees it within seconds, takes no new entries and cancels the entries still waiting to fill. Positions already open keep their stop and target at Alpaca and close normally.</p>
+</section>
+
+<section id="clear">
+  <h2>Clear STOP</h2>
+  <p>Only in Terminal, on purpose. The console has no button for it.</p>
+  <pre><code>cat data/STOP    # who set it, and when
+rm data/STOP</code></pre>
+  <p>A running engine starts taking entries again on its next tick. If STOP is present when <code>run</code> starts, it refuses to start; clear STOP and start it again.</p>
+</section>
+
+<section id="flatten">
+  <h2>Close everything</h2>
+  <p>In the console: type <code>FLATTEN</code> and press the button. Or in Terminal (works in paper and live):</p>
+  <pre><code>cargo run --release -- flatten</code></pre>
+  <p>It engages STOP first, then closes every position and cancels every order at Alpaca, and checks up to 10 times that the account is flat. It answers "flat" or tells you what's left. STOP stays engaged afterwards; <a href="#clear">clear it</a> yourself if you want trading back. Last resort: close positions in Alpaca's own dashboard.</p>
+</section>
+
+<section id="crash">
+  <h2>The engine stopped during the day</h2>
+  <ol class="steps">
+    <li>Don't panic: every entry was sent as a bracket, so Alpaca holds its stop and target even with the Mac asleep.</li>
+    <li>Read why it stopped: the last lines of the <code>run</code> window, and the console's journal.</li>
+    <li>If you want out now, <a href="#flatten">close everything</a>.</li>
+    <li>Don't start <code>run</code> again today; it refuses anyway. Start fresh tomorrow before 09:25.</li>
+  </ol>
+</section>
+
+<section id="research">
+  <h2>Research a strategy</h2>
+  <p>A strategy trades with real money only after it passes the research gate on history. Results go to <code>data/trials.jsonl</code> and show in the console.</p>
+  <pre><code>cargo run --release -- fetch --from 2020-08-03 --to 2025-12-31
+cargo run --release -- backtest --from 2020-08-03 --to 2025-12-31 [--trend] [--marketable]</code></pre>
+  <ul>
+    <li>Every variant you test is a trial, and the more trials there are, the harder the gate. Try few, on purpose.</li>
+    <li>The last 3 months are the holdout, kept unseen. <code>--holdout</code> uses it once, at the end; a second look needs <code>--holdout-again</code> and makes the result less trustworthy.</li>
+    <li><code>fetch --allow-gaps</code> accepts a day Alpaca has no data for (up to 5 per symbol), recorded as a day without trades.</li>
+  </ul>
+</section>
+
+<section id="keys">
+  <h2>Keys</h2>
+  <p>Keys live in the macOS Keychain (service <code>bmv-trader</code>). Each command asks for the value, so it stays out of shell history:</p>
+  <pre><code>security add-generic-password -s bmv-trader -a ALPACA_PAPER_KEY_ID -w
+security add-generic-password -s bmv-trader -a ALPACA_PAPER_SECRET -w</code></pre>
+  <ul>
+    <li>Paper keys may sit in <code>.env</code> instead, but never in both places: that is refused.</li>
+    <li>Live keys are Keychain only, and <code>run</code> refuses live mode until P5.</li>
+    <li>To replace a key, add <code>-U</code>. To remove one: <code>security delete-generic-password -s bmv-trader -a NAME</code></li>
+    <li>Never paste a key into chat, a commit or this console.</li>
+  </ul>
+</section>
+
+<section id="errors">
+  <h2>When <code>run</code> refuses to start</h2>
+  <table>
+    <thead><tr><th>It says</th><th>Do</th></tr></thead>
+    <tbody>
+      <tr><td>kill switch engaged at startup</td><td><a href="#clear">Clear STOP</a> if you meant to, then start again</td></tr>
+      <tr><td>a run already started today</td><td>Nothing until tomorrow</td></tr>
+      <tr><td>account not flat</td><td><code>cargo run --release -- flatten</code>, then start again</td></tr>
+      <tr><td>local clock is … ms off Alpaca's</td><td>System Settings → General → Date &amp; Time → set automatically</td></tr>
+      <tr><td>… is not a trading day</td><td>Weekend or holiday; nothing to do</td></tr>
+      <tr><td>today's P&amp;L … already hit the daily loss halt</td><td>No trading today</td></tr>
+      <tr><td>live trading is P5; run is paper only</td><td>Set <code>TRADING_MODE=paper</code> in <code>.env</code></td></tr>
+      <tr><td>… is in both the Keychain and .env</td><td>Remove it from <code>.env</code></td></tr>
+      <tr><td>… must not be in .env; store it in the Keychain</td><td>Live keys go in the Keychain only; see <a href="#keys">Keys</a></td></tr>
+    </tbody>
+  </table>
+</section>
+</main>
+</body>
+</html>
