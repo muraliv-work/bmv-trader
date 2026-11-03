@@ -60,12 +60,14 @@ Status: **Active** · **Pending** (needs the owner or data) · **Superseded**
 | R2b | **Trend filter needs fresh SPY data** (newest SPY bar ≤ 120 s old), or no trade | Stale market data would let the filter fail open | If MARKET becomes a thinner symbol | Active |
 | R2c | **Research data = IEX 2020-08-03 → 2025-12-31**; holdout pinned from 2025-10-02; missing days only via explicit `--allow-gaps` (one so far: 2025-03-10, all symbols) | Free IEX minute history starts late July 2020; silent gaps would bias results | Paid SIP data | Active |
 | R2d | **Marketable entry (`--marketable`, limit 5 bps above the close) is the only entry variant tried** | Tests whether resting limits only filled failing breakouts | — | **Failed P1 (trial 3, 2026-11-03):** 2,296 trades, −0.117R, CI −0.21..−0.02R, PF 0.86, 18/61 windows. Hypothesis rejected: ORB has no edge here after costs. **Stop tuning ORB**; next strategy is a new family |
-| R3 | **Indicators use today's regular-hours bars only** (no premarket, no prior day) | Simple and avoids data-alignment bugs | Multi-day trend filters need prior-day data → new decision | Active |
+| R3 | **Indicators use today's regular-hours bars only** (no premarket, no prior day) | Simple and avoids data-alignment bugs | Multi-day trend filters need prior-day data → new decision | Active; one exception: R2e (yesterday's close, backtest only) |
+| R2e | **Trial 4: gap-and-go** (DESIGN §7b, pre-registered, ≥ +1% gap, 5-min range breakout, gap still open) | Gap days carry news and momentum the ORB missed | — | **Failed P1 (trial 4, 2026-11-03):** 385 trades, −0.036R, CI −0.23..+0.16R, PF 0.95, 24/61 windows, DD 30R. Best so far, but indistinguishable from zero; beats random |
+| R2f | **Trial 5: VWAP pullback** (DESIGN §7c, pre-registered, from 10:00, first resumption above VWAP after a touch) | Trend continuation on a pullback, not a breakout | — | **Failed P1 (trial 5, 2026-11-03):** 2,521 trades, −0.219R, CI −0.30..−0.13R, PF 0.73, 12/61 windows, DD 561R. **No better than random entries** (−0.25R): the signal adds nothing |
 | R4 | **Random-entry baseline**: same exits and sizing, random entry time | If a strategy can't beat random entries, the signal adds nothing | Never | Active |
 | R5 | **Pessimistic fill model** (slippage, partial fills, stop wins ties, no fill after TTL) | Backtests that flatter you lose real money | After paper trading measures real slippage | Active |
 | R6 | **Every backtest run is a logged trial; the significance bar rises with each trial** (Bonferroni) | Stops "try 50 variants until one looks lucky" | Never | Active |
 | R7 | **Final holdout (last 63 sessions) is pinned and evaluated once** | A holdout used twice is no longer a test | Never | Active |
-| R8 | **P1 gate** must pass before P2 work goes live: ≥ 100 trades, CI > 0, beats random, ≥ 60% profitable windows, PF > 1.2, DD < 10R, holdout > 0 | Only build on an edge that survives honest testing | — | **Not passed** by trials 1–2; owner decides next |
+| R8 | **P1 gate** must pass before P2 work goes live: ≥ 100 trades, CI > 0, beats random, ≥ 60% profitable windows, PF > 1.2, DD < 10R, holdout > 0 | Only build on an edge that survives honest testing | — | **Not passed** by trials 1–5 (ORB ×3, gap-and-go, VWAP pullback); owner decides next |
 
 ## Development
 
