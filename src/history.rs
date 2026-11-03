@@ -308,6 +308,37 @@ pub struct FetchReport {
     pub sessions: usize,
     pub downloaded: usize,
     pub cached: usize,
+    /// (date, symbol) pairs Alpaca had no bars for, stored as empty days because of `allow_gaps`.
+    pub gaps: Vec<(String, String)>,
+}
+
+/// More gaps than this for one symbol in one fetch looks like a wrong symbol, not missing days.
+pub const MAX_GAPS_PER_SYMBOL: usize = 5;
+
+/// With `allow_gaps`, a symbol-day with no bars becomes an empty day (no trades that day) instead
+/// of an error, but only up to MAX_GAPS_PER_SYMBOL per symbol.
+fn bars_or_gap(
+    symbol: &str,
+    date: &str,
+    bars: Option<Vec<Bar>>,
+    allow_gaps: bool,
+    gaps: &mut Vec<(String, String)>,
+) -> Result<Vec<Bar>, String> {
+    match require_bars(symbol, date, bars) {
+        Ok(b) => Ok(b),
+        Err(e) if !allow_gaps => Err(format!(
+            "{e} (or pass --allow-gaps if Alpaca has no data that day)"
+        )),
+        Err(e) => {
+            if gaps.iter().filter(|(_, s)| s == symbol).count() >= MAX_GAPS_PER_SYMBOL {
+                return Err(format!(
+                    "{e}: more than {MAX_GAPS_PER_SYMBOL} gaps for {symbol}, check the symbol"
+                ));
+            }
+            gaps.push((date.to_string(), symbol.to_string()));
+            Ok(Vec::new())
+        }
+    }
 }
 
 /// Downloads every session in [start, end] (YYYY-MM-DD) for `symbols` into `dir`, skipping what is
@@ -318,6 +349,7 @@ pub fn fetch_range(
     symbols: &[String],
     start: &str,
     end: &str,
+    allow_gaps: bool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<FetchReport, String> {
     check_symbols(symbols)?;
@@ -343,7 +375,7 @@ pub fn fetch_range(
         }
         let mut got = fetch_session(alpaca, &missing, s, &mut wait)?;
         for sym in &missing {
-            let bars = require_bars(sym, &s.date, got.remove(sym))?;
+            let bars = bars_or_gap(sym, &s.date, got.remove(sym), allow_gaps, &mut report.gaps)?;
             write_json(&bars_path(dir, sym, &s.date), &bars)?;
         }
         report.downloaded += missing.len();
@@ -635,5 +667,26 @@ mod tests {
                 .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
                 .collect();
         assert!(leftovers.is_empty(), "no temp files left behind");
+    }
+
+    #[test]
+    fn gaps_are_errors_unless_allowed_and_capped_per_symbol() {
+        let mut gaps = Vec::new();
+        let e = bars_or_gap("SPY", "2025-03-10", None, false, &mut gaps).unwrap_err();
+        assert!(e.contains("--allow-gaps") && gaps.is_empty(), "{e}");
+        assert!(
+            bars_or_gap("SPY", "2025-03-10", Some(vec![]), true, &mut gaps)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(gaps, [("2025-03-10".to_string(), "SPY".to_string())]);
+        for d in 1..MAX_GAPS_PER_SYMBOL {
+            bars_or_gap("SPY", &format!("d{d}"), None, true, &mut gaps).unwrap();
+        }
+        assert!(bars_or_gap("SPY", "one-too-many", None, true, &mut gaps).is_err());
+        assert!(
+            bars_or_gap("QQQ", "2025-03-10", None, true, &mut gaps).is_ok(),
+            "the cap is per symbol"
+        );
     }
 }

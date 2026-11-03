@@ -54,15 +54,16 @@ Status: **Active** · **Pending** (needs the owner or data) · **Superseded**
 
 | # | Decision | Why | Revisit when | Status |
 |---|---|---|---|---|
-| R1 | **Strategy v1 = ORB-15 long** on 10 liquid symbols | Simple, well known, few parameters, easy to test | If it fails the P1 gate | Active, untested on real data |
-| R2 | **Trend filter is an optional, separate trial** (`--trend`): trade only while SPY and the symbol are above today's VWAP and open | Breakouts tend to work better in a rising market; testable with today's bars only | If it fails the P1 gate | Active, untested on real data |
+| R1 | **Strategy v1 = ORB-15 long** on 10 liquid symbols | Simple, well known, few parameters, easy to test | If it fails the P1 gate | **Failed P1 (trial 1, 2026-11-03):** 1,555 trades, −0.105R, CI −0.18..−0.03R, PF 0.86, 22/61 windows; beats random (−0.25R) |
+| R2 | **Trend filter is an optional, separate trial** (`--trend`): trade only while SPY and the symbol are above today's VWAP and open | Breakouts tend to work better in a rising market; testable with today's bars only | If it fails the P1 gate | **Failed P1 (trial 2, 2026-11-03):** 970 trades, −0.120R, CI −0.23..−0.00R, PF 0.84, 26/61 windows; beats random (−0.25R) |
 | R2b | **Trend filter needs fresh SPY data** (newest SPY bar ≤ 120 s old), or no trade | Stale market data would let the filter fail open | If MARKET becomes a thinner symbol | Active |
+| R2c | **Research data = IEX 2020-08-03 → 2025-12-31**; holdout pinned from 2025-10-02; missing days only via explicit `--allow-gaps` (one so far: 2025-03-10, all symbols) | Free IEX minute history starts late July 2020; silent gaps would bias results | Paid SIP data | Active |
 | R3 | **Indicators use today's regular-hours bars only** (no premarket, no prior day) | Simple and avoids data-alignment bugs | Multi-day trend filters need prior-day data → new decision | Active |
 | R4 | **Random-entry baseline**: same exits and sizing, random entry time | If a strategy can't beat random entries, the signal adds nothing | Never | Active |
 | R5 | **Pessimistic fill model** (slippage, partial fills, stop wins ties, no fill after TTL) | Backtests that flatter you lose real money | After paper trading measures real slippage | Active |
 | R6 | **Every backtest run is a logged trial; the significance bar rises with each trial** (Bonferroni) | Stops "try 50 variants until one looks lucky" | Never | Active |
 | R7 | **Final holdout (last 63 sessions) is pinned and evaluated once** | A holdout used twice is no longer a test | Never | Active |
-| R8 | **P1 gate** must pass before P2 work goes live: ≥ 100 trades, CI > 0, beats random, ≥ 60% profitable windows, PF > 1.2, DD < 10R, holdout > 0 | Only build on an edge that survives honest testing | — | **Pending (needs keys + data)** |
+| R8 | **P1 gate** must pass before P2 work goes live: ≥ 100 trades, CI > 0, beats random, ≥ 60% profitable windows, PF > 1.2, DD < 10R, holdout > 0 | Only build on an edge that survives honest testing | — | **Not passed** by trials 1–2; owner decides next |
 
 ## Development
 

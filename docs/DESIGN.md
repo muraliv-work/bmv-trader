@@ -24,7 +24,7 @@ No UI ever has buy or sell buttons. The only controls are STOP and flatten.
 
 | Topic | Decision |
 |---|---|
-| Broker / data | Alpaca. Basic (free) plan: IEX real-time, websocket ≤ 30 symbols, 200 historical calls/min, history since 2016 |
+| Broker / data | Alpaca. Basic (free) plan: IEX real-time, websocket ≤ 30 symbols, 200 historical calls/min. IEX minute history starts late July 2020 (measured: none on 2020-07-15, present on 2020-07-27), so research uses 2020-08-03 on |
 | Language | Rust, single binary |
 | AI role | Rules generate candidates → Claude approves, reduces, or rejects → risk gate decides |
 | Execution | Automatic in paper. In live, each order needs your confirmation (phone), plus a confirmation at the start of each live session. |
@@ -441,4 +441,4 @@ No coverage-percentage target, because coverage measures which lines ran, not wh
 2. **Shorts:** enable after longs are validated?
 3. **SIP data:** pay for full-market data if the IEX gaps hurt P3 or P5?
 4. **Phone channel:** Telegram bot (two-way, chat-id locked) or authenticated ntfy?
-5. **Universe:** the rule-based top-30 for research (§13) means downloading daily bars for about 500 symbols plus 1-minute bars for whichever are in the top 30 each month. That's fine on the free plan (since 2016, 200 calls/min), but the first download takes hours. OK?
+5. **Universe:** the rule-based top-30 for research (§13) means downloading daily bars for about 500 symbols plus 1-minute bars for whichever are in the top 30 each month. That's fine on the free plan (IEX minute bars only from late July 2020, 200 calls/min), but the first download takes hours. OK?

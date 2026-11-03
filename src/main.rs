@@ -11,7 +11,7 @@ const USAGE: &str = "usage:
   bmv-trader status                       account, positions and open orders (read-only)
   bmv-trader run      [--symbols ...] [--trend]   one paper session (PAPER ONLY; live is P5)
   bmv-trader flatten                      close every position and confirm (any mode)
-  bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...]
+  bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
   bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--symbols ...] [--fold-days 21]
                       [--seeds 5] [--holdout] [--holdout-again] [--trend]
 
@@ -29,7 +29,7 @@ const MAX_SEEDS: usize = 50;
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
 const VALUE_FLAGS: [&str; 5] = ["--from", "--to", "--symbols", "--fold-days", "--seeds"];
-const SWITCHES: [&str; 3] = ["--holdout", "--holdout-again", "--trend"];
+const SWITCHES: [&str; 4] = ["--holdout", "--holdout-again", "--trend", "--allow-gaps"];
 
 struct Args {
     values: BTreeMap<String, String>,
@@ -126,7 +126,7 @@ fn main() {
             Some("run") => run(&args.symbols()?, args.has("--trend")),
             Some("fetch") => {
                 let (from, to) = args.dates()?;
-                fetch(&from, &to, &args.symbols()?)
+                fetch(&from, &to, &args.symbols()?, args.has("--allow-gaps"))
             }
             Some("backtest") => {
                 let (from, to) = args.dates()?;
@@ -237,7 +237,7 @@ fn data_dir() -> Result<std::path::PathBuf, String> {
     Ok(config::home()?.join("data"))
 }
 
-fn fetch(from: &str, to: &str, symbols: &[String]) -> Result<(), String> {
+fn fetch(from: &str, to: &str, symbols: &[String], allow_gaps: bool) -> Result<(), String> {
     let today = chrono::Utc::now().date_naive();
     if history::canonical_date(to)? >= today {
         return Err(format!(
@@ -250,13 +250,25 @@ fn fetch(from: &str, to: &str, symbols: &[String]) -> Result<(), String> {
         symbols.len(),
         history::FEED
     );
-    let r = history::fetch_range(&alpaca, &data_dir()?, symbols, from, to, &mut |d| {
-        eprintln!("  {d}")
-    })?;
+    let r = history::fetch_range(
+        &alpaca,
+        &data_dir()?,
+        symbols,
+        from,
+        to,
+        allow_gaps,
+        &mut |d| eprintln!("  {d}"),
+    )?;
     println!(
         "{} sessions; {} symbol-days downloaded, {} already cached",
         r.sessions, r.downloaded, r.cached
     );
+    for (date, sym) in &r.gaps {
+        println!(
+            "  gap: no {} bars for {sym} on {date}, stored as a day without trades",
+            history::FEED
+        );
+    }
     Ok(())
 }
 
