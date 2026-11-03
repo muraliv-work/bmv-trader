@@ -169,7 +169,7 @@ fn utc(ts: i64) -> Result<String, String> {
 }
 
 /// Percent-encodes everything except unreserved URL characters.
-fn encode(s: &str) -> String {
+pub(crate) fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -230,13 +230,13 @@ fn require_bars(symbol: &str, date: &str, bars: Option<Vec<Bar>>) -> Result<Vec<
     }
 }
 
-fn session_path(dir: &Path, date: &str) -> PathBuf {
+pub(crate) fn session_path(dir: &Path, date: &str) -> PathBuf {
     dir.join("history")
         .join("sessions")
         .join(format!("{date}.json"))
 }
 
-fn bars_path(dir: &Path, symbol: &str, date: &str) -> PathBuf {
+pub(crate) fn bars_path(dir: &Path, symbol: &str, date: &str) -> PathBuf {
     dir.join("history")
         .join(FEED)
         .join(symbol)
@@ -249,7 +249,7 @@ fn fetched_path(dir: &Path) -> PathBuf {
 
 /// Writes via a per-process temp file, synced, then renamed: an interrupted or concurrent run
 /// never leaves a half file under the real name.
-fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<(), String> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<(), String> {
     let dir = path.parent().ok_or("no parent directory")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
@@ -263,7 +263,7 @@ fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("cannot rename into {}: {e}", path.display()))
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     serde_json::from_slice(&bytes)
         .map_err(|e| format!("corrupt cache file {}: {e}", path.display()))
@@ -447,6 +447,7 @@ pub fn load_range(
                 open: s.open,
                 close: s.close,
                 bars,
+                prev_close: BTreeMap::new(),
             })
         })
         .collect()

@@ -28,6 +28,10 @@ pub struct Day {
     pub open: i64,
     pub close: i64,
     pub bars: Vec<(String, Bar)>,
+    /// Yesterday's close per symbol, when the loader knows it (the scan does). Empty means the
+    /// backtest uses each symbol's last minute close of the previous loaded day.
+    #[serde(default)]
+    pub prev_close: BTreeMap<String, f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -162,7 +166,13 @@ pub fn run(days: &[Day], settings: Settings, model: FillModel) -> Result<Vec<Day
                 buying_power: sim.model.buying_power,
             },
         );
-        for (symbol, close) in std::mem::take(&mut prev_close) {
+        let known = std::mem::take(&mut prev_close);
+        let closes = if day.prev_close.is_empty() {
+            known
+        } else {
+            day.prev_close.clone()
+        };
+        for (symbol, close) in closes {
             sim.drive(&mut engine, Event::PrevClose { symbol, close });
         }
         let mut bars = day.bars.clone();
@@ -462,6 +472,7 @@ mod tests {
             open: OPEN,
             close: CLOSE,
             bars,
+            prev_close: BTreeMap::new(),
         }
     }
 

@@ -15,7 +15,10 @@ const USAGE: &str = "usage:
   bmv-trader flatten                      close every position and confirm (any mode)
   bmv-trader backstop                     for launchd: near the close, flatten anything left (deploy/)
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
-  bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--strategy orb|gap|vwap] [--symbols ...] [--fold-days 21]
+  bmv-trader universe                     list every US stock, active and delisted (for the scan)
+  bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD   daily bars for the universe
+  bmv-trader scan     --from YYYY-MM-DD --to YYYY-MM-DD   each day's gappers, and their minute bars
+  bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--strategy orb|gap|vwap] [--scan] [--symbols ...] [--fold-days 21]
                       [--seeds 5] [--holdout] [--holdout-again] [--trend] [--marketable]
 
 The holdout start date is pinned in data/holdout_from on the first backtest (the last 63 sessions
@@ -40,7 +43,8 @@ const VALUE_FLAGS: [&str; 7] = [
     "--seeds",
     "--port",
 ];
-const SWITCHES: [&str; 5] = [
+const SWITCHES: [&str; 6] = [
+    "--scan",
     "--holdout",
     "--holdout-again",
     "--trend",
@@ -148,6 +152,15 @@ fn main() {
                 let (from, to) = args.dates()?;
                 fetch(&from, &to, &args.symbols()?, args.has("--allow-gaps"))
             }
+            Some("universe") => universe(),
+            Some("fetch-daily") => {
+                let (from, to) = args.dates()?;
+                fetch_daily(&from, &to)
+            }
+            Some("scan") => {
+                let (from, to) = args.dates()?;
+                scan(&from, &to)
+            }
             Some("backtest") => {
                 let (from, to) = args.dates()?;
                 let opts = Opts {
@@ -156,6 +169,7 @@ fn main() {
                     holdout: args.has("--holdout"),
                     holdout_again: args.has("--holdout-again"),
                     trend: args.has("--trend"),
+                    scan: args.has("--scan"),
                     orb: orb_params(&args),
                     strategy: match args.get("--strategy").unwrap_or("orb") {
                         "orb" => Strategy::Orb,
@@ -345,6 +359,32 @@ fn flatten() -> Result<(), String> {
     Ok(())
 }
 
+/// The scan universe: every listed US stock, active and delisted (DESIGN §13b).
+fn universe() -> Result<(), String> {
+    let n = bmv_trader::scan::fetch_universe(&connect()?, &data_dir()?)?;
+    println!("{n} symbols in data/daily/universe.json");
+    Ok(())
+}
+
+fn fetch_daily(from: &str, to: &str) -> Result<(), String> {
+    let n = bmv_trader::scan::fetch_daily(&connect()?, &data_dir()?, from, to, &mut |d, n| {
+        eprintln!("  {d}/{n} symbols")
+    })?;
+    println!("daily bars for {n} new symbols");
+    Ok(())
+}
+
+fn scan(from: &str, to: &str) -> Result<(), String> {
+    let r = bmv_trader::scan::scan_range(&connect()?, &data_dir()?, from, to, &mut |d| {
+        eprintln!("  {d}")
+    })?;
+    println!(
+        "{} days, {} picks, {} picks without minute bars (kept as days without trades)",
+        r.days, r.picks, r.no_minute_bars
+    );
+    Ok(())
+}
+
 fn run(symbols: &[String], trend: bool, orb: OrbParams) -> Result<(), String> {
     let cfg = config::load()?;
     let mode = cfg.mode();
@@ -420,6 +460,8 @@ struct Opts {
     holdout_again: bool,
     /// Only trade while SPY and the symbol trend up today; a separate trial from plain ORB.
     trend: bool,
+    /// Trade each day's scanned gappers (`bmv-trader scan`) instead of `--symbols`.
+    scan: bool,
     orb: OrbParams,
     strategy: Strategy,
 }
@@ -505,6 +547,9 @@ fn folds(results: &[DayResult], fold_days: usize) -> Vec<Vec<DayResult>> {
 }
 
 fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<(), String> {
+    if o.scan && o.trend {
+        return Err("--trend needs SPY, which the scan doesn't trade: use one or the other".into());
+    }
     if o.trend && !symbols.iter().any(|s| s == engine::MARKET) {
         return Err(format!(
             "--trend reads {} to judge the market; add it to --symbols",
@@ -512,7 +557,11 @@ fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<()
         ));
     }
     let dir = data_dir()?;
-    let days = history::load_range(&dir, symbols, from, to)?;
+    let days = if o.scan {
+        bmv_trader::scan::load_scan_range(&dir, from, to)?
+    } else {
+        history::load_range(&dir, symbols, from, to)?
+    };
     let dates: Vec<&str> = days.iter().map(|d| d.date.as_str()).collect();
     let cut_date = holdout_from(&dir, &dates)?;
     let cut = days.partition_point(|d| d.date < cut_date);
@@ -568,10 +617,14 @@ fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<()
     let ci = stats::bootstrap_expectancy(&stats::r_by_day(research), 2_000, 0.05, 42);
     let period = format!("{}..{}", research_days[0].date, research_days[cut - 1].date);
     let when = chrono::Utc::now().to_rfc3339();
-    let params = format!("{:?} {orb:?} trend_filter={}", o.strategy, o.trend);
+    let params = format!(
+        "{:?} {orb:?} trend_filter={} scan={}",
+        o.strategy, o.trend, o.scan
+    );
     let strategy_name = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         o.strategy.name(),
+        if o.scan { "@scan" } else { "" },
         if o.trend { "+trend" } else { "" },
         if o.orb.entry_buffer_bps > 0 {
             "+mkt"

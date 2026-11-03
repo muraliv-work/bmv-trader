@@ -371,6 +371,25 @@ More AI authority is earned one level at a time. Each level is enabled only afte
 
 **Why Claude isn't backtested:** its training data may already contain how those past days turned out (look-ahead bias). Its value is measured forward only.
 
+## 13b. Trial 6: gap-and-go on scanned gappers (pre-registered 2026-11-03, before any data)
+
+Trial 4 was starved: ten mega-caps rarely gap 1%. This trial keeps trial 4's rules unchanged (§7b) and only changes **which stocks** it may trade.
+
+- **Universe:** every US stock on NYSE, NASDAQ, AMEX, ARCA or BATS that Alpaca lists, **active and inactive**, so delisted stocks stay in the past.
+  - Alpaca's inactive list is incomplete, so some survivorship bias remains. It flatters results, so treat a pass with extra care.
+- **Daily data:** IEX daily bars at raw prices (`fetch-daily`).
+- **The daily scan** (`scan`) uses only what is known at 09:30. A stock is eligible when:
+  - yesterday's close is at least **$5**
+  - it traded yesterday
+  - it has 20 daily bars, all within the last 30 sessions
+  - its average **IEX dollar volume** over those 20 days is at least **$1M** (IEX is about 2–3% of all volume, so roughly $30M+ consolidated)
+  - today's open is between **+2% and +30%** above yesterday's close (above 30% is mostly reverse splits, buyouts and halts)
+- **Picks:** the **top 10 by gap** each day, best first.
+- **Trading:** trial 4's gap-and-go rules on those picks, with yesterday's close taken from the daily bar. Risk limits, the fill model and costs are unchanged.
+- **Baseline:** random entries on the same picks.
+- **Period:** research from **2020-09-01** (the first month after IEX history starts is the 20-day warm-up) to 2025-10-01. The holdout stays pinned from 2025-10-02.
+- **One trial.** Changing any threshold above is a new trial.
+
 ## 14. Roadmap
 
 ```
