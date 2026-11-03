@@ -88,6 +88,12 @@ impl Alpaca {
 
     /// A read-only GET. There is deliberately no generic POST: orders get their own typed method.
     pub fn get<T: DeserializeOwned>(&self, api: Api, path: &str) -> Result<T, String> {
+        // "@host/x" after the base would make `host` the real destination and hand it the keys
+        let unsafe_path =
+            !path.starts_with('/') || ["@", "\\", "#", "://"].iter().any(|bad| path.contains(bad));
+        if unsafe_path {
+            return Err(format!("refusing Alpaca path {path:?}"));
+        }
         let base = match api {
             Api::Trading => self.cfg.mode().base_url(),
             Api::MarketData => "https://data.alpaca.markets",
@@ -149,6 +155,30 @@ mod tests {
         ] {
             let a: Account = serde_json::from_str(&ACCOUNT.replace(from, to)).unwrap();
             assert!(a.validate().is_err(), "should reject {to}");
+        }
+    }
+
+    #[test]
+    fn paths_that_could_redirect_the_keys_are_refused_before_any_request() {
+        let cfg = crate::config::from_env(|k| match k {
+            "ALPACA_PAPER_KEY_ID" => Some("pk".into()),
+            "ALPACA_PAPER_SECRET" => Some("ps".into()),
+            _ => None,
+        })
+        .unwrap();
+        let a = Alpaca::new(cfg).unwrap();
+        for bad in [
+            "@evil.example/x",
+            "v2/account",
+            "/x@evil.example",
+            "/a\\b",
+            "/a#b",
+            "/https://evil",
+        ] {
+            let err = a
+                .get::<serde_json::Value>(Api::MarketData, bad)
+                .unwrap_err();
+            assert!(err.contains("refusing"), "{bad}: {err}");
         }
     }
 

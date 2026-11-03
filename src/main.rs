@@ -1,33 +1,369 @@
-use bmv_trader::{broker, config, config::Mode};
+use bmv_trader::backtest::{self, DayResult, FillModel};
+use bmv_trader::engine::{Entry, Settings};
+use bmv_trader::strategy::OrbParams;
+use bmv_trader::{broker, config, config::Mode, history, stats};
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::exit;
 
-fn main() {
-    let cfg = config::load().unwrap_or_else(|e| fail(&e));
+const USAGE: &str = "usage:
+  bmv-trader account
+  bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...]
+  bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--symbols ...] [--fold-days 21]
+                      [--seeds 5] [--holdout] [--holdout-again]
 
+The holdout start date is pinned in data/holdout_from on the first backtest (the last 63 sessions
+loaded) and research never uses days from it on. --holdout evaluates it once; a second evaluation
+of the same holdout needs --holdout-again, and should be rare.";
+
+/// The v1 watchlist (DESIGN §7).
+const WATCHLIST: &str = "SPY,QQQ,AAPL,MSFT,NVDA,AMD,META,AMZN,GOOGL,TSLA";
+/// About 3 months (DESIGN §13).
+const HOLDOUT_SESSIONS: usize = 63;
+const MAX_SEEDS: usize = 50;
+
+/// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
+/// fall back to a default.
+const VALUE_FLAGS: [&str; 5] = ["--from", "--to", "--symbols", "--fold-days", "--seeds"];
+const SWITCHES: [&str; 2] = ["--holdout", "--holdout-again"];
+
+struct Args {
+    values: BTreeMap<String, String>,
+    switches: Vec<String>,
+}
+
+impl Args {
+    fn parse(rest: &[String]) -> Result<Self, String> {
+        let mut values = BTreeMap::new();
+        let mut switches = Vec::new();
+        let mut it = rest.iter();
+        while let Some(a) = it.next() {
+            if VALUE_FLAGS.contains(&a.as_str()) {
+                match it.next() {
+                    Some(v) if !v.starts_with("--") => {
+                        values.insert(a.clone(), v.clone());
+                    }
+                    _ => return Err(format!("{a} needs a value")),
+                }
+            } else if SWITCHES.contains(&a.as_str()) {
+                switches.push(a.clone());
+            } else {
+                return Err(format!("unknown argument {a:?}\n{USAGE}"));
+            }
+        }
+        Ok(Args { values, switches })
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(String::as_str)
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.switches.iter().any(|s| s == name)
+    }
+
+    fn num(
+        &self,
+        name: &str,
+        default: usize,
+        range: std::ops::RangeInclusive<usize>,
+    ) -> Result<usize, String> {
+        let n = match self.get(name) {
+            None => default,
+            Some(v) => v
+                .parse()
+                .map_err(|_| format!("{name} must be a whole number, got {v:?}"))?,
+        };
+        if range.contains(&n) {
+            Ok(n)
+        } else {
+            Err(format!(
+                "{name} must be between {} and {}",
+                range.start(),
+                range.end()
+            ))
+        }
+    }
+
+    fn dates(&self) -> Result<(String, String), String> {
+        match (self.get("--from"), self.get("--to")) {
+            (Some(f), Some(t)) => {
+                if history::canonical_date(f)? > history::canonical_date(t)? {
+                    return Err(format!("--from {f} is after --to {t}"));
+                }
+                Ok((f.to_string(), t.to_string()))
+            }
+            _ => Err(format!("need --from and --to\n{USAGE}")),
+        }
+    }
+
+    fn symbols(&self) -> Result<Vec<String>, String> {
+        let mut out: Vec<String> = Vec::new();
+        for s in self.get("--symbols").unwrap_or(WATCHLIST).split(',') {
+            let s = s.trim().to_ascii_uppercase();
+            if !history::valid_symbol(&s) {
+                return Err(format!("invalid symbol {s:?}"));
+            }
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn main() {
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    let result = Args::parse(all.get(1..).unwrap_or_default()).and_then(|args| {
+        match all.first().map(String::as_str) {
+            Some("account") => account(),
+            Some("fetch") => {
+                let (from, to) = args.dates()?;
+                fetch(&from, &to, &args.symbols()?)
+            }
+            Some("backtest") => {
+                let (from, to) = args.dates()?;
+                let opts = Opts {
+                    fold_days: args.num("--fold-days", 21, 5..=126)?,
+                    seeds: args.num("--seeds", 5, 1..=MAX_SEEDS)?,
+                    holdout: args.has("--holdout"),
+                    holdout_again: args.has("--holdout-again"),
+                };
+                run_backtest(&from, &to, &args.symbols()?, &opts)
+            }
+            _ => Err(USAGE.to_string()),
+        }
+    });
+    if let Err(e) = result {
+        fail(&e);
+    }
+}
+
+fn connect() -> Result<broker::Alpaca, String> {
+    let cfg = config::load()?;
     match cfg.mode() {
         Mode::Paper => eprintln!("mode: PAPER"),
         Mode::Live => eprintln!("\x1b[1;41m  LIVE TRADING — REAL MONEY  \x1b[0m"),
     }
+    broker::Alpaca::new(cfg)
+}
 
-    let alpaca = broker::Alpaca::new(cfg).unwrap_or_else(|e| fail(&e));
-    match std::env::args().nth(1).as_deref() {
-        Some("account") => {
-            let a = alpaca.account().unwrap_or_else(|e| fail(&e));
-            for (k, v) in [
-                ("status", a.status),
-                ("currency", a.currency),
-                ("cash", a.cash.to_string()),
-                ("buying_power", a.buying_power.to_string()),
-                ("equity", a.equity.to_string()),
-                ("today_pnl", (a.equity - a.last_equity).to_string()),
-                ("trading_blocked", a.trading_blocked.to_string()),
-                ("account_blocked", a.account_blocked.to_string()),
-            ] {
-                println!("{k:>16}: {v}");
-            }
-        }
-        _ => fail("usage: bmv-trader account"),
+fn account() -> Result<(), String> {
+    let a = connect()?.account()?;
+    for (k, v) in [
+        ("status", a.status),
+        ("currency", a.currency),
+        ("cash", a.cash.to_string()),
+        ("buying_power", a.buying_power.to_string()),
+        ("equity", a.equity.to_string()),
+        ("today_pnl", (a.equity - a.last_equity).to_string()),
+        ("trading_blocked", a.trading_blocked.to_string()),
+        ("account_blocked", a.account_blocked.to_string()),
+    ] {
+        println!("{k:>16}: {v}");
     }
+    Ok(())
+}
+
+fn data_dir() -> Result<std::path::PathBuf, String> {
+    Ok(config::home()?.join("data"))
+}
+
+fn fetch(from: &str, to: &str, symbols: &[String]) -> Result<(), String> {
+    let today = chrono::Utc::now().date_naive();
+    if history::canonical_date(to)? >= today {
+        return Err(format!(
+            "--to must be before today ({today}) so no day is partial"
+        ));
+    }
+    let alpaca = connect()?;
+    eprintln!(
+        "fetching {} symbols, {from} .. {to}, feed {}",
+        symbols.len(),
+        history::FEED
+    );
+    let r = history::fetch_range(&alpaca, &data_dir()?, symbols, from, to, &mut |d| {
+        eprintln!("  {d}")
+    })?;
+    println!(
+        "{} sessions; {} symbol-days downloaded, {} already cached",
+        r.sessions, r.downloaded, r.cached
+    );
+    Ok(())
+}
+
+struct Opts {
+    fold_days: usize,
+    seeds: usize,
+    holdout: bool,
+    holdout_again: bool,
+}
+
+/// The pinned holdout start: read from `data/holdout_from`, or set once from the loaded days.
+fn holdout_from(dir: &Path, dates: &[&str]) -> Result<String, String> {
+    let path = dir.join("holdout_from");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let s = s.trim().to_string();
+        history::canonical_date(&s).map_err(|e| format!("{}: {e}", path.display()))?;
+        return Ok(s);
+    }
+    if dates.len() <= HOLDOUT_SESSIONS {
+        return Err(format!(
+            "{} sessions loaded: need more than {HOLDOUT_SESSIONS} to set aside a holdout",
+            dates.len()
+        ));
+    }
+    let pinned = dates[dates.len() - HOLDOUT_SESSIONS].to_string();
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    std::fs::write(&path, format!("{pinned}\n"))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    eprintln!(
+        "holdout pinned: sessions from {pinned} on (in {}); research stays before it",
+        path.display()
+    );
+    Ok(pinned)
+}
+
+/// Walk-forward test windows of `fold_days`; a short last window joins the one before it.
+fn folds(results: &[DayResult], fold_days: usize) -> Vec<Vec<DayResult>> {
+    let mut folds: Vec<Vec<DayResult>> = results
+        .chunks(fold_days)
+        .map(<[DayResult]>::to_vec)
+        .collect();
+    if folds.len() > 1 && folds.last().is_some_and(|f| f.len() < fold_days) {
+        let tail = folds.pop().unwrap_or_default();
+        if let Some(prev) = folds.last_mut() {
+            prev.extend(tail);
+        }
+    }
+    folds
+}
+
+fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<(), String> {
+    let dir = data_dir()?;
+    let days = history::load_range(&dir, symbols, from, to)?;
+    let dates: Vec<&str> = days.iter().map(|d| d.date.as_str()).collect();
+    let cut_date = holdout_from(&dir, &dates)?;
+    let cut = days.partition_point(|d| d.date < cut_date);
+    if cut == 0 {
+        return Err(format!(
+            "every loaded day is in the holdout (from {cut_date}): start earlier"
+        ));
+    }
+    let (research_days, holdout_days) = days.split_at(cut);
+    let log = dir.join("trials.jsonl");
+    let holdout_period = holdout_days
+        .first()
+        .zip(holdout_days.last())
+        .map(|(a, b)| format!("{}..{}", a.date, b.date));
+    if o.holdout {
+        let period = holdout_period.as_deref().ok_or(format!(
+            "no loaded days on or after the holdout start {cut_date}"
+        ))?;
+        let seen = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.contains("\"orb-holdout\"") && l.contains(&cut_date));
+        if seen && !o.holdout_again {
+            return Err(format!(
+                "the holdout from {cut_date} was already evaluated (see {}); pass --holdout-again only if you mean to spend it twice",
+                log.display()
+            ));
+        }
+        eprintln!("evaluating the holdout {period}");
+    }
+
+    let orb = OrbParams::default();
+    let settings = |entry| Settings {
+        vetting: false,
+        orb: orb.clone(),
+        entry,
+    };
+    let span = if o.holdout { &days[..] } else { research_days };
+    let results = backtest::run(span, settings(Entry::Orb), FillModel::default())?;
+    let (research, holdout) = results.split_at(cut);
+    let mut baseline = Vec::new();
+    for seed in 1..=o.seeds as u64 {
+        baseline.extend(backtest::run(
+            research_days,
+            settings(Entry::Random { seed }),
+            FillModel::default(),
+        )?);
+    }
+
+    let s = backtest::summarize(research);
+    let ci = stats::bootstrap_expectancy(&stats::r_by_day(research), 2_000, 0.05, 42);
+    let period = format!("{}..{}", research_days[0].date, research_days[cut - 1].date);
+    let when = chrono::Utc::now().to_rfc3339();
+    let params = format!("{orb:?}");
+    stats::record_trial(
+        &log,
+        &stats::Trial::from_summary(&when, "orb", &params, &period, &s, ci.map(|c| c.0)),
+    )?;
+    let holdout_results = o.holdout.then_some(holdout);
+    if let (Some(h), Some(hp)) = (holdout_results, &holdout_period) {
+        let hs = backtest::summarize(h);
+        let label = format!("{hp} (holdout from {cut_date})");
+        stats::record_trial(
+            &log,
+            &stats::Trial::from_summary(&when, "orb-holdout", &params, &label, &hs, None),
+        )?;
+    }
+    let report = stats::p1_gate(
+        &folds(research, o.fold_days),
+        &baseline,
+        holdout_results,
+        &log,
+    )?;
+
+    let b = backtest::summarize(&baseline);
+    println!(
+        "research {period}: {cut} days, {} trades, {} missed entries",
+        s.trades, s.missed
+    );
+    println!(
+        "  win rate {:.1}%  expectancy {:.3}R  profit factor {:.2}  max drawdown {:.1}R  P&L {}",
+        100.0 * s.win_rate,
+        s.expectancy_r,
+        s.profit_factor,
+        s.max_drawdown_r,
+        s.pnl
+    );
+    println!(
+        "random baseline ({} seeds): {} trades, expectancy {:.3}R",
+        o.seeds, b.trades, b.expectancy_r
+    );
+    if let Some(h) = holdout_results {
+        let hs = backtest::summarize(h);
+        println!(
+            "HOLDOUT {}: {} trades, expectancy {:.3}R",
+            holdout_period.unwrap_or_default(),
+            hs.trades,
+            hs.expectancy_r
+        );
+    }
+    println!(
+        "\nP1 gate ({} trials logged in {}):",
+        stats::count_trials(&log)?,
+        log.display()
+    );
+    for c in &report.checks {
+        println!(
+            "  [{}] {}: {}",
+            if c.passed { "pass" } else { "FAIL" },
+            c.name,
+            c.detail
+        );
+    }
+    println!(
+        "{}",
+        if report.passed() {
+            "P1 GATE PASSED"
+        } else {
+            "P1 gate not passed"
+        }
+    );
+    Ok(())
 }
 
 fn fail(msg: &str) -> ! {
