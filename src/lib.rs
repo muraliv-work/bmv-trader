@@ -2,6 +2,7 @@
 
 pub mod broker;
 pub mod config;
+pub mod engine;
 pub mod money;
 pub mod risk;
 pub mod strategy;

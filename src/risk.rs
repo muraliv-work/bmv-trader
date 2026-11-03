@@ -52,10 +52,6 @@ impl Limits {
     pub fn mode(&self) -> Mode {
         self.mode
     }
-    /// What a pending candidate reserves while Claude decides (its size isn't known yet).
-    pub fn max_risk_per_trade(&self) -> Usd {
-        self.max_risk_per_trade
-    }
     pub fn daily_loss_halt(&self) -> Usd {
         self.daily_loss_halt
     }

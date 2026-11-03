@@ -12,7 +12,7 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 - [x] `strategy.rs`: Bar, Candidate, ORB-15 (tier 2)
 - [x] `vetting.rs` types: `Verdict { Approve, Reduce(Factor), Reject }` (tier 1, types only; parsing comes in P4)
 - [x] `risk.rs`: `Limits::for_mode`, `gate()` for every §9 rule, sizing, open-risk budget, clusters, `self_test()`; property tests (tier 1)
-- [ ] `engine.rs`: `State`, `Event`, `Effect`, pure `step()`; reservations; one trade per symbol; flatten timing (tier 1)
+- [x] `engine.rs`: `State`, `Event`, `Effect`, pure `step()`; reservations; one trade per symbol; flatten timing (tier 1)
 - [ ] `backtest.rs`: replay feeder + simulated broker (§13 fill model), trades → metrics (tier 2)
 - [ ] Research stats: day-block bootstrap, random-entry baseline, walk-forward split, trial log (tier 2)
 - [ ] `history.rs`: Alpaca bars `feed=iex`, throttled, resumable cache in `data/`; tested on saved responses (tier 2)
