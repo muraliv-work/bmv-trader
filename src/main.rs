@@ -13,6 +13,7 @@ const USAGE: &str = "usage:
   bmv-trader ui       [--port 8765]       web console on 127.0.0.1: the watch view plus STOP and flatten
   bmv-trader run      [--symbols ...] [--trend] [--marketable]   one paper session (PAPER ONLY; live is P5)
   bmv-trader flatten                      close every position and confirm (any mode)
+  bmv-trader backstop                     for launchd: near the close, flatten anything left (deploy/)
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
   bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--strategy orb|gap|vwap] [--symbols ...] [--fold-days 21]
                       [--seeds 5] [--holdout] [--holdout-again] [--trend] [--marketable]
@@ -141,6 +142,7 @@ fn main() {
             Some("watch") => watch(),
             Some("ui") => ui(args.num("--port", 8765, 1024..=65535)?),
             Some("flatten") => flatten(),
+            Some("backstop") => backstop(),
             Some("run") => run(&args.symbols()?, args.has("--trend"), orb_params(&args)),
             Some("fetch") => {
                 let (from, to) = args.dates()?;
@@ -321,6 +323,18 @@ fn ui(port: usize) -> Result<(), String> {
     ui::serve(&connect()?, &config::home()?, &mode, port)
 }
 
+/// launchd runs this every 2 minutes (deploy/). Between closes it exits at once, without the
+/// network or the Keychain; near a close it flattens anything left (any mode, like `flatten`).
+fn backstop() -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp();
+    if !live::maybe_near_close(now) {
+        return Ok(());
+    }
+    let msg = live::backstop(&connect()?, now)?;
+    println!("{} {msg}", chrono::Utc::now().to_rfc3339());
+    Ok(())
+}
+
 /// The emergency exit, allowed in both modes.
 fn flatten() -> Result<(), String> {
     let a = connect()?;
@@ -337,6 +351,7 @@ fn run(symbols: &[String], trend: bool, orb: OrbParams) -> Result<(), String> {
     live::refuse_live(mode)?;
     eprintln!("mode: PAPER");
     let home = config::home()?;
+    let _lock = live::lock_run(&home)?;
     let settings = Settings {
         vetting: false,
         orb,

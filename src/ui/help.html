@@ -111,6 +111,7 @@ rm data/STOP</code></pre>
     <li>If you want out now, <a href="#flatten">close everything</a>.</li>
     <li>Don't start <code>run</code> again today; it refuses anyway. Start fresh tomorrow before 09:25.</li>
   </ol>
+  <p>If you installed the launchd backstop (<code>deploy/README.md</code>), it closes anything left from 3 minutes before the close on its own. It logs to <code>data/backstop.log</code>.</p>
 </section>
 
 <section id="research">
@@ -145,6 +146,7 @@ security add-generic-password -s bmv-trader -a ALPACA_PAPER_SECRET -w</code></pr
     <tbody>
       <tr><td>kill switch engaged at startup</td><td><a href="#clear">Clear STOP</a> if you meant to, then start again</td></tr>
       <tr><td>a run already started today</td><td>Nothing until tomorrow</td></tr>
+      <tr><td>another `run` is active</td><td>One is already running in another window; use that one</td></tr>
       <tr><td>account not flat</td><td><code>cargo run --release -- flatten</code>, then start again</td></tr>
       <tr><td>local clock is … ms off Alpaca's</td><td>System Settings → General → Date &amp; Time → set automatically</td></tr>
       <tr><td>… is not a trading day</td><td>Weekend or holiday; nothing to do</td></tr>

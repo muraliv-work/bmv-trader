@@ -893,6 +893,83 @@ pub fn startup(
     )
 }
 
+/// Held for the whole run, so a second `run` (another terminal, a stray launchd job) fails
+/// instead of trading the same account twice. The OS releases it when the process exits.
+#[derive(Debug)]
+pub struct RunLock(#[allow(dead_code)] std::fs::File);
+
+pub fn lock_run(home: &Path) -> Result<RunLock, String> {
+    let path = home.join("data").join("run.lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("run lock {}: {e}", path.display()))?;
+    match f.try_lock() {
+        Ok(()) => Ok(RunLock(f)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "another `run` is active ({} is locked)",
+            path.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("run lock {}: {e}", path.display())),
+    }
+}
+
+/// The backstop acts from this long before the close (the engine flattens at 5 minutes)...
+pub const BACKSTOP_BEFORE_SECS: i64 = 180;
+/// ...until this long after it.
+pub const BACKSTOP_AFTER_SECS: i64 = 900;
+
+/// Cheap local check, no network: could `now` be near a regular (16:00) or half-day (13:00) close?
+/// Weekends never are. The calendar then decides exactly.
+pub fn maybe_near_close(now: i64) -> bool {
+    use chrono::{Datelike, Timelike};
+    let Some(t) = chrono::DateTime::from_timestamp(now, 0) else {
+        return false;
+    };
+    let et = t.with_timezone(&chrono_tz::America::New_York);
+    if et.weekday().number_from_monday() > 5 {
+        return false;
+    }
+    let secs = i64::from(et.num_seconds_from_midnight());
+    [13 * 3600, 16 * 3600]
+        .iter()
+        .any(|close| (close - BACKSTOP_BEFORE_SECS..=close + BACKSTOP_AFTER_SECS).contains(&secs))
+}
+
+/// The flatten backstop (DESIGN §12), run by launchd every 2 minutes: near today's real close,
+/// if anything is still open (the engine died, hung or the Mac slept), close everything.
+pub fn backstop(alpaca: &Alpaca, now: i64) -> Result<String, String> {
+    let today = chrono::DateTime::from_timestamp(now, 0)
+        .ok_or("bad clock")?
+        .with_timezone(&chrono_tz::America::New_York)
+        .date_naive()
+        .to_string();
+    let rows: Vec<CalendarRow> = alpaca.get(
+        Api::Trading,
+        &format!("/v2/calendar?start={today}&end={today}"),
+    )?;
+    let session = match pick_session(&rows, &today) {
+        Ok(s) => s,
+        Err(_) => return Ok(format!("{today}: no session")),
+    };
+    if !(session.close - BACKSTOP_BEFORE_SECS..=session.close + BACKSTOP_AFTER_SECS).contains(&now)
+    {
+        return Ok("not near today's close".into());
+    }
+    let (positions, orders) = (alpaca.positions()?, open_orders(alpaca)?);
+    if positions.is_empty() && orders.is_empty() {
+        return Ok("flat".into());
+    }
+    let left = require_flat(&positions, &orders).unwrap_err();
+    flatten(alpaca, 10, &mut || {
+        std::thread::sleep(Duration::from_secs(1))
+    })
+    .map(|()| format!("FLATTENED by the backstop: {left}"))
+    .map_err(|e| format!("BACKSTOP FLATTEN FAILED ({left}): {e}"))
+}
+
 /// Ticks every LOOP_SECS until the day is done. On an error, closes everything and returns it.
 pub fn run(r: &mut Runner<Alpaca>, home: &Path) -> Result<(), String> {
     let stop = safety::stop_path(home);
@@ -1977,6 +2054,30 @@ mod tests {
         }
         assert!(check_skew("2024-01-02T09:30:00.5-05:00", ms + 500).is_ok());
         assert!(check_skew("garbage", ms).is_err());
+    }
+
+    #[test]
+    fn a_second_run_lock_is_refused_until_the_first_is_dropped() {
+        let t = Tmp::new();
+        std::fs::create_dir_all(t.0.join("data")).unwrap();
+        let first = lock_run(&t.0).unwrap();
+        let err = lock_run(&t.0).unwrap_err();
+        assert!(err.contains("another `run` is active"), "{err}");
+        drop(first);
+        assert!(lock_run(&t.0).is_ok());
+    }
+
+    #[test]
+    fn the_backstop_only_wakes_near_a_close_on_weekdays() {
+        // 2024-01-02 (Tue) 09:30 ET = OPEN; 16:00 ET = OPEN + 6.5 h
+        let close = OPEN + 390 * 60;
+        assert!(!maybe_near_close(OPEN));
+        assert!(!maybe_near_close(close - BACKSTOP_BEFORE_SECS - 1));
+        assert!(maybe_near_close(close - BACKSTOP_BEFORE_SECS));
+        assert!(maybe_near_close(close + BACKSTOP_AFTER_SECS));
+        assert!(!maybe_near_close(close + BACKSTOP_AFTER_SECS + 1));
+        assert!(maybe_near_close(close - 3 * 3600), "13:00 half-day close");
+        assert!(!maybe_near_close(close + 4 * 86_400), "Saturday");
     }
 
     #[test]

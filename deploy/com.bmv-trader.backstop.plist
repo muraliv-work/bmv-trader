@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Flatten backstop (DESIGN §12): every 2 minutes, `bmv-trader backstop`. Between closes it exits
+     at once; near today's close it flattens anything the engine left. Install: deploy/README.md -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bmv-trader.backstop</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/target/release/bmv-trader</string>
+    <string>backstop</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BMV_HOME</key>
+    <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>120</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/data/backstop.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/data/backstop.log</string>
+</dict>
+</plist>
