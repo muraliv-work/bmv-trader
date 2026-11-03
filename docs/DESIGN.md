@@ -317,7 +317,7 @@ More AI authority is earned one level at a time. Each level is enabled only afte
 - **Entry:** filled at the next bar if that bar trades through the limit. Otherwise it's a **miss**. Misses are counted, because missed runaway breakouts flatter the results.
 - **Stop and target in the same bar:** assume the stop hit first.
 - **Stop through a gap:** filled at min(stop, bar open) − slippage.
-- **Slippage:** 1¢ + 0.02% each way.
+- **Slippage:** 1¢ + 0.02% of the fill price on market fills (stops, flattens). Limit orders (the entry and the target) fill at their own price, and only when a bar trades strictly through it; a touch is a miss. An entry can't fill after its 1-minute time-to-live.
 - **Partial fills:** a 10% random partial rate, as in Alpaca's paper simulation.
 
 **Baseline**
@@ -335,6 +335,7 @@ More AI authority is earned one level at a time. Each level is enabled only afte
 - Lower 95% bound of expectancy > 0 after costs (day-block bootstrap) in walk-forward
 - Beats the random-entry baseline
 - Profit factor > 1.2 and max drawdown < 10R
+- At least 100 trades (a run with no winners has a profit factor of 0, never "infinite")
 - The final holdout is positive
 
 **Why Claude isn't backtested:** its training data may already contain how those past days turned out (look-ahead bias). Its value is measured forward only.

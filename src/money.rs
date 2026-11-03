@@ -74,6 +74,9 @@ pub fn risk_per_share(entry: Price, stop: Price) -> Option<Usd> {
 }
 
 impl Price {
+    /// The lowest valid price, used as the worst case when a computed price isn't valid.
+    pub const PENNY: Price = Price(1);
+
     pub fn from_cents(c: i64) -> Option<Self> {
         (c > 0).then_some(Price(c))
     }
