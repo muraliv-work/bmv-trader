@@ -1,5 +1,5 @@
 use bmv_trader::backtest::{self, DayResult, FillModel};
-use bmv_trader::engine::{Entry, Settings};
+use bmv_trader::engine::{self, Entry, Settings};
 use bmv_trader::strategy::OrbParams;
 use bmv_trader::{broker, config, config::Mode, history, stats};
 use std::collections::BTreeMap;
@@ -10,11 +10,12 @@ const USAGE: &str = "usage:
   bmv-trader account
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...]
   bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--symbols ...] [--fold-days 21]
-                      [--seeds 5] [--holdout] [--holdout-again]
+                      [--seeds 5] [--holdout] [--holdout-again] [--trend]
 
 The holdout start date is pinned in data/holdout_from on the first backtest (the last 63 sessions
 loaded) and research never uses days from it on. --holdout evaluates it once; a second evaluation
-of the same holdout needs --holdout-again, and should be rare.";
+of the same holdout needs --holdout-again, and should be rare. --trend only takes breakouts while
+SPY and the symbol trend up today (above VWAP and the open); it is logged as its own trial.";
 
 /// The v1 watchlist (DESIGN §7).
 const WATCHLIST: &str = "SPY,QQQ,AAPL,MSFT,NVDA,AMD,META,AMZN,GOOGL,TSLA";
@@ -25,7 +26,7 @@ const MAX_SEEDS: usize = 50;
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
 const VALUE_FLAGS: [&str; 5] = ["--from", "--to", "--symbols", "--fold-days", "--seeds"];
-const SWITCHES: [&str; 2] = ["--holdout", "--holdout-again"];
+const SWITCHES: [&str; 3] = ["--holdout", "--holdout-again", "--trend"];
 
 struct Args {
     values: BTreeMap<String, String>,
@@ -128,6 +129,7 @@ fn main() {
                     seeds: args.num("--seeds", 5, 1..=MAX_SEEDS)?,
                     holdout: args.has("--holdout"),
                     holdout_again: args.has("--holdout-again"),
+                    trend: args.has("--trend"),
                 };
                 run_backtest(&from, &to, &args.symbols()?, &opts)
             }
@@ -197,6 +199,8 @@ struct Opts {
     seeds: usize,
     holdout: bool,
     holdout_again: bool,
+    /// Only trade while SPY and the symbol trend up today; a separate trial from plain ORB.
+    trend: bool,
 }
 
 /// The pinned holdout start: read from `data/holdout_from`, or set once from the loaded days.
@@ -240,6 +244,12 @@ fn folds(results: &[DayResult], fold_days: usize) -> Vec<Vec<DayResult>> {
 }
 
 fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<(), String> {
+    if o.trend && !symbols.iter().any(|s| s == engine::MARKET) {
+        return Err(format!(
+            "--trend reads {} to judge the market; add it to --symbols",
+            engine::MARKET
+        ));
+    }
     let dir = data_dir()?;
     let days = history::load_range(&dir, symbols, from, to)?;
     let dates: Vec<&str> = days.iter().map(|d| d.date.as_str()).collect();
@@ -278,6 +288,7 @@ fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<()
         vetting: false,
         orb: orb.clone(),
         entry,
+        trend_filter: o.trend,
     };
     let span = if o.holdout { &days[..] } else { research_days };
     let results = backtest::run(span, settings(Entry::Orb), FillModel::default())?;
@@ -295,10 +306,11 @@ fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<()
     let ci = stats::bootstrap_expectancy(&stats::r_by_day(research), 2_000, 0.05, 42);
     let period = format!("{}..{}", research_days[0].date, research_days[cut - 1].date);
     let when = chrono::Utc::now().to_rfc3339();
-    let params = format!("{orb:?}");
+    let params = format!("{orb:?} trend_filter={}", o.trend);
+    let strategy_name = if o.trend { "orb+trend" } else { "orb" };
     stats::record_trial(
         &log,
-        &stats::Trial::from_summary(&when, "orb", &params, &period, &s, ci.map(|c| c.0)),
+        &stats::Trial::from_summary(&when, strategy_name, &params, &period, &s, ci.map(|c| c.0)),
     )?;
     let holdout_results = o.holdout.then_some(holdout);
     if let (Some(h), Some(hp)) = (holdout_results, &holdout_period) {
@@ -306,7 +318,14 @@ fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<()
         let label = format!("{hp} (holdout from {cut_date})");
         stats::record_trial(
             &log,
-            &stats::Trial::from_summary(&when, "orb-holdout", &params, &label, &hs, None),
+            &stats::Trial::from_summary(
+                &when,
+                &format!("{strategy_name}-holdout"),
+                &params,
+                &label,
+                &hs,
+                None,
+            ),
         )?;
     }
     let report = stats::p1_gate(

@@ -20,9 +20,10 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 - [ ] ⛔ Download history (needs keys) and run the P1 gate (§13) → owner decides: go to P2, iterate, or stop
 
 ## P2 — Safety core
-- [ ] Broker orders: bracket submit (idempotent client_order_id), cancel, `close_all`, OCO for partial fills, typed Order/Position (tier 1)
-- [ ] Kill switch at `$BMV_HOME/data/STOP`, reconcile from Alpaca, startup self-tests (tier 1)
-- [ ] `cargo-mutants` on `risk.rs`: no surviving mutants in limit checks
+- [x] Broker orders: bracket submit (idempotent client_order_id), cancel, `close_all`, OCO for partial fills, typed Order/Position (tier 1). Send-once `Bracket`, `Exits` token for the OCO, typed `Cancel`, `close_position`; Alpaca error codes still **[verify codes]**
+- [x] Kill switch at `$BMV_HOME/data/STOP` and startup self-tests (`safety.rs`, tier 1)
+- [ ] Reconcile from Alpaca into the engine; wire `startup_checks` at boot and poll the kill switch every Tick (lands with the P3 run loop)
+- [x] `cargo-mutants` on `risk.rs`: no surviving mutants in limit checks (4 equivalent mutants in the post-sizing `within` check, explained in the QA report)
 - [ ] ⛔ Paper tests that resolve every [verify] in DESIGN
 
 ## P3 — Paper engine

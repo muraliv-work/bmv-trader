@@ -147,7 +147,8 @@ impl fmt::Display for Rejection {
 }
 
 /// A sized, risk-checked bracket order. Fields are private and it isn't Clone: only `gate`
-/// creates one, and the broker's submit takes it by value, so it can't be sent twice.
+/// creates one, and `broker::Bracket` binds it by value to one client id that `submit_bracket`
+/// consumes, so it can't be sent twice; only an Unknown outcome hands it back, same id.
 #[derive(Debug, PartialEq, Eq)]
 pub struct OrderIntent {
     mode: Mode,
@@ -517,6 +518,34 @@ mod tests {
     fn self_test_passes_for_both_modes() {
         assert_eq!(self_test(&paper()), Ok(()));
         assert_eq!(self_test(&live()), Ok(()));
+    }
+
+    #[test]
+    fn self_test_expects_the_risk_cap_when_it_binds() {
+        // $10 risk cap, $100k notional cap: 10 shares of the $1-R test trade, not 1000.
+        let l = Limits {
+            max_risk_per_trade: usd(10),
+            max_notional: usd(100_000),
+            ..paper()
+        };
+        assert_eq!(self_test(&l), Ok(()));
+    }
+
+    #[test]
+    fn self_test_fails_when_the_normal_trade_is_mis_sized() {
+        // A $10 daily budget shrinks the 25-share paper trade to 10; the self-test must notice.
+        let l = Limits {
+            daily_loss_halt: usd(10),
+            ..paper()
+        };
+        assert!(self_test(&l).unwrap_err().contains("normal trade"));
+    }
+
+    #[test]
+    fn exposure_uppercases_and_clamps_negative_risk() {
+        let e = exposure("spy", 7);
+        assert_eq!((e.symbol(), e.risk()), ("SPY", usd(7)));
+        assert_eq!(exposure("spy", -5).risk(), Usd::ZERO);
     }
 
     // --- sizing -------------------------------------------------------------------------------

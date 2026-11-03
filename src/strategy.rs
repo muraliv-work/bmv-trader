@@ -136,6 +136,40 @@ impl OrbParams {
     }
 }
 
+/// Today's direction so far, from regular-hours bars only (DESIGN §7: no premarket, no prior day).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trend {
+    Up,
+    Down,
+    Flat,
+}
+
+/// Up: the last close is above both today's VWAP and today's first open; Down: below both.
+/// Too few bars, bad bars or no volume mean Flat, which a trend filter treats as "don't trade".
+pub fn trend(bars: &[Bar], min_bars: usize) -> Trend {
+    let (Some(first), Some(last)) = (bars.first(), bars.last()) else {
+        return Trend::Flat;
+    };
+    if bars.len() < min_bars.max(1) || !bars.iter().all(Bar::is_sane) {
+        return Trend::Flat;
+    }
+    let (pv, vol) = bars.iter().fold((0.0, 0.0), |(pv, vol), b| {
+        let v = b.volume as f64;
+        (pv + (b.high + b.low + b.close) / 3.0 * v, vol + v)
+    });
+    if vol <= 0.0 {
+        return Trend::Flat;
+    }
+    let vwap = pv / vol;
+    if last.close > vwap && last.close > first.open {
+        Trend::Up
+    } else if last.close < vwap && last.close < first.open {
+        Trend::Down
+    } else {
+        Trend::Flat
+    }
+}
+
 /// ORB long (DESIGN §7), evaluated on the **last** bar of `bars` — today's regular-hours bars so far,
 /// oldest first. Fires only on the first bar after the opening range that closes above its high
 /// (if that bar fails the volume filter, the day is done), with volume above the average of the
@@ -588,5 +622,46 @@ mod tests {
         assert!(mk(100, 100, 102).is_err());
         assert!(mk(100, 101, 102).is_err());
         assert!(mk(100, 99, 100).is_err());
+    }
+
+    fn tb(open: f64, close: f64, volume: u64) -> Bar {
+        Bar {
+            ts: 0,
+            open,
+            high: open.max(close) + 0.1,
+            low: open.min(close) - 0.1,
+            close,
+            volume,
+        }
+    }
+
+    #[test]
+    fn trend_follows_price_versus_vwap_and_the_open() {
+        let rising: Vec<Bar> = (0..20)
+            .map(|i| tb(100.0 + i as f64 * 0.1, 100.1 + i as f64 * 0.1, 100))
+            .collect();
+        let falling: Vec<Bar> = (0..20)
+            .map(|i| tb(100.0 - i as f64 * 0.1, 99.9 - i as f64 * 0.1, 100))
+            .collect();
+        assert_eq!(trend(&rising, 10), Trend::Up);
+        assert_eq!(trend(&falling, 10), Trend::Down);
+        // back at the open after a rally: above VWAP? no, below; not below the open either → Flat
+        let mut round_trip = rising.clone();
+        round_trip.push(tb(101.9, 100.0, 100));
+        assert_eq!(trend(&round_trip, 10), Trend::Flat);
+    }
+
+    #[test]
+    fn trend_is_flat_when_it_cannot_tell() {
+        let rising: Vec<Bar> = (0..20)
+            .map(|i| tb(100.0 + i as f64 * 0.1, 100.1 + i as f64 * 0.1, 100))
+            .collect();
+        assert_eq!(trend(&[], 10), Trend::Flat);
+        assert_eq!(trend(&rising[..5], 10), Trend::Flat, "too few bars");
+        let silent: Vec<Bar> = rising.iter().map(|b| Bar { volume: 0, ..*b }).collect();
+        assert_eq!(trend(&silent, 10), Trend::Flat, "no volume");
+        let mut bad = rising.clone();
+        bad[3].close = f64::NAN;
+        assert_eq!(trend(&bad, 10), Trend::Flat, "bad bar");
     }
 }

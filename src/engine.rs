@@ -31,7 +31,16 @@ pub struct Settings {
     pub vetting: bool,
     pub orb: OrbParams,
     pub entry: Entry,
+    /// Only take longs while both the market (SPY) and the symbol trend up today.
+    pub trend_filter: bool,
 }
+
+/// The market the trend filter reads; its bars must be in the feed, or nothing trades.
+pub const MARKET: &str = "SPY";
+
+/// The newest market bar the trend filter may read is at most this old (one missing minute
+/// tolerated); an older one means the market feed stalled, and a stale trend is unknown.
+const MARKET_STALE_SECS: i64 = 120;
 
 /// Which rule turns bars into candidates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,6 +398,21 @@ impl State {
         self.housekeeping(out);
 
         let (bars, p) = (&self.bars[&symbol], &self.settings.orb);
+        if self.settings.trend_filter {
+            let up = |b: &[Bar]| strategy::trend(b, p.min_or_bars) == strategy::Trend::Up;
+            // The market's minutes strictly before this bar: its same-minute bar may or may not
+            // have arrived yet (replay sorts by symbol), so using it would make results order-dependent.
+            let market = self
+                .bars
+                .get(MARKET)
+                .map_or(&[][..], |m| &m[..m.partition_point(|b| b.ts < bar.ts)]);
+            let fresh = market
+                .last()
+                .is_some_and(|m| bar.ts - m.ts <= MARKET_STALE_SECS);
+            if !(fresh && up(market) && up(bars)) {
+                return;
+            }
+        }
         let candidate = match self.settings.entry {
             Entry::Orb => strategy::orb_long(&symbol, open, bars, p),
             Entry::Random { seed } => strategy::random_long(&symbol, open, bars, p, seed),
@@ -829,6 +853,7 @@ mod tests {
                 vetting,
                 orb: OrbParams::default(),
                 entry: Entry::Orb,
+                trend_filter: false,
             },
         )
         .unwrap();
@@ -941,12 +966,14 @@ mod tests {
                 ..OrbParams::default()
             },
             entry: Entry::Orb,
+            trend_filter: false,
         };
         assert!(State::new(Limits::for_mode(Mode::Paper), bad).is_err());
         let random = Settings {
             vetting: false,
             orb: OrbParams::default(),
             entry: Entry::Random { seed: 1 },
+            trend_filter: false,
         };
         assert!(State::new(Limits::for_mode(Mode::Paper), random.clone()).is_ok());
         assert!(
@@ -963,6 +990,7 @@ mod tests {
                 vetting: false,
                 orb: OrbParams::default(),
                 entry: Entry::Orb,
+                trend_filter: false,
             },
         )
         .unwrap();
@@ -1078,6 +1106,119 @@ mod tests {
     }
 
     #[test]
+    fn trend_filter_trades_only_with_the_market() {
+        let filtered = || {
+            let mut e = State::new(
+                Limits::for_mode(Mode::Paper),
+                Settings {
+                    vetting: false,
+                    orb: OrbParams::default(),
+                    entry: Entry::Orb,
+                    trend_filter: true,
+                },
+            )
+            .unwrap();
+            e.step(start("2024-01-02", 0));
+            e
+        };
+        let submitted = |fx: &[Effect]| fx.iter().any(|f| matches!(f, Effect::Submit { .. }));
+        // SPY sliding from 500 to 498.5 over the same 16 minutes
+        let spy_down: Vec<Bar> = (0..16)
+            .map(|m| {
+                let c = 500.0 - m as f64 * 0.1;
+                bar(m, c + 0.2, c - 0.2, c, 5000)
+            })
+            .collect();
+        let spy_up: Vec<Bar> = (0..16)
+            .map(|m| {
+                let c = 500.0 + m as f64 * 0.1;
+                bar(m, c + 0.2, c - 0.2, c, 5000)
+            })
+            .collect();
+
+        let mut e = filtered();
+        feed(&mut e, "SPY", spy_down.clone());
+        assert!(!submitted(&breakout_day(&mut e, "AAPL")), "market falling");
+
+        let mut e = filtered();
+        feed(&mut e, "SPY", spy_up.clone());
+        assert!(submitted(&breakout_day(&mut e, "AAPL")), "market rising");
+
+        let mut e = filtered();
+        assert!(
+            !submitted(&breakout_day(&mut e, "AAPL")),
+            "no SPY bars: can't tell, so no trade"
+        );
+
+        // SPY's minute-15 bar crashes; whether it lands before or after AAPL's minute-15 breakout,
+        // the filter reads SPY only through minute 14, so the result can't depend on arrival order
+        let crash = bar(15, 501.6, 480.0, 480.0, 5000);
+        let mut e = filtered();
+        feed(&mut e, "SPY", spy_up[..15].to_vec());
+        feed(&mut e, "SPY", [crash]);
+        assert!(submitted(&breakout_day(&mut e, "AAPL")), "SPY bar first");
+        let mut e = filtered();
+        feed(&mut e, "SPY", spy_up[..15].to_vec());
+        let fx = breakout_day(&mut e, "AAPL");
+        feed(&mut e, "SPY", [crash]);
+        assert!(submitted(&fx), "SPY bar after");
+
+        // a later SPY minute already in (AAPL's bar is late) must not be read: no look-ahead
+        let mut e = filtered();
+        feed(&mut e, "SPY", spy_down[..15].to_vec());
+        feed(&mut e, "SPY", [bar(16, 520.0, 519.0, 519.5, 5000)]);
+        assert!(!submitted(&breakout_day(&mut e, "AAPL")), "future SPY bar");
+
+        // SPY's feed stalls: one missing minute is tolerated, an older last bar means no trade
+        let mut e = filtered();
+        feed(&mut e, "SPY", spy_up[..14].to_vec());
+        assert!(
+            submitted(&breakout_day(&mut e, "AAPL")),
+            "SPY minute 14 missing"
+        );
+        let mut e = filtered();
+        feed(&mut e, "SPY", spy_up[..13].to_vec());
+        assert!(
+            !submitted(&breakout_day(&mut e, "AAPL")),
+            "SPY stale since minute 12"
+        );
+    }
+
+    #[test]
+    fn trend_filter_gates_the_random_baseline_like_orb() {
+        // AAPL drifts up all day; SPY drifts with `spy_step` per minute. One bar each per minute.
+        let run = |trend_filter: bool, spy_step: f64| {
+            let mut e = State::new(
+                Limits::for_mode(Mode::Paper),
+                Settings {
+                    vetting: false,
+                    orb: OrbParams::default(),
+                    entry: Entry::Random { seed: 7 },
+                    trend_filter,
+                },
+            )
+            .unwrap();
+            e.step(start("2024-01-02", 0));
+            let mut fx = Vec::new();
+            for m in 0..330 {
+                let s = 500.0 + m as f64 * spy_step;
+                fx.extend(feed(&mut e, "SPY", [bar(m, s + 0.2, s - 0.2, s, 5000)]));
+                let c = 100.0 + m as f64 * 0.01;
+                fx.extend(feed(&mut e, "AAPL", [bar(m, c + 1.0, c - 1.0, c, 1000)]));
+            }
+            submits(&fx)
+                .into_iter()
+                .filter(|(id, _)| id.contains("AAPL"))
+                .map(|(id, q)| (id.to_string(), q))
+                .collect::<Vec<_>>()
+        };
+        let plain = run(false, 0.01);
+        assert!(!plain.is_empty(), "the seed's minute falls inside the day");
+        assert_eq!(run(true, 0.01), plain, "market up: same trades");
+        assert!(run(true, -0.01).is_empty(), "market down: none");
+    }
+
+    #[test]
     fn reservations_count_while_claude_thinks() {
         // six symbols in different clusters break out in the same minute; the limit is 5 positions
         let mut e = engine(true);
@@ -1108,6 +1249,7 @@ mod tests {
                 vetting: false,
                 orb: OrbParams::default(),
                 entry: Entry::Orb,
+                trend_filter: false,
             },
         )
         .unwrap();

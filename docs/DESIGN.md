@@ -1,6 +1,7 @@
 # bmv-trader — System Design
 
-Status: draft v3 · 2026-11-02 · Current phase: **P0**
+Status: draft v3 · 2026-11-02 · Current phase: **P1 (gate pending), P2 in progress**
+See also: [DECISION.md](DECISION.md) (key decisions and why) · [FLOW.md](FLOW.md) (how the flow runs, who decides).
 v3 incorporates 4 independent reviews (architecture, silent failures, type design, trading/broker fact-check). Alpaca facts are checked against docs.alpaca.markets as of 2026-11-02; anything marked **[verify]** must be tested in paper during P2 before code relies on it.
 
 ## 1. Goal
@@ -200,6 +201,7 @@ On a half-day (close at 13:00), all of this shifts automatically.
 - **Target:** 2R. Exit at flatten time regardless.
 - **Size** (in `risk.rs`, not the strategy): `qty = min(risk_per_trade / R, max_position / entry)` in integer cents. If qty < 1, no trade. `Candidate` carries prices only.
 - **One trade per symbol per day**, derived from today's Alpaca orders via the `client_order_id` prefix
+- **Optional trend filter (`--trend`, its own trial):** a breakout is taken only while both SPY and the symbol trend **up** today: last close above today's VWAP and above today's first open. Too few bars, bad bars, no volume or missing SPY bars mean "can't tell", so no trade. The random baseline uses the same filter, so the comparison still isolates the entry signal.
 - **Shorts:** off in v1
 
 ## 8. Decision pipeline (one candidate)
@@ -222,6 +224,8 @@ On a half-day (close at 13:00), all of this shifts automatically.
    - A submit error means the outcome is **unknown**, not failed. Reconcile by `client_order_id` before doing anything else.
    - **Entry time-to-live = 1 bar.** If the entry isn't filled, cancel it.
    - **Partial fill:** Alpaca activates the bracket legs only when the entry is *completely* filled. So cancel the rest of the entry and immediately submit an OCO (stop + target) for the filled quantity, or close it **[verify OCO]**.
+   - The OCO's client id is the entry id plus `-x`. **If Alpaca refuses the OCO** (for example the price is already below the stop), close that position immediately with `close_position`.
+   - `close_all` / `close_position` returning Ok means the close was **accepted**, not that the account is flat: confirm with `positions()`.
    - **Both legs filled** (Alpaca warns this can happen in fast markets): the minute-by-minute reconcile detects the unexpected short and closes it.
 8. **Journal** records every step: the decision, the order id, the fills and the outcome.
 

@@ -7,6 +7,7 @@ pub mod engine;
 pub mod history;
 pub mod money;
 pub mod risk;
+pub mod safety;
 pub mod stats;
 pub mod strategy;
 pub mod vetting;

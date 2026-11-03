@@ -440,6 +440,7 @@ mod tests {
             vetting: false,
             orb: OrbParams::default(),
             entry: Entry::Orb,
+            trend_filter: false,
         }
     }
 
