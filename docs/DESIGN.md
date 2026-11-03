@@ -394,6 +394,39 @@ Trial 4 was starved: ten mega-caps rarely gap 1%. This trial keeps trial 4's rul
 - **Period:** research from **2020-09-01** (the first month after IEX history starts is the 20-day warm-up) to 2025-10-01. The holdout stays pinned from 2025-10-02.
 - **One trial.** Changing any threshold above is a new trial.
 
+## 13c. Trial 7: 12-1 month momentum (pre-registered 2026-11-03, before any data)
+
+Trials 1–6 tested intraday long-only rules and all failed after costs. This is the effect with the longest record in the literature: stocks that rose most over the past year, skipping the last month, tend to keep outperforming for a few months. It holds positions for a month, so costs matter far less. It needs multi-day holding in the engine before it could trade; that is built only if it passes.
+
+- **Data:** daily bars from the **SIP feed with `adjustment=all`** (splits and dividends), 2016-01-01 to 2026-10-30, in `data/daily/sip-all/` (`fetch-daily --adjusted`).
+  - It differs from §13's IEX rule for two reasons. IEX history only starts in mid-2020. And a monthly signal on closing prices hardly depends on the feed. A live version would read the same SIP daily history, which Alpaca serves for free once it is over 15 minutes old.
+- **Universe:** the same symbol list as trial 6 (§13b), active and inactive, with the same known biases. ETFs, including leveraged ones, pass. Stocks delisted to OTC are missing, which flatters a long strategy.
+- **Calendar:** the dates SPY has a bar. **Rebalance** on the first session of each month. The **signal day** is the session before it.
+- **Eligible** on the signal day, s = the signal session:
+  - The stock has a bar on s, on s−21 and on s−252 (sessions).
+  - Its average dollar volume, close × volume, over the 63 sessions ending at s is at least **$20M**, with bars on at least 60 of them. Dollar volume doesn't change with split adjustment.
+  - There is no price floor. Adjusted prices aren't the prices of the day, so a $5 rule would be a look-ahead.
+  - It has a bar on the rebalance day. You can see that at the open.
+- **Score:** close(s−21) / close(s−252) − 1. **Hold the top 20**, ties broken by symbol, at equal weight.
+- **Fills:** buy at the rebalance day's open and sell at the next rebalance day's open. If a held stock has no bar that day (delisted), sell at its last close before then.
+  - **Cost: 0.20% of the traded weight per side**, on names that enter or leave. Names kept pay nothing. Drift rebalancing is not charged; it is small at a monthly horizon.
+- **Baseline:** 20 random names from the same eligible set each month, with the same costs, averaged over 20 seeds.
+- **Benchmark:** SPY held without costs, open to open.
+- **Research period:** every month whose exit date is before the pinned holdout (2025-10-02), from the first month with 20 eligible names (about 2017-02, after a year of history) to 2025-09. The holdout isn't run unless the research gate passes.
+- **Gate:** the monthly analogue of §13.
+  - The confidence level is Bonferroni over all trials: 7, so 99.29%. Confidence bounds resample **blocks of 3 consecutive months**, because momentum crashes cluster. Changed from single months after review, before any run.
+  - **Lower bound of the mean monthly return > 0.**
+  - **Lower bound of the mean monthly excess over the random baseline > 0.** This is the edge test.
+  - **Beats the index fund on its point estimates:** CAGR above SPY's and Sharpe above SPY's.
+  - At least 60% of calendar years beat the random baseline on compounded return; the partial first and last years count. Max drawdown is at most 1.5× SPY's over the same months.
+- **Expect low power.** About 105 months is short for an edge of a few percent a year, so a real effect can still fail the CI. A failure here means "not proven on this data", not proof that momentum is false.
+- **Logged** in `trials.jsonl` as one trial. `trades` counts position-months. The `expectancy_r` and drawdown fields hold monthly-return fractions, not R; `params` says so.
+- **Checks added after review, before any run:**
+  - `momentum` refuses a second run and refuses any data range other than the pre-registered one.
+  - Volume in the adjusted bars was confirmed split-adjusted: AAPL's 2020 4:1 split, against raw bars.
+  - Each run prints the months with fewer than 20 eligible names and the most-held names. A pass carried by a few leveraged ETFs or bad prints is read as that, not as stock momentum.
+- **One trial.** Changing any number above, or adding a market filter, is a new trial.
+
 ## 14. Roadmap
 
 ```

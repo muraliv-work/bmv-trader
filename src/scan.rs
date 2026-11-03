@@ -3,7 +3,8 @@
 //!
 //! Layout under `data/`:
 //! - `daily/universe.json`        symbols Alpaca lists, active and inactive (delisted)
-//! - `daily/iex/{SYM}.json`       daily bars, raw prices
+//! - `daily/iex/{SYM}.json`       daily bars, raw prices (the gap scan)
+//! - `daily/sip-all/{SYM}.json`   daily bars, adjusted for splits and dividends (momentum, §13c)
 //! - `scan/iex/{DATE}.json`       that day's picks, best gap first
 //! - `history/iex/{SYM}/{DATE}.json` minute bars, shared with `fetch`
 
@@ -26,6 +27,27 @@ pub const LIQUIDITY_DAYS: usize = 20;
 pub const PICKS_PER_DAY: usize = 10;
 
 const DAILY_BATCH: usize = 100;
+
+/// One downloaded set of daily bars, each in its own folder with its own date range.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DailySet {
+    feed: &'static str,
+    adjustment: &'static str,
+    folder: &'static str,
+}
+
+/// Raw IEX prices: the gap scan compares today's open with yesterday's real close.
+pub const RAW_IEX: DailySet = DailySet {
+    feed: history::FEED,
+    adjustment: "raw",
+    folder: history::FEED,
+};
+/// Split- and dividend-adjusted SIP prices, from 2016: returns over months (DESIGN §13c).
+pub const ADJUSTED_SIP: DailySet = DailySet {
+    feed: "sip",
+    adjustment: "all",
+    folder: "sip-all",
+};
 const EXCHANGES: [&str; 5] = ["NYSE", "NASDAQ", "AMEX", "ARCA", "BATS"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,8 +138,8 @@ fn in_gap_range(gap: f64) -> bool {
     (GAP_MIN - EPS..=GAP_MAX + EPS).contains(&gap)
 }
 
-fn range_path(dir: &Path) -> PathBuf {
-    dir.join("daily").join(history::FEED).join("_range.json")
+fn range_path(dir: &Path, set: DailySet) -> PathBuf {
+    dir.join("daily").join(set.folder).join("_range.json")
 }
 
 /// The one date range the daily files cover, so a later scan can't run on short data.
@@ -130,9 +152,9 @@ struct DailyRange {
 fn universe_path(dir: &Path) -> PathBuf {
     dir.join("daily").join("universe.json")
 }
-fn daily_path(dir: &Path, symbol: &str) -> PathBuf {
+fn daily_path(dir: &Path, set: DailySet, symbol: &str) -> PathBuf {
     dir.join("daily")
-        .join(history::FEED)
+        .join(set.folder)
         .join(format!("{symbol}.json"))
 }
 fn picks_path(dir: &Path, date: &str) -> PathBuf {
@@ -225,6 +247,7 @@ fn ny_date(t: &str) -> Result<String, String> {
 pub fn fetch_daily(
     alpaca: &Alpaca,
     dir: &Path,
+    set: DailySet,
     from: &str,
     to: &str,
     progress: &mut dyn FnMut(usize, usize),
@@ -236,20 +259,18 @@ pub fn fetch_daily(
         from: from.into(),
         to: to.into(),
     };
-    match history::read_json::<DailyRange>(&range_path(dir)) {
+    match history::read_json::<DailyRange>(&range_path(dir, set)) {
         Ok(r) if r != range => {
             return Err(format!(
                 "daily bars already cover {}..{}; delete data/daily/{} to fetch {from}..{to}",
-                r.from,
-                r.to,
-                history::FEED
+                r.from, r.to, set.folder
             ));
         }
-        _ => history::write_json(&range_path(dir), &range)?,
+        _ => history::write_json(&range_path(dir, set), &range)?,
     }
     let todo: Vec<&String> = universe
         .iter()
-        .filter(|s| !daily_path(dir, s).exists())
+        .filter(|s| !daily_path(dir, set, s).exists())
         .collect();
     let mut done = 0;
     for batch in todo.chunks(DAILY_BATCH) {
@@ -266,9 +287,10 @@ pub fn fetch_daily(
                 return Err("more than 1,000 pages for one batch: Alpaca is looping".into());
             }
             let mut path = format!(
-                "/v2/stocks/bars?symbols={}&timeframe=1Day&start={from}&end={to}&feed={}&adjustment=raw&limit=10000",
+                "/v2/stocks/bars?symbols={}&timeframe=1Day&start={from}&end={to}&feed={}&adjustment={}&limit=10000",
                 history::encode(&names.join(",")),
-                history::FEED
+                set.feed,
+                set.adjustment
             );
             if let Some(t) = &token {
                 path.push_str(&format!("&page_token={}", history::encode(t)));
@@ -312,7 +334,7 @@ pub fn fetch_daily(
             let mut bars = got.remove(sym.as_str()).unwrap_or_default();
             bars.sort_by(|a, b| a.date.cmp(&b.date));
             bars.dedup_by(|a, b| a.date == b.date);
-            history::write_json(&daily_path(dir, sym), &bars)?;
+            history::write_json(&daily_path(dir, set, sym), &bars)?;
         }
         done += batch.len();
         progress(done, todo.len());
@@ -320,18 +342,45 @@ pub fn fetch_daily(
     Ok(todo.len())
 }
 
-fn load_daily(dir: &Path) -> Result<BTreeMap<String, Vec<DailyBar>>, String> {
+/// The universe's daily bars in `set`; symbols without bars are left out.
+fn load_daily(dir: &Path, set: DailySet) -> Result<BTreeMap<String, Vec<DailyBar>>, String> {
+    let mut daily = BTreeMap::new();
+    for_each_daily(dir, set, &mut |s, bars| {
+        daily.insert(s.to_string(), bars);
+        Ok(())
+    })?;
+    Ok(daily)
+}
+
+/// Called with each symbol and its bars.
+pub type OnDaily<'a> = dyn FnMut(&str, Vec<DailyBar>) -> Result<(), String> + 'a;
+
+/// Each universe symbol with bars in `set`, one at a time, so a long history needn't fit in memory.
+/// Errors if a symbol has no file (a partial download).
+pub fn for_each_daily(dir: &Path, set: DailySet, f: &mut OnDaily<'_>) -> Result<(), String> {
     let universe: Vec<String> = history::read_json(&universe_path(dir))
         .map_err(|e| format!("{e}: run `bmv-trader universe` first"))?;
-    let mut daily = BTreeMap::new();
     for s in universe {
-        let bars: Vec<DailyBar> = history::read_json(&daily_path(dir, &s))
+        let bars: Vec<DailyBar> = history::read_json(&daily_path(dir, set, &s))
             .map_err(|e| format!("{e}: run `bmv-trader fetch-daily` first"))?;
         if !bars.is_empty() {
-            daily.insert(s, bars);
+            f(&s, bars)?;
         }
     }
-    Ok(daily)
+    Ok(())
+}
+
+/// One symbol's bars in `set`.
+pub fn read_daily(dir: &Path, set: DailySet, symbol: &str) -> Result<Vec<DailyBar>, String> {
+    history::read_json(&daily_path(dir, set, symbol))
+        .map_err(|e| format!("{e}: run `bmv-trader fetch-daily` first"))
+}
+
+/// The date range `set` was downloaded for.
+pub fn daily_range(dir: &Path, set: DailySet) -> Result<(String, String), String> {
+    let r: DailyRange = history::read_json(&range_path(dir, set))
+        .map_err(|e| format!("{e}: run `bmv-trader fetch-daily` first"))?;
+    Ok((r.from, r.to))
 }
 
 #[derive(Debug, Default)]
@@ -353,7 +402,7 @@ pub fn scan_range(
 ) -> Result<ScanReport, String> {
     // Sessions from 60 days earlier, so the first day has its 30-session lookback.
     let start = (history::canonical_date(from)? - chrono::Days::new(60)).to_string();
-    let covered: DailyRange = history::read_json(&range_path(dir))
+    let covered: DailyRange = history::read_json(&range_path(dir, RAW_IEX))
         .map_err(|e| format!("{e}: run `bmv-trader fetch-daily` first"))?;
     if covered.from.as_str() > start.as_str() || covered.to.as_str() < to {
         return Err(format!(
@@ -361,7 +410,7 @@ pub fn scan_range(
             covered.from, covered.to
         ));
     }
-    let daily = load_daily(dir)?;
+    let daily = load_daily(dir, RAW_IEX)?;
     let rows: Vec<history::CalendarRow> = alpaca.get(
         Api::Trading,
         &format!("/v2/calendar?start={start}&end={to}"),

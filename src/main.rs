@@ -16,7 +16,9 @@ const USAGE: &str = "usage:
   bmv-trader backstop                     for launchd: near the close, flatten anything left (deploy/)
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
   bmv-trader universe                     list every US stock, active and delisted (for the scan)
-  bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD   daily bars for the universe
+  bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD [--adjusted]   daily bars for the universe
+                      (raw IEX for the scan; --adjusted: split- and dividend-adjusted SIP, for momentum)
+  bmv-trader momentum                     trial 7: 12-1 month momentum on the adjusted daily bars (DESIGN §13c)
   bmv-trader scan     --from YYYY-MM-DD --to YYYY-MM-DD   each day's gappers, and their minute bars
   bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--strategy orb|gap|vwap] [--scan] [--symbols ...] [--fold-days 21]
                       [--seeds 5] [--holdout] [--holdout-again] [--trend] [--marketable]
@@ -43,7 +45,8 @@ const VALUE_FLAGS: [&str; 7] = [
     "--seeds",
     "--port",
 ];
-const SWITCHES: [&str; 6] = [
+const SWITCHES: [&str; 7] = [
+    "--adjusted",
     "--scan",
     "--holdout",
     "--holdout-again",
@@ -155,8 +158,9 @@ fn main() {
             Some("universe") => universe(),
             Some("fetch-daily") => {
                 let (from, to) = args.dates()?;
-                fetch_daily(&from, &to)
+                fetch_daily(&from, &to, args.has("--adjusted"))
             }
+            Some("momentum") => momentum(),
             Some("scan") => {
                 let (from, to) = args.dates()?;
                 scan(&from, &to)
@@ -367,11 +371,132 @@ fn universe() -> Result<(), String> {
     Ok(())
 }
 
-fn fetch_daily(from: &str, to: &str) -> Result<(), String> {
-    let n = bmv_trader::scan::fetch_daily(&connect()?, &data_dir()?, from, to, &mut |d, n| {
-        eprintln!("  {d}/{n} symbols")
-    })?;
+fn fetch_daily(from: &str, to: &str, adjusted: bool) -> Result<(), String> {
+    use bmv_trader::scan::{ADJUSTED_SIP, RAW_IEX};
+    let set = if adjusted { ADJUSTED_SIP } else { RAW_IEX };
+    let n =
+        bmv_trader::scan::fetch_daily(&connect()?, &data_dir()?, set, from, to, &mut |d, n| {
+            eprintln!("  {d}/{n} symbols")
+        })?;
     println!("daily bars for {n} new symbols");
+    Ok(())
+}
+
+/// Trial 7 (DESIGN §13c): research months only; logs the trial, then prints the gate.
+fn momentum() -> Result<(), String> {
+    use bmv_trader::momentum::{self as mo, Calendar};
+    use bmv_trader::scan::ADJUSTED_SIP;
+    let dir = data_dir()?;
+    let cut = holdout_from(&dir, &[])?;
+    let log = dir.join("trials.jsonl");
+    // one trial (§13c): a rerun would log a second row and raise the bar for every later trial
+    if std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.contains(&format!("\"strategy\":\"{}\"", mo::TRIAL_NAME)))
+    {
+        return Err(format!(
+            "{} is already in {}: trial 7 has run",
+            mo::TRIAL_NAME,
+            log.display()
+        ));
+    }
+    let (from, to) = bmv_trader::scan::daily_range(&dir, ADJUSTED_SIP)?;
+    if (from.as_str(), to.as_str()) != (mo::DATA_FROM, mo::DATA_TO) {
+        return Err(format!(
+            "adjusted bars cover {from}..{to}, but trial 7 is pre-registered on {}..{}",
+            mo::DATA_FROM,
+            mo::DATA_TO
+        ));
+    }
+    eprintln!("adjusted SIP daily bars {from}..{to}; holdout from {cut} stays unseen");
+    let spy = bmv_trader::scan::read_daily(&dir, ADJUSTED_SIP, mo::BENCHMARK)?;
+    let cal = Calendar::new(&spy)?;
+    let mut by_symbol = BTreeMap::new();
+    let mut seen = 0;
+    bmv_trader::scan::for_each_daily(&dir, ADJUSTED_SIP, &mut |s, bars| {
+        by_symbol.insert(s.to_string(), mo::months(&bars, &cal));
+        seen += 1;
+        if seen % 2000 == 0 {
+            eprintln!("  {seen} symbols");
+        }
+        Ok(())
+    })?;
+    let st = mo::study(&by_symbol, &cal, &cut)?;
+    let period = format!(
+        "{}..{}",
+        st.dates.first().map_or("", String::as_str),
+        st.dates.last().map_or("", String::as_str)
+    );
+    let trials = stats::count_trials(&log)? + 1;
+    let trial = stats::Trial {
+        when: chrono::Utc::now().to_rfc3339(),
+        strategy: mo::TRIAL_NAME.into(),
+        params: format!(
+            "monthly, top {}, ${}M liquidity, {}% per side; units: expectancy_r and max_drawdown_r are monthly-return fractions, not R",
+            mo::HOLD,
+            mo::MIN_DOLLAR_VOLUME / 1e6,
+            mo::COST_PER_SIDE * 100.0
+        ),
+        period: period.clone(),
+        trades: st.strategy.len() * mo::HOLD,
+        expectancy_r: mo::mean(&st.strategy),
+        profit_factor: mo::profit_factor(&st.strategy),
+        max_drawdown_r: mo::max_drawdown(&st.strategy),
+        ci_low: st.ci_low(trials),
+    };
+    let logged = stats::record_trial(&log, &trial)?;
+    println!(
+        "trial {logged}: momentum 12-1, {period}, {} months",
+        st.dates.len()
+    );
+    println!(
+        "{:<16}{:>12}{:>10}{:>8}{:>12}",
+        "", "mean/month", "CAGR", "Sharpe", "max DD"
+    );
+    for (name, r) in [
+        ("momentum", &st.strategy),
+        ("random 20", &st.baseline),
+        ("SPY", &st.benchmark),
+    ] {
+        println!(
+            "{name:<16}{:>11.2}%{:>9.1}%{:>8.2}{:>11.1}%",
+            mo::mean(r) * 100.0,
+            mo::cagr(r) * 100.0,
+            mo::sharpe(r),
+            mo::max_drawdown(r) * 100.0
+        );
+    }
+    println!(
+        "{} months had fewer than {} eligible names",
+        st.thin_months,
+        mo::HOLD
+    );
+    let mut most: Vec<(&String, &usize)> = st.held.iter().collect();
+    most.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let most: Vec<String> = most
+        .iter()
+        .take(15)
+        .map(|(s, n)| format!("{s} {n}"))
+        .collect();
+    println!("most-held names (months): {}", most.join(", "));
+    let gate = st.gate(logged);
+    for c in &gate.checks {
+        println!(
+            "  [{}] {}: {}",
+            if c.passed { "pass" } else { "FAIL" },
+            c.name,
+            c.detail
+        );
+    }
+    println!(
+        "P1 gate: {}",
+        if gate.passed() {
+            "PASSED (the holdout is next)"
+        } else {
+            "not passed"
+        }
+    );
     Ok(())
 }
 
