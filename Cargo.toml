@@ -12,3 +12,6 @@ serde_json = "1.0.154"
 # Any plain integer overflow panics instead of wrapping silently, also in release.
 [profile.release]
 overflow-checks = true
+
+[dev-dependencies]
+proptest = "1.12.0"

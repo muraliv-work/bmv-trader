@@ -26,7 +26,8 @@ impl Bar {
     }
 }
 
-/// A long setup. Only constructible with stop < entry < target.
+/// A long setup. Only constructible with stop < entry < target and an uppercase symbol
+/// (so "spy" can't dodge the per-symbol and cluster limits).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Candidate {
     symbol: String,
@@ -44,13 +45,20 @@ impl Candidate {
         target: Price,
         reason: String,
     ) -> Result<Self, String> {
+        let valid_symbol = (1..=10).contains(&symbol.len())
+            && symbol
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.');
+        if !valid_symbol {
+            return Err(format!("invalid symbol {symbol:?}"));
+        }
         if !(stop < entry && entry < target) {
             return Err(format!(
                 "{symbol}: need stop < entry < target, got {stop} / {entry} / {target}"
             ));
         }
         Ok(Self {
-            symbol: symbol.to_string(),
+            symbol: symbol.to_ascii_uppercase(),
             entry,
             stop,
             target,
@@ -440,6 +448,13 @@ mod tests {
         let p = |c| Price::from_cents(c).unwrap();
         let mk = |e, s, t| Candidate::long("X", p(e), p(s), p(t), String::new());
         assert!(mk(100, 99, 102).is_ok());
+        let sym = |s| {
+            Candidate::long(s, p(100), p(99), p(102), String::new()).map(|c| c.symbol().to_string())
+        };
+        assert_eq!(sym("brk.b"), Ok("BRK.B".to_string()));
+        for bad in ["", " SPY", "SP Y", "SPY;", "TOOLONGSYMBOL"] {
+            assert!(sym(bad).is_err(), "{bad:?}");
+        }
         assert!(mk(100, 100, 102).is_err());
         assert!(mk(100, 101, 102).is_err());
         assert!(mk(100, 99, 100).is_err());

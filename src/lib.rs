@@ -3,4 +3,6 @@
 pub mod broker;
 pub mod config;
 pub mod money;
+pub mod risk;
 pub mod strategy;
+pub mod vetting;
