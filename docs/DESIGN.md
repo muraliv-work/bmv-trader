@@ -53,6 +53,91 @@ Deterministic rules find setups, Claude vets them, hard-coded risk limits have t
  Research:  history + backtest drive the SAME step() with a replay feeder and a simulated broker
 ```
 
+### Diagrams (render on GitHub / VS Code with Mermaid)
+
+**Architecture.** Arrows into the engine are events; arrows out are effects. The AI only answers when the engine asks.
+
+```mermaid
+flowchart LR
+    subgraph Alpaca
+        MWS[Market data WS<br/>IEX bars, halts]
+        TWS[Trading WS<br/>order updates]
+        REST[REST<br/>account, orders, positions]
+    end
+
+    subgraph Engine["bmv-trader engine (one process)"]
+        INBOX[(Event inbox)]
+        STEP["step(State, Event) → Effects<br/><b>sole owner of State</b>"]
+        STRAT[strategy.rs<br/>ORB rules]
+        RISK[risk.rs<br/>hard limits · only maker of OrderIntent]
+        INBOX --> STEP
+        STEP --> STRAT --> STEP
+        STEP --> RISK --> STEP
+    end
+
+    subgraph AI["AI (no tools, answers only)"]
+        CLAUDE[Claude Sonnet<br/>approve / reduce / reject]
+        OPUS[Claude Opus<br/>end-of-day review]
+        FREE[OmniRoute free models<br/>digest, narrative]
+    end
+
+    MWS -- Bar / Status --> INBOX
+    TWS -- TradeUpdate --> INBOX
+    REST -- Reconciled snapshot --> INBOX
+    TIMER[1 s timer<br/>STOP file, staleness] -- Tick --> INBOX
+    CLI[CLI: flatten] -- Command --> INBOX
+
+    STEP -- "Effect::Vet (candidate + bars + news)" --> CLAUDE
+    CLAUDE -- "VetResult (verdict only)" --> INBOX
+    STEP -- "SubmitBracket / Cancel / CloseAll" --> REST
+    STEP -- "Journal (before acting)" --> DB[(SQLite journal)]
+    DB -. after close .-> OPUS
+    DB -. after close .-> FREE
+    OPUS -. report .-> YOU([You])
+    FREE -. report .-> YOU
+
+    BACKSTOP[Flatten backstop<br/>separate launchd job] -- close all at close−3m --> REST
+    STEP -- heartbeat --> DEADMAN[Off-host dead-man check] -. alert .-> YOU
+```
+
+**One candidate.** Every arrow from the AI goes back through the engine and the risk gate. Nothing reaches Alpaca without them.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Alpaca
+    participant E as Engine (step)
+    participant S as strategy.rs
+    participant C as Claude (Sonnet)
+    participant R as risk.rs
+    participant J as Journal
+
+    A->>E: 1-minute bar (NVDA)
+    E->>S: today's bars so far
+    S-->>E: Candidate (entry, stop, target) or nothing
+    E->>E: pre-check (kill switch, halts, limits incl. reservations)
+    E->>J: candidate + reservation
+    E->>C: candidate + 30 bars + ≤5 headlines (untrusted), 10 s timeout
+    alt answer parses
+        C-->>E: {"verdict":"reduce","factor_pct":50,...}
+    else timeout / error / bad JSON
+        E->>E: Reject (logged as reject_error)
+    end
+    E->>J: verdict + prompt hash
+    E->>R: gate(candidate, verdict, current state)
+    alt passes every limit
+        R-->>E: OrderIntent (sized, can't exceed caps)
+        E->>E: pre-send check (price vs ask, moved < 0.25R)
+        E->>J: order_submit (client_order_id)
+        E->>A: bracket order (limit entry + stop + target, day)
+        A-->>E: fill / partial / reject (via trading WS)
+        E->>J: order_update, fill
+    else breaks a limit
+        R-->>E: Rejection (reason)
+        E->>J: rejection, release reservation
+    end
+```
+
 ### Concurrency and state model
 - **One engine task owns `State`** (open positions and working orders mirrored from Alpaca, reservations, counters, halts). No shared mutexes.
 - Everything that happens arrives as an `Event` on one inbox. Everything the engine wants done goes out as an `Effect`. Network effects run in spawned tasks, and their results come back as events.
