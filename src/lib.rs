@@ -4,6 +4,7 @@ pub mod backtest;
 pub mod broker;
 pub mod config;
 pub mod engine;
+pub mod history;
 pub mod money;
 pub mod risk;
 pub mod stats;

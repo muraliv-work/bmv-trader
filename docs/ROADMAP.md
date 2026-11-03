@@ -14,7 +14,7 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 - [x] `risk.rs`: `Limits::for_mode`, `gate()` for every §9 rule, sizing, open-risk budget, clusters, `self_test()`; property tests (tier 1)
 - [x] `engine.rs`: `State`, `Event`, `Effect`, pure `step()`; reservations; one trade per symbol; flatten timing (tier 1)
 - [x] `backtest.rs`: replay feeder + simulated broker (§13 fill model), trades → metrics (tier 2)
-- [ ] Research stats: day-block bootstrap, random-entry baseline, walk-forward split, trial log (tier 2)
+- [x] Research stats: day-block bootstrap, random-entry baseline, walk-forward split, trial log (tier 2)
 - [ ] `history.rs`: Alpaca bars `feed=iex`, throttled, resumable cache in `data/`; tested on saved responses (tier 2)
 - [ ] CLI: `fetch`, `backtest` (tier 3)
 - [ ] ⛔ Download history (needs keys) and run the P1 gate (§13) → owner decides: go to P2, iterate, or stop

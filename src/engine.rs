@@ -30,6 +30,16 @@ pub struct Settings {
     /// Send candidates to Claude (P4). Off: every candidate counts as approved.
     pub vetting: bool,
     pub orb: OrbParams,
+    pub entry: Entry,
+}
+
+/// Which rule turns bars into candidates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    /// The opening-range breakout (DESIGN §7).
+    Orb,
+    /// The P1 control: same exits and sizing, no signal (research only; refused in live mode).
+    Random { seed: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -181,6 +191,9 @@ impl State {
     pub fn new(limits: Limits, settings: Settings) -> Result<Self, String> {
         risk::self_test(&limits)?;
         settings.orb.validate()?;
+        if limits.mode() == crate::config::Mode::Live && settings.entry != Entry::Orb {
+            return Err("the random-entry baseline is for research only, never live".into());
+        }
         Ok(State {
             limits,
             settings,
@@ -375,8 +388,12 @@ impl State {
         self.now = self.now.max(bar.ts + 60);
         self.housekeeping(out);
 
-        if let Some(c) = strategy::orb_long(&symbol, open, &self.bars[&symbol], &self.settings.orb)
-        {
+        let (bars, p) = (&self.bars[&symbol], &self.settings.orb);
+        let candidate = match self.settings.entry {
+            Entry::Orb => strategy::orb_long(&symbol, open, bars, p),
+            Entry::Random { seed } => strategy::random_long(&symbol, open, bars, p, seed),
+        };
+        if let Some(c) = candidate {
             self.on_candidate(c, out);
         }
     }
@@ -811,6 +828,7 @@ mod tests {
             Settings {
                 vetting,
                 orb: OrbParams::default(),
+                entry: Entry::Orb,
             },
         )
         .unwrap();
@@ -922,8 +940,19 @@ mod tests {
                 atr_len: 0,
                 ..OrbParams::default()
             },
+            entry: Entry::Orb,
         };
         assert!(State::new(Limits::for_mode(Mode::Paper), bad).is_err());
+        let random = Settings {
+            vetting: false,
+            orb: OrbParams::default(),
+            entry: Entry::Random { seed: 1 },
+        };
+        assert!(State::new(Limits::for_mode(Mode::Paper), random.clone()).is_ok());
+        assert!(
+            State::new(Limits::for_mode(Mode::Live), random).is_err(),
+            "the baseline never runs live"
+        );
     }
 
     #[test]
@@ -933,6 +962,7 @@ mod tests {
             Settings {
                 vetting: false,
                 orb: OrbParams::default(),
+                entry: Entry::Orb,
             },
         )
         .unwrap();
@@ -1077,6 +1107,7 @@ mod tests {
             Settings {
                 vetting: false,
                 orb: OrbParams::default(),
+                entry: Entry::Orb,
             },
         )
         .unwrap();

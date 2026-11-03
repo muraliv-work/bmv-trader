@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, VecDeque};
 const ENTRY_TTL_SECS: i64 = 60;
 
 /// One regular session's bars for any number of symbols.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Day {
     pub date: String,
     pub open: i64,
@@ -402,6 +402,7 @@ pub fn summarize(days: &[DayResult]) -> Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Entry;
     use crate::strategy::OrbParams;
 
     const OPEN: i64 = 1_704_205_800; // 2024-01-02 09:30 ET
@@ -438,6 +439,7 @@ mod tests {
         Settings {
             vetting: false,
             orb: OrbParams::default(),
+            entry: Entry::Orb,
         }
     }
 

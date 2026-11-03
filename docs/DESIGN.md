@@ -331,12 +331,13 @@ More AI authority is earned one level at a time. Each level is enabled only afte
 **Trial log**
 - Every variant tried (strategy × parameters) is logged. The gate's bar rises with the number of trials (Bonferroni-style).
 
-**P1 gate**
-- Lower 95% bound of expectancy > 0 after costs (day-block bootstrap) in walk-forward
-- Beats the random-entry baseline
-- Profit factor > 1.2 and max drawdown < 10R
-- At least 100 trades (a run with no winners has a profit factor of 0, never "infinite")
-- The final holdout is positive
+**P1 gate** (`stats::p1_gate`)
+- The trial count comes from the trial log itself (the run must be logged first). The confidence level is 1 − 0.05 / trials, and the day-block bootstrap draws enough resamples for that level (at least 20 in each tail). Beyond about 500 trials no level can be met, and the gate fails.
+- The lower confidence bound of expectancy, after costs, over the walk-forward test windows is **> 0** and **above the random-entry baseline**. The baseline uses the same exits and sizing with no signal, pooled over several seeds.
+- At least 60% of walk-forward windows are profitable on their own.
+- Profit factor > 1.2 and max drawdown < 10R.
+- At least 100 research trades. A run with no winners has a profit factor of 0, never "infinite".
+- The final holdout: at least 30 trades with positive expectancy, run once for the finalist and logged as a trial.
 
 **Why Claude isn't backtested:** its training data may already contain how those past days turned out (look-ahead bias). Its value is measured forward only.
 

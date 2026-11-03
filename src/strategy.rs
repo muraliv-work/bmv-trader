@@ -5,7 +5,7 @@
 use crate::money::{Price, Usd, risk_per_share};
 
 /// One 1-minute bar. `ts` is the bar's **start** (Unix seconds, UTC), as Alpaca stamps it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Bar {
     pub ts: i64,
     pub open: f64,
@@ -141,37 +141,115 @@ impl OrbParams {
 /// (if that bar fails the volume filter, the day is done), with volume above the average of the
 /// earlier bars today. Bad bars, out-of-order bars, or bad params mean no candidate.
 pub fn orb_long(symbol: &str, session_open: i64, bars: &[Bar], p: &OrbParams) -> Option<Candidate> {
-    let (cur, earlier) = bars.split_last()?;
-    let in_order = bars.windows(2).all(|w| w[0].ts < w[1].ts);
-    if p.validate().is_err()
-        || !in_order
-        || bars[0].ts < session_open
-        || !bars.iter().all(Bar::is_sane)
-    {
+    let v = Today::after_range(session_open, bars, p)?;
+    let broke_out_before = v
+        .earlier
+        .iter()
+        .any(|b| b.ts >= v.or_end && b.close > v.or_high);
+    if broke_out_before || v.cur.close <= v.or_high {
         return None;
     }
-    let or_end = session_open.checked_add(p.or_minutes * 60)?;
-    if cur.ts < or_end {
-        return None;
-    }
-    let in_range = earlier.iter().filter(|b| b.ts < or_end);
-    if in_range.clone().count() < p.min_or_bars {
-        return None;
-    }
-    let or_high = in_range.clone().map(|b| b.high).reduce(f64::max)?;
-    let or_low = in_range.map(|b| b.low).reduce(f64::min)?;
-    let broke_out_before = earlier.iter().any(|b| b.ts >= or_end && b.close > or_high);
-    if broke_out_before || cur.close <= or_high {
-        return None;
-    }
-    let avg_volume = earlier.iter().map(|b| b.volume as f64).sum::<f64>() / earlier.len() as f64;
-    if cur.volume as f64 <= avg_volume {
+    let avg_volume =
+        v.earlier.iter().map(|b| b.volume as f64).sum::<f64>() / v.earlier.len() as f64;
+    if v.cur.volume as f64 <= avg_volume {
         return None;
     }
     let atr = atr(bars, p.atr_len)?;
+    let reason = format!(
+        "ORB{} long: close {:.2} > OR high {:.2}; volume {} > avg {:.0}; ATR {:.2}",
+        p.or_minutes, v.cur.close, v.or_high, v.cur.volume, avg_volume, atr
+    );
+    long_with_exits(symbol, v.cur.close, v.or_low, atr, p, reason)
+}
 
-    let entry = Price::from_f64_ceil(cur.close)?;
-    let stop = Price::from_f64_floor(or_low.max(cur.close - p.atr_mult * atr))?;
+/// Random-entry control for the P1 gate (DESIGN §13): the same day, data checks, stop, target and
+/// sizing as ORB, but entering at one pseudo-random minute per symbol and day with no signal at all.
+/// The minute depends only on (symbol, session, seed), so a replay is repeatable.
+pub fn random_long(
+    symbol: &str,
+    session_open: i64,
+    bars: &[Bar],
+    p: &OrbParams,
+    seed: u64,
+) -> Option<Candidate> {
+    /// Entries spread over the 5 hours after the opening range: before the 30-minute cutoff on a
+    /// full day; on a half-day, late picks are rejected by the engine's cutoff like any late entry.
+    const WINDOW_MINUTES: u64 = 300;
+    let v = Today::after_range(session_open, bars, p)?;
+    let pick = v
+        .or_end
+        .checked_add(60 * (mix(symbol, session_open, seed) % WINDOW_MINUTES) as i64)?;
+    let picked_earlier = v.earlier.iter().any(|b| b.ts >= pick);
+    if v.cur.ts < pick || picked_earlier {
+        return None;
+    }
+    let atr = atr(bars, p.atr_len)?;
+    let reason = format!(
+        "random entry (seed {seed}): close {:.2}; ATR {:.2}",
+        v.cur.close, atr
+    );
+    long_with_exits(symbol, v.cur.close, v.or_low, atr, p, reason)
+}
+
+/// Today's bars after the opening range, validated: in order, sane, none before the open,
+/// a full enough range, valid params.
+struct Today<'a> {
+    cur: &'a Bar,
+    earlier: &'a [Bar],
+    or_end: i64,
+    or_high: f64,
+    or_low: f64,
+}
+
+impl<'a> Today<'a> {
+    fn after_range(session_open: i64, bars: &'a [Bar], p: &OrbParams) -> Option<Self> {
+        let (cur, earlier) = bars.split_last()?;
+        let in_order = bars.windows(2).all(|w| w[0].ts < w[1].ts);
+        if p.validate().is_err()
+            || !in_order
+            || bars[0].ts < session_open
+            || !bars.iter().all(Bar::is_sane)
+        {
+            return None;
+        }
+        let or_end = session_open.checked_add(p.or_minutes * 60)?;
+        if cur.ts < or_end {
+            return None;
+        }
+        let in_range = earlier.iter().filter(|b| b.ts < or_end);
+        if in_range.clone().count() < p.min_or_bars {
+            return None;
+        }
+        let or_high = in_range.clone().map(|b| b.high).reduce(f64::max)?;
+        let or_low = in_range.map(|b| b.low).reduce(f64::min)?;
+        Some(Today {
+            cur,
+            earlier,
+            or_end,
+            or_high,
+            or_low,
+        })
+    }
+}
+
+/// Entry at the close (rounded up), stop at the closer of the range low (if below) and
+/// close − k × ATR (rounded down), target at `target_r` × R; refuses a stop that's too tight.
+fn long_with_exits(
+    symbol: &str,
+    close: f64,
+    or_low: f64,
+    atr: f64,
+    p: &OrbParams,
+    reason: String,
+) -> Option<Candidate> {
+    let atr_stop = close - p.atr_mult * atr;
+    let stop = if or_low < close {
+        or_low.max(atr_stop)
+    } else {
+        atr_stop
+    };
+    let entry = Price::from_f64_ceil(close)?;
+    let stop = Price::from_f64_floor(stop)?;
     let r = risk_per_share(entry, stop)?;
     let min_r = ((entry.cents() as f64 * p.min_r_frac).ceil() as i64).max(p.min_r_cents);
     if r.cents() < min_r {
@@ -179,11 +257,22 @@ pub fn orb_long(symbol: &str, session_open: i64, bars: &[Bar], p: &OrbParams) ->
     }
     let reward = (r.cents() as f64 * p.target_r).floor() as i64; // finite: params validated
     let target = Price::from_cents(entry.cents().checked_add(reward)?)?;
-    let reason = format!(
-        "ORB{} long: close {:.2} > OR high {:.2}; volume {} > avg {:.0}; ATR {:.2}",
-        p.or_minutes, cur.close, or_high, cur.volume, avg_volume, atr
-    );
     Candidate::long(symbol, entry, stop, target, reason).ok()
+}
+
+/// FNV-1a over the inputs, then a splitmix finalizer: stable across platforms and Rust versions.
+fn mix(symbol: &str, session_open: i64, seed: u64) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in symbol
+        .bytes()
+        .chain(session_open.to_le_bytes())
+        .chain(seed.to_le_bytes())
+    {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
 }
 
 /// Simple average of the last `len` true ranges, using today's bars only (no previous-day close).
@@ -441,6 +530,47 @@ mod tests {
             assert!(p.validate().is_err(), "{p:?}");
             assert_eq!(orb_long("SPY", OPEN, &bars, &p), None, "{p:?}");
         }
+    }
+
+    fn quiet_day() -> Vec<Bar> {
+        let mut bars = opening_range();
+        bars.extend((15..330).map(|m| bar(m, 100.9, 100.4, 100.6, 1000)));
+        bars
+    }
+
+    fn random_fires(bars: &[Bar], seed: u64) -> Vec<(usize, Candidate)> {
+        (1..=bars.len())
+            .filter_map(|n| {
+                random_long("SPY", OPEN, &bars[..n], &OrbParams::default(), seed)
+                    .map(|c| (n - 1, c))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_random_baseline_fires_once_without_any_signal() {
+        let bars = quiet_day(); // never breaks the range: ORB never fires
+        assert!((1..=bars.len()).all(|n| run(&bars[..n]).is_none()));
+        let fired = random_fires(&bars, 7);
+        assert_eq!(fired.len(), 1);
+        let (i, c) = &fired[0];
+        assert!(bars[*i].ts >= OPEN + 15 * 60, "after the opening range");
+        // same exit construction as ORB: stop at the range low (closer than the ATR stop), 2R target
+        assert_eq!((c.entry().cents(), c.stop().cents()), (10_060, 10_000));
+        assert_eq!(c.target().cents(), 10_060 + 2 * 60);
+    }
+
+    #[test]
+    fn the_random_baseline_is_repeatable_and_seeded() {
+        let bars = quiet_day();
+        assert_eq!(random_fires(&bars, 7), random_fires(&bars, 7));
+        let minutes: std::collections::BTreeSet<usize> = (1..20)
+            .filter_map(|s| random_fires(&bars, s).first().map(|(i, _)| *i))
+            .collect();
+        assert!(
+            minutes.len() > 10,
+            "different seeds pick different minutes: {minutes:?}"
+        );
     }
 
     #[test]

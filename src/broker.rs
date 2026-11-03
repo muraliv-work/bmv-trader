@@ -60,6 +60,13 @@ pub struct Alpaca {
     cfg: Config,
 }
 
+/// Which Alpaca host a read goes to. Market data is the same host for paper and live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Api {
+    Trading,
+    MarketData,
+}
+
 impl Alpaca {
     pub fn new(cfg: Config) -> Result<Self, String> {
         let http = reqwest::blocking::Client::builder()
@@ -74,18 +81,23 @@ impl Alpaca {
 
     /// The account, already validated (see `Account::validate`).
     pub fn account(&self) -> Result<Account, String> {
-        let a: Account = self.get("/v2/account")?;
+        let a: Account = self.get(Api::Trading, "/v2/account")?;
         a.validate()?;
         Ok(a)
     }
 
-    fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+    /// A read-only GET. There is deliberately no generic POST: orders get their own typed method.
+    pub fn get<T: DeserializeOwned>(&self, api: Api, path: &str) -> Result<T, String> {
+        let base = match api {
+            Api::Trading => self.cfg.mode().base_url(),
+            Api::MarketData => "https://data.alpaca.markets",
+        };
         let mut secret = HeaderValue::from_str(self.cfg.secret())
             .map_err(|_| "Alpaca secret contains characters not allowed in a header".to_string())?;
         secret.set_sensitive(true);
         let resp = self
             .http
-            .get(format!("{}{path}", self.cfg.mode().base_url()))
+            .get(format!("{base}{path}"))
             .header("APCA-API-KEY-ID", self.cfg.key_id())
             .header("APCA-API-SECRET-KEY", secret)
             .send()
