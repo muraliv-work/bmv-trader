@@ -21,7 +21,7 @@ Status: **Active** · **Pending** (needs the owner or data) · **Superseded**
 | # | Decision | Why | Revisit when | Status |
 |---|---|---|---|---|
 | S1 | **Paper by default; live needs `TRADING_MODE=live` + the confirm phrase + separate live keys, all in `.env`** | A live order must never happen by accident; shell variables can't override `.env` | Never | Active |
-| S2 | **Keys only in `.env` (mode 600), never committed or printed** | Keys can move real money | Never | Active |
+| S2 | **Keys only in `.env` (mode 600), never committed or printed** | Keys can move real money | Never | **Superseded by S13** for where keys live; never committed or printed still holds |
 | S3 | **"Unknown means stop"**: any state we can't confirm blocks new entries | A wrong guess about orders or positions costs money; waiting costs nothing | Never | Active |
 | S4 | **The broker is the source of truth**; the journal is only an audit log | Our own records can drift from reality; Alpaca's can't | Never | Active |
 | S5 | **Only `risk::gate()` can create an `OrderIntent`**, and only an `OrderIntent` can open a position | One place enforces every limit, so nothing can skip it | Never | Active |
@@ -31,6 +31,9 @@ Status: **Active** · **Pending** (needs the owner or data) · **Superseded**
 | S10 | **An approved order is sent once**: `Bracket` consumes the `OrderIntent`; an unknown outcome hands it back for a retry with the **same** id only | A retry under a new id could double a position without a second gate pass | Never | Active |
 | S11 | **A refused OCO means close that position now** (`close_position`); "not found" right after an unknown submit is not proof of absence | A partial fill must never sit without a stop | Never | Active |
 | S12 | **STOP present at startup means no trading today**; any error reading it counts as engaged | Unknown means stop | If an engine start is ever needed just to flatten | Active |
+| S13 | **Keys come from the macOS Keychain** (service `bmv-trader`); paper keys may also sit in `.env`, **live keys never may**; a key in both places is refused; a Keychain error stops startup (no fallback to `.env`) | No plain-text live keys on disk; one source per key so they can't disagree | Moving to a cloud VM (D3) → its secret manager | Active |
+| S14 | **No mid-day restart**: if the journal shows a run since today's open, `run` refuses until tomorrow (after `flatten`) | A restart would forget today's trades, losses and used symbols, so limits could be exceeded | When engine state can be rebuilt from Alpaca's fills | Active |
+| S15 | **Paper run loop v1 polls REST** once a minute, blocking, no tokio | Smallest working loop with no new dependencies | Websocket upgrade later in P3 | Active |
 | S9 | **No buy/sell buttons in any UI**; only STOP and flatten | Humans don't place trades around the gate | Never | Active |
 
 ## AI

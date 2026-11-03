@@ -183,7 +183,7 @@ fn encode(s: &str) -> String {
 }
 
 /// Downloads one session's bars for `symbols`, following pagination. `wait` runs before each call.
-fn fetch_session(
+pub(crate) fn fetch_session(
     alpaca: &Alpaca,
     symbols: &[String],
     s: &Session,

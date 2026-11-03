@@ -22,12 +22,13 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 ## P2 — Safety core
 - [x] Broker orders: bracket submit (idempotent client_order_id), cancel, `close_all`, OCO for partial fills, typed Order/Position (tier 1). Send-once `Bracket`, `Exits` token for the OCO, typed `Cancel`, `close_position`; Alpaca error codes still **[verify codes]**
 - [x] Kill switch at `$BMV_HOME/data/STOP` and startup self-tests (`safety.rs`, tier 1)
-- [ ] Reconcile from Alpaca into the engine; wire `startup_checks` at boot and poll the kill switch every Tick (lands with the P3 run loop)
+- [x] Reconcile from Alpaca into the engine; `startup_checks` at boot; kill switch polled every loop (`live.rs`)
 - [x] `cargo-mutants` on `risk.rs`: no surviving mutants in limit checks (4 equivalent mutants in the post-sizing `within` check, explained in the QA report)
 - [ ] ⛔ Paper tests that resolve every [verify] in DESIGN
 
 ## P3 — Paper engine
-- [ ] `market_data.rs` websocket + backfill + staleness; tokio event loop around `step()`; calendar/clock; flatten backstop; `status`, `report` (tier 1/2)
+- [x] Paper run loop v1: `market_data.rs` (REST polling, SPY staleness), `live.rs` (executor, reconcile, JSONL journal, startup: skew, calendar, flat, day P&L), CLI `run` (paper only), `flatten`, `status`
+- [ ] Websocket market data (replaces REST polling); flatten backstop launchd job; `report`; X-RateLimit back-off; single-instance lock; ⛔ first paper run needs keys
 - [ ] ⛔ 10 unattended paper days; live candidates identical to replay
 
 ## P4 — AI layer

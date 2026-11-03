@@ -342,7 +342,8 @@ impl Sim {
                             self.close(engine, &id, px, ExitReason::Flatten);
                         }
                     }
-                    Effect::Vet { .. } | Effect::Journal { .. } => {}
+                    // the sim's positions already carry their stop and target
+                    Effect::Vet { .. } | Effect::Journal { .. } | Effect::Protect { .. } => {}
                 }
             }
         }

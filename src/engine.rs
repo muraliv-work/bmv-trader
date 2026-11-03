@@ -87,6 +87,35 @@ pub enum Event {
         price: Price,
     },
     KillSwitch(bool),
+    /// Something about the broker or the data can't be confirmed. New entries are blocked while
+    /// any key is unresolved. Working orders are not cancelled and nothing latches.
+    Unresolved {
+        key: String,
+        why: String,
+    },
+    /// Clears `key`. Resolving a key that isn't set does nothing and journals nothing.
+    Resolved {
+        key: String,
+    },
+    /// A position or order the engine can't explain: halt, cancel working, flatten.
+    Unexplained {
+        why: String,
+    },
+}
+
+/// A trade that holds shares or could still get some, as the executor polls it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveTrade {
+    pub id: String,
+    pub symbol: String,
+    /// The entry order may still be working (Phase::Working).
+    pub working: bool,
+    /// Working: the ordered qty. Open: the held qty. The most shares Alpaca may show for this trade.
+    pub qty: u32,
+    /// Shares the engine believes it holds: 0, a partial fill, or all of them.
+    pub filled: u32,
+    /// Last bar close for the symbol, else the fill avg, else candidate.entry().
+    pub mark: Price,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +139,9 @@ pub enum JournalKind {
     Halt,
     Flatten,
     KillSwitch,
+    Unresolved,
+    Resolved,
+    Protect,
 }
 
 #[derive(Debug, PartialEq)]
@@ -126,6 +158,11 @@ pub enum Effect {
         id: String,
     },
     FlattenAll,
+    /// A partly filled entry was closed. Its filled shares have no stop (Alpaca only activates
+    /// bracket legs on a complete fill), so they need an OCO, or a close if the OCO is refused.
+    Protect {
+        id: String,
+    },
     Journal {
         kind: JournalKind,
         id: String,
@@ -193,6 +230,8 @@ pub struct State {
     realized: Usd,
     consecutive_losses: u32,
     buying_power: Usd,
+    /// Unconfirmed broker or data state, key → why. Non-empty blocks new entries; survives SessionStart.
+    unresolved: BTreeMap<String, String>,
 }
 
 impl State {
@@ -217,11 +256,48 @@ impl State {
             realized: Usd::ZERO,
             consecutive_losses: 0,
             buying_power: Usd::ZERO,
+            unresolved: BTreeMap::new(),
         })
     }
 
     pub fn halted(&self) -> bool {
         self.halted
+    }
+
+    /// Trades in Phase::Working or Phase::Open, in id order. The executor polls exactly these.
+    pub fn live_trades(&self) -> Vec<LiveTrade> {
+        self.trades
+            .iter()
+            .filter_map(|(id, t)| {
+                let (working, qty, filled, avg) = match t.phase {
+                    Phase::Working {
+                        ordered, filled, ..
+                    } => (
+                        true,
+                        ordered.get(),
+                        filled.map_or(0, |(q, _)| q.get()),
+                        filled.map(|(_, p)| p),
+                    ),
+                    Phase::Open { qty, entry } => (false, qty.get(), qty.get(), Some(entry)),
+                    _ => return None,
+                };
+                let symbol = t.candidate.symbol();
+                let mark = self
+                    .marks
+                    .get(symbol)
+                    .copied()
+                    .or(avg)
+                    .unwrap_or(t.candidate.entry());
+                Some(LiveTrade {
+                    id: id.clone(),
+                    symbol: symbol.to_string(),
+                    working,
+                    qty,
+                    filled,
+                    mark,
+                })
+            })
+            .collect()
     }
 
     /// Realized plus unrealized: open and partly filled positions marked at their last bar close.
@@ -278,6 +354,18 @@ impl State {
                     self.cancel_working(&mut out, |_, _| true);
                 }
             }
+            Event::Unresolved { key, why } => {
+                if let std::collections::btree_map::Entry::Vacant(v) = self.unresolved.entry(key) {
+                    journal(&mut out, JournalKind::Unresolved, v.key(), &why);
+                    v.insert(why);
+                }
+            }
+            Event::Resolved { key } => {
+                if self.unresolved.remove(&key).is_some() {
+                    journal(&mut out, JournalKind::Resolved, &key, "");
+                }
+            }
+            Event::Unexplained { why } => self.unexpected(&mut out, "", &why),
         }
         out
     }
@@ -730,6 +818,10 @@ impl State {
                     &id,
                     &format!("now {:?}", t.phase),
                 );
+                if filled.is_some() {
+                    journal(out, JournalKind::Protect, &id, "partial fill has no stop");
+                    out.push(Effect::Protect { id });
+                }
             }
             ref other => {
                 let other = format!("{other:?}");
@@ -810,7 +902,8 @@ impl State {
             .collect();
         RiskState {
             kill_switch: self.kill_switch,
-            halted: self.halted,
+            // unknown means stop: unconfirmed broker or data state blocks entries without latching
+            halted: self.halted || !self.unresolved.is_empty(),
             entries_allowed,
             pnl_today: self.pnl_today(),
             buying_power: self.buying_power - committed,
@@ -1397,6 +1490,147 @@ mod tests {
             assert!(e.halted());
             assert!(flattens(&fx) >= 1);
         }
+    }
+
+    // --- live loop: unresolved state, unexplained broker state, protection -------------------
+
+    fn unresolved(key: &str) -> Event {
+        Event::Unresolved {
+            key: key.into(),
+            why: "why".into(),
+        }
+    }
+
+    #[test]
+    fn live_trades_lists_working_and_open_with_their_mark() {
+        let mut e = engine(false);
+        breakout_day(&mut e, "SPY"); // SPY working, 24 ordered, mark = last close 101.50
+        trade_and_exit(&mut e, "AAPL", 2, 10_300); // closed: not listed
+        breakout_day(&mut e, "NVDA");
+        let nvda = "bmv-2024-01-02-NVDA-3";
+        e.step(fill(nvda, 24, 10_160)); // open
+        e.marks.remove("NVDA"); // no bar → falls back to the fill avg
+        let live = e.live_trades();
+        assert_eq!(
+            live,
+            [
+                LiveTrade {
+                    id: nvda.into(),
+                    symbol: "NVDA".into(),
+                    working: false,
+                    qty: 24,
+                    filled: 24,
+                    mark: price(10_160),
+                },
+                LiveTrade {
+                    id: SPY1.into(),
+                    symbol: "SPY".into(),
+                    working: true,
+                    qty: 24,
+                    filled: 0,
+                    mark: price(10_150),
+                },
+            ]
+        );
+        e.step(fill(SPY1, 10, 10_155));
+        e.marks.clear(); // no bar, partial fill avg
+        assert_eq!(e.live_trades()[1].filled, 10);
+        assert_eq!(e.live_trades()[1].mark, price(10_155));
+        // no bar and no fill → the candidate's entry
+        let mut e = engine(false);
+        breakout_day(&mut e, "SPY");
+        e.marks.clear();
+        let entry = e.trades[SPY1].candidate.entry();
+        assert_eq!(e.live_trades()[0].mark, entry);
+    }
+
+    #[test]
+    fn unresolved_blocks_entries_without_halting_or_cancelling() {
+        let mut e = engine(false);
+        breakout_day(&mut e, "SPY"); // working entry
+        let fx = e.step(unresolved("positions"));
+        assert_eq!(of_kind(&fx, JournalKind::Unresolved), ["why"]);
+        assert_eq!(cancels(&fx), 0);
+        assert!(!e.halted());
+        assert_eq!(rejections(&breakout_day(&mut e, "NVDA")), ["Halted"]);
+        assert_eq!(
+            of_kind(&e.step(unresolved("positions")), JournalKind::Unresolved).len(),
+            0,
+            "journals once"
+        );
+        let fx = e.step(Event::Resolved {
+            key: "positions".into(),
+        });
+        assert_eq!(of_kind(&fx, JournalKind::Resolved).len(), 1);
+        assert!(
+            e.step(Event::Resolved {
+                key: "positions".into()
+            })
+            .is_empty(),
+            "resolving a missing key does nothing"
+        );
+        assert_eq!(submits(&breakout_day(&mut e, "AAPL")).len(), 1, "unblocked");
+    }
+
+    #[test]
+    fn unresolved_survives_a_new_session() {
+        let mut e = engine(false);
+        e.step(unresolved("bug:x"));
+        e.step(start("2024-01-03", 1));
+        let mut bars = range_bars();
+        bars.push(bar(15, 101.6, 100.9, 101.5, 3000));
+        let fx = feed(
+            &mut e,
+            "SPY",
+            bars.into_iter().map(|b| Bar {
+                ts: b.ts + 86_400,
+                ..b
+            }),
+        );
+        assert_eq!(rejections(&fx), ["Halted"]);
+    }
+
+    #[test]
+    fn unexplained_halts_and_flattens() {
+        let mut e = engine(false);
+        breakout_day(&mut e, "SPY");
+        let fx = e.step(Event::Unexplained {
+            why: "short AAPL".into(),
+        });
+        assert_eq!(of_kind(&fx, JournalKind::Unexpected), ["short AAPL"]);
+        assert!(e.halted());
+        assert_eq!(cancels(&fx), 1);
+        assert_eq!(flattens(&fx), 1);
+    }
+
+    #[test]
+    fn closing_a_partial_entry_asks_for_protection_once() {
+        let protects = |fx: &[Effect]| {
+            fx.iter()
+                .filter(|f| matches!(f, Effect::Protect { id } if id == SPY1))
+                .count()
+        };
+        let mut e = engine(false);
+        breakout_day(&mut e, "SPY");
+        e.step(fill(SPY1, 10, 10_150));
+        let fx = e.step(Event::EntryClosed { id: SPY1.into() });
+        assert_eq!(protects(&fx), 1);
+        assert_eq!(of_kind(&fx, JournalKind::Protect).len(), 1);
+        assert_eq!(
+            protects(&e.step(Event::EntryClosed { id: SPY1.into() })),
+            0,
+            "already open"
+        );
+
+        let mut e = engine(false);
+        breakout_day(&mut e, "SPY");
+        assert_eq!(protects(&e.step(Event::EntryClosed { id: SPY1.into() })), 0);
+
+        let mut e = engine(false);
+        breakout_day(&mut e, "SPY");
+        let mut fx = e.step(fill(SPY1, 24, 10_150)); // full fill: bracket legs active
+        fx.extend(e.step(Event::EntryClosed { id: SPY1.into() }));
+        assert_eq!(protects(&fx), 0);
     }
 
     // --- halts, kill switch, end of day --------------------------------------------------------

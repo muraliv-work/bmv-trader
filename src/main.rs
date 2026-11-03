@@ -1,13 +1,16 @@
 use bmv_trader::backtest::{self, DayResult, FillModel};
 use bmv_trader::engine::{self, Entry, Settings};
 use bmv_trader::strategy::OrbParams;
-use bmv_trader::{broker, config, config::Mode, history, stats};
+use bmv_trader::{broker, config, config::Mode, history, live, stats};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::exit;
 
 const USAGE: &str = "usage:
   bmv-trader account
+  bmv-trader status                       account, positions and open orders (read-only)
+  bmv-trader run      [--symbols ...] [--trend]   one paper session (PAPER ONLY; live is P5)
+  bmv-trader flatten                      close every position and confirm (any mode)
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...]
   bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--symbols ...] [--fold-days 21]
                       [--seeds 5] [--holdout] [--holdout-again] [--trend]
@@ -118,6 +121,9 @@ fn main() {
     let result = Args::parse(all.get(1..).unwrap_or_default()).and_then(|args| {
         match all.first().map(String::as_str) {
             Some("account") => account(),
+            Some("status") => status(),
+            Some("flatten") => flatten(),
+            Some("run") => run(&args.symbols()?, args.has("--trend")),
             Some("fetch") => {
                 let (from, to) = args.dates()?;
                 fetch(&from, &to, &args.symbols()?)
@@ -151,7 +157,11 @@ fn connect() -> Result<broker::Alpaca, String> {
 }
 
 fn account() -> Result<(), String> {
-    let a = connect()?.account()?;
+    print_account(&connect()?)
+}
+
+fn print_account(alpaca: &broker::Alpaca) -> Result<(), String> {
+    let a = alpaca.account()?;
     for (k, v) in [
         ("status", a.status),
         ("currency", a.currency),
@@ -164,6 +174,62 @@ fn account() -> Result<(), String> {
     ] {
         println!("{k:>16}: {v}");
     }
+    Ok(())
+}
+
+/// Read-only: account, positions, open orders.
+fn status() -> Result<(), String> {
+    let a = connect()?;
+    print_account(&a)?;
+    println!("positions:");
+    for p in a.positions()? {
+        println!("  {:>6} {:>6} @ {}", p.symbol, p.qty, p.avg_entry_price);
+    }
+    println!("open orders:");
+    for o in live::open_orders(&a)? {
+        println!(
+            "  {} {} {} {} {}/{}",
+            o.client_order_id, o.symbol, o.side, o.status, o.filled_qty, o.qty
+        );
+    }
+    Ok(())
+}
+
+/// The emergency exit, allowed in both modes.
+fn flatten() -> Result<(), String> {
+    let a = connect()?;
+    live::flatten(&a, 10, &mut || {
+        std::thread::sleep(std::time::Duration::from_secs(1))
+    })?;
+    println!("flat");
+    Ok(())
+}
+
+fn run(symbols: &[String], trend: bool) -> Result<(), String> {
+    let cfg = config::load()?;
+    let mode = cfg.mode();
+    live::refuse_live(mode)?;
+    eprintln!("mode: PAPER");
+    let home = config::home()?;
+    let settings = Settings {
+        vetting: false,
+        orb: OrbParams::default(),
+        entry: Entry::Orb,
+        trend_filter: trend,
+    };
+    let mut r = live::startup(
+        broker::Alpaca::new(cfg)?,
+        mode,
+        &home,
+        settings,
+        symbols.to_vec(),
+    )?;
+    live::run(&mut r, &home)?;
+    println!(
+        "session done: pnl_today {}, halted {}",
+        r.engine.pnl_today(),
+        r.engine.halted()
+    );
     Ok(())
 }
 

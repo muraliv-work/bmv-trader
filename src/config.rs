@@ -1,5 +1,7 @@
 //! Paper by default. Live needs TRADING_MODE=live, the exact LIVE_CONFIRM phrase (surrounding
-//! whitespace ignored), and separate live keys. Config comes from `$BMV_HOME/.env` only, never the shell.
+//! whitespace ignored), and separate live keys. Settings come from `$BMV_HOME/.env` only, never the
+//! shell. Keys come from the macOS Keychain (service `bmv-trader`, account = the variable name);
+//! paper keys may instead sit in `.env`, live keys never may.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -31,7 +33,83 @@ pub fn load() -> Result<Config, String> {
             "{k} is set in your shell; unset it (config comes from .env only)"
         ));
     }
-    from_map(&read_env_file(&home()?.join(".env"))?)
+    from_map(&read_env_file(&home()?.join(".env"))?, keychain)
+}
+
+pub const KEYCHAIN_SERVICE: &str = "bmv-trader";
+
+/// One Keychain item, via Apple's own CLI (absolute path, so PATH can't swap it). Not found is
+/// None; any other failure, such as a locked keychain, a denied prompt or a hang, is an error.
+fn keychain(account: &str) -> Result<Option<String>, String> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    // A locked keychain over SSH can wait forever on a prompt; startup must fail instead of hang.
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    let mut child = Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            account,
+            "-w",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run /usr/bin/security for {account}: {e}"))?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "Keychain lookup for {account} timed out; is the keychain unlocked?"
+                ));
+            }
+            Err(e) => return Err(format!("Keychain lookup for {account} failed: {e}")),
+        }
+    };
+    let mut stdout = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        out.read_to_end(&mut stdout)
+            .map_err(|e| format!("cannot read Keychain reply for {account}: {e}"))?;
+    }
+    keychain_reply(account, status.code(), &stdout)
+}
+
+/// `security` exits 44 when the item doesn't exist. Its stderr is never echoed: keep errors free of secrets.
+fn keychain_reply(
+    account: &str,
+    code: Option<i32>,
+    stdout: &[u8],
+) -> Result<Option<String>, String> {
+    match code {
+        Some(0) => {
+            let v = std::str::from_utf8(stdout)
+                .map_err(|_| format!("Keychain item {account} is not valid UTF-8"))?
+                .trim()
+                .to_string();
+            // An empty item would let a paper key fall through to .env; refuse it instead.
+            if v.is_empty() {
+                return Err(format!(
+                    "Keychain item {account} is empty; delete it or set a value"
+                ));
+            }
+            Ok(Some(v))
+        }
+        Some(44) => Ok(None),
+        other => Err(format!(
+            "Keychain lookup for {account} failed (security exit {other:?}); is the keychain unlocked?"
+        )),
+    }
 }
 
 fn shell_conflict(mut names: impl Iterator<Item = String>) -> Option<String> {
@@ -57,12 +135,18 @@ fn read_env_file(path: &Path) -> Result<HashMap<String, String>, String> {
 }
 
 /// Values are trimmed; empty counts as missing.
-fn from_map(vars: &HashMap<String, String>) -> Result<Config, String> {
-    from_env(|k| {
-        vars.get(k)
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    })
+fn from_map(
+    vars: &HashMap<String, String>,
+    keychain: impl Fn(&str) -> Result<Option<String>, String>,
+) -> Result<Config, String> {
+    from_sources(
+        |k| {
+            vars.get(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        },
+        keychain,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,14 +193,40 @@ impl Config {
     }
 }
 
-/// `get` returns a variable's value, with empty treated as missing.
+/// `.env` only, no Keychain: paper works, live is always refused (its keys must be in the Keychain).
 pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
-    let need = |k: &str| get(k).ok_or_else(|| format!("{k} is not set in .env"));
+    from_sources(get, |_| Ok(None))
+}
+
+/// `env` returns a `.env` value (empty = missing); `keychain` looks up one Keychain item.
+pub fn from_sources(
+    env: impl Fn(&str) -> Option<String>,
+    keychain: impl Fn(&str) -> Result<Option<String>, String>,
+) -> Result<Config, String> {
+    let get = &env;
+    // A key in both places could silently disagree, so that's refused like a shell override.
+    let key = |k: &str, env_allowed: bool| -> Result<String, String> {
+        match (keychain(k)?, env(k)) {
+            (Some(_), Some(_)) => Err(format!(
+                "{k} is in both the Keychain and .env; remove it from .env"
+            )),
+            (Some(v), None) => Ok(v),
+            (None, Some(_)) if !env_allowed => Err(format!(
+                "{k} must not be in .env; store it in the Keychain: \
+                 security add-generic-password -s {KEYCHAIN_SERVICE} -a {k} -w"
+            )),
+            (None, Some(v)) => Ok(v),
+            (None, None) => Err(format!(
+                "{k} is not set (Keychain service {KEYCHAIN_SERVICE}{})",
+                if env_allowed { ", or .env" } else { "" }
+            )),
+        }
+    };
     match get("TRADING_MODE").as_deref().unwrap_or("paper") {
         "paper" => Ok(Config {
             mode: Mode::Paper,
-            key_id: need("ALPACA_PAPER_KEY_ID")?,
-            secret: Secret(need("ALPACA_PAPER_SECRET")?),
+            key_id: key("ALPACA_PAPER_KEY_ID", true)?,
+            secret: Secret(key("ALPACA_PAPER_SECRET", true)?),
         }),
         "live" => {
             if get("LIVE_CONFIRM").as_deref() != Some(LIVE_CONFIRM_PHRASE) {
@@ -126,8 +236,8 @@ pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Config, String> 
             }
             Ok(Config {
                 mode: Mode::Live,
-                key_id: need("ALPACA_LIVE_KEY_ID")?,
-                secret: Secret(need("ALPACA_LIVE_SECRET")?),
+                key_id: key("ALPACA_LIVE_KEY_ID", false)?,
+                secret: Secret(key("ALPACA_LIVE_SECRET", false)?),
             })
         }
         other => Err(format!(
@@ -147,6 +257,20 @@ mod tests {
             .collect();
         move |k| pairs.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.clone())
     }
+
+    fn no_keychain(_: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    fn keychain_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<Option<String>, String> {
+        let get = env(pairs);
+        move |k| Ok(get(k))
+    }
+
+    const LIVE_ON: [(&str, &str); 2] = [
+        ("TRADING_MODE", "live"),
+        ("LIVE_CONFIRM", LIVE_CONFIRM_PHRASE),
+    ];
 
     const PAPER: [(&str, &str); 2] = [("ALPACA_PAPER_KEY_ID", "pk"), ("ALPACA_PAPER_SECRET", "ps")];
     const LIVE: [(&str, &str); 2] = [("ALPACA_LIVE_KEY_ID", "lk"), ("ALPACA_LIVE_SECRET", "ls")];
@@ -188,15 +312,21 @@ mod tests {
             LIVE[1],
             ("LIVE_CONFIRM", " "),
         ]);
-        assert!(from_map(&m).unwrap_err().contains("refused"));
+        assert!(from_map(&m, no_keychain).unwrap_err().contains("refused"));
         let m = map(&[
             ("TRADING_MODE", ""),
             PAPER[0],
             ("ALPACA_PAPER_SECRET", "  ps  "),
         ]);
-        let c = from_map(&m).unwrap();
+        let c = from_map(&m, no_keychain).unwrap();
         assert_eq!((c.mode(), c.secret()), (Mode::Paper, "ps"));
-        assert!(from_map(&map(&[PAPER[0], ("ALPACA_PAPER_SECRET", "   ")])).is_err());
+        assert!(
+            from_map(
+                &map(&[PAPER[0], ("ALPACA_PAPER_SECRET", "   ")]),
+                no_keychain
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -289,16 +419,97 @@ mod tests {
 
     #[test]
     fn live_with_everything() {
-        let vars = [
-            ("TRADING_MODE", "live"),
-            ("LIVE_CONFIRM", LIVE_CONFIRM_PHRASE),
-            LIVE[0],
-            LIVE[1],
-        ];
-        let c = from_env(env(&vars)).unwrap();
+        let c = from_sources(env(&LIVE_ON), keychain_of(&LIVE)).unwrap();
         assert_eq!(c.mode(), Mode::Live);
         assert_eq!(c.mode().base_url(), "https://api.alpaca.markets");
-        assert_eq!(c.secret(), "ls");
+        assert_eq!((c.key_id(), c.secret()), ("lk", "ls"));
+    }
+
+    #[test]
+    fn live_keys_in_env_are_refused_even_when_complete() {
+        let vars = [LIVE_ON[0], LIVE_ON[1], LIVE[0], LIVE[1]];
+        let e = from_sources(env(&vars), no_keychain).unwrap_err();
+        assert!(
+            e.contains("must not be in .env") && e.contains("add-generic-password"),
+            "{e}"
+        );
+        // half in the Keychain, half in .env is still refused
+        let e = from_sources(
+            env(&[LIVE_ON[0], LIVE_ON[1], LIVE[1]]),
+            keychain_of(&[LIVE[0]]),
+        )
+        .unwrap_err();
+        assert!(e.contains("ALPACA_LIVE_SECRET must not be in .env"), "{e}");
+        assert!(
+            from_sources(env(&LIVE_ON), no_keychain)
+                .unwrap_err()
+                .contains("not set")
+        );
+    }
+
+    #[test]
+    fn paper_keys_come_from_the_keychain_or_env() {
+        let c = from_sources(env(&[]), keychain_of(&PAPER)).unwrap();
+        assert_eq!(
+            (c.mode(), c.key_id(), c.secret()),
+            (Mode::Paper, "pk", "ps")
+        );
+        let c = from_sources(env(&PAPER), no_keychain).unwrap();
+        assert_eq!(c.secret(), "ps");
+        let c = from_sources(env(&[PAPER[0]]), keychain_of(&[PAPER[1]])).unwrap();
+        assert_eq!((c.key_id(), c.secret()), ("pk", "ps"));
+    }
+
+    #[test]
+    fn a_key_in_both_places_is_refused() {
+        let e = from_sources(env(&PAPER), keychain_of(&PAPER)).unwrap_err();
+        assert!(e.contains("both the Keychain and .env"), "{e}");
+    }
+
+    #[test]
+    fn keychain_errors_stop_startup_instead_of_falling_back_to_env() {
+        let locked = |_: &str| Err("Keychain lookup failed".to_string());
+        assert!(from_sources(env(&PAPER), locked).is_err());
+    }
+
+    #[test]
+    fn keychain_replies_are_read_strictly() {
+        assert_eq!(
+            keychain_reply("K", Some(0), b"abc\n").unwrap().as_deref(),
+            Some("abc")
+        );
+        assert!(
+            keychain_reply("K", Some(0), b"  \n")
+                .unwrap_err()
+                .contains("empty")
+        );
+        assert_eq!(keychain_reply("K", Some(44), b"").unwrap(), None);
+        for code in [Some(1), Some(51), Some(128), None] {
+            let e = keychain_reply("K", code, b"").unwrap_err();
+            assert!(e.contains("unlocked"), "{code:?}: {e}");
+        }
+        assert!(keychain_reply("K", Some(0), &[0xff, 0xfe]).is_err());
+    }
+
+    #[test]
+    fn the_real_keychain_never_invents_a_missing_item() {
+        // The real CLI on an account that can't exist: None here, or an error on a machine without
+        // a usable keychain (CI, sandbox), but never a value.
+        if std::path::Path::new("/usr/bin/security").exists() {
+            let got = keychain("bmv-trader-test-nonexistent-account");
+            assert!(!matches!(got, Ok(Some(_))), "{got:?}");
+        }
+    }
+
+    #[test]
+    fn live_confirm_is_checked_before_any_keychain_lookup() {
+        let asked = std::cell::Cell::new(false);
+        let spy = |_: &str| {
+            asked.set(true);
+            Ok(None)
+        };
+        assert!(from_sources(env(&[("TRADING_MODE", "live")]), spy).is_err());
+        assert!(!asked.get());
     }
 
     #[test]
