@@ -9,7 +9,15 @@ An AI-assisted intraday trading system for US stocks/ETFs (crypto later), runnin
 Deterministic rules find setups, Claude vets them, hard-coded risk limits have the final say. Paper trading by default.
 **The real goal is to find and prove an edge cheaply.** Every phase is gated, and failing a gate means stopping or going back.
 
-**Non-goals (v1):** options, futures, overnight holds, 24/7 crypto, high-frequency trading, a UI beyond the terminal, cloud deployment.
+**Non-goals (v1):** options, futures, overnight holds, 24/7 crypto, high-frequency trading, any UI that can place orders, cloud deployment.
+
+**Monitoring:**
+- Alpaca's dashboard for positions, orders and P&L (from day one)
+- the terminal log plus `status` and `report` commands (P3)
+- a **read-only** local web dashboard on 127.0.0.1, reachable over Tailscale, showing candidates, Claude's verdicts, orders, P&L and Claude vs shadow (P4)
+- phone alerts (P5)
+
+No UI ever has buy or sell buttons. The only controls are STOP and flatten.
 
 ## 2. Decisions
 
@@ -249,6 +257,27 @@ On a half-day (close at 13:00), all of this shifts automatically.
 - **The Anthropic host is hard-coded,** never read from `ANTHROPIC_BASE_URL`. The response's `model` field must match the model requested. Claude never goes through OmniRoute.
 - **Free-model output never reaches the decision path.**
 - **Cost control:** cached system prompt; Claude called only for candidates that passed the pre-check, capped per day; tokens and cost journaled per call.
+
+### AI controls (P4)
+1. **Pinned model id.** A model change counts as a strategy change: it re-runs the P4 shadow comparison.
+2. **Versioned prompt.** A hash of the system prompt is journaled with every decision.
+3. **Regression set.** About 30 saved historical candidates with their context. After any prompt or model change, re-run them and alert if the approve/reduce/reject mix shifts sharply.
+4. **Drift alarm.** The daily approve rate is tracked; 100% approve or 100% reject, or a sudden jump, raises an alert.
+5. **Deterministic settings.** Use the lowest-randomness settings the API allows.
+
+### AI authority ladder
+More AI authority is earned one level at a time. Each level is enabled only after its own pre-registered paper shadow test beats the level below. The hard limits (§9) and `risk::gate` apply at every level.
+
+| Level | AI decides |
+|---|---|
+| L0 (P4) | Approve, reduce or reject a rule candidate |
+| L1 | Rank several candidates; size 0–100% of the cap |
+| L2 | Pre-market plan: which P1-proven strategies and symbols run today |
+| L3 | Manage exits: tighten a stop, take partial profit, exit early. **Never widen a stop.** |
+| L4 | Propose its own setups, which still go through the gate as brackets |
+| L5 (offline, any time) | Research agent: proposes strategy variants and runs them through the P1 backtester. A human promotes; every trial is logged. |
+
+**Never, at any level:** change limits, code, keys or the model; widen a stop; bypass the gate; trade outside hours; hold overnight.
 
 ## 11. Journal (`$BMV_HOME/data/journal.db`, gitignored)
 
