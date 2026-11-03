@@ -377,6 +377,8 @@ Trial 4 was starved: ten mega-caps rarely gap 1%. This trial keeps trial 4's rul
 
 - **Universe:** every US stock on NYSE, NASDAQ, AMEX, ARCA or BATS that Alpaca lists, **active and inactive**, so delisted stocks stay in the past.
   - Only common-stock tickers count: 1–5 letters plus an optional class such as `BRK.B`. Added before any scan ran, because Alpaca's inactive list also holds CUSIP-style codes for rights and escrows that the bars API rejects.
+  - Also excluded: five-letter tickers ending in W, U or R (Nasdaq warrants, units and rights). Added after review, still before any scan.
+  - **Known biases that remain:** ETFs and ETNs pass, because Alpaca doesn't mark them. Stocks delisted to OTC are missing, which flatters a long strategy. A reused ticker may join two companies' histories.
   - Alpaca's inactive list is incomplete, so some survivorship bias remains. It flatters results, so treat a pass with extra care.
 - **Daily data:** IEX daily bars at raw prices (`fetch-daily`).
 - **The daily scan** (`scan`) uses only what is known at 09:30. A stock is eligible when:
@@ -386,6 +388,7 @@ Trial 4 was starved: ten mega-caps rarely gap 1%. This trial keeps trial 4's rul
   - its average **IEX dollar volume** over those 20 days is at least **$1M** (IEX is about 2–3% of all volume, so roughly $30M+ consolidated)
   - today's open is between **+2% and +30%** above yesterday's close (above 30% is mostly reverse splits, buyouts and halts)
 - **Picks:** the **top 10 by gap** each day, best first.
+- **Boundaries:** both ends of the gap range are inclusive, with float-rounding tolerance. The only same-day input is today's open.
 - **Trading:** trial 4's gap-and-go rules on those picks, with yesterday's close taken from the daily bar. Risk limits, the fill model and costs are unchanged.
 - **Baseline:** random entries on the same picks.
 - **Period:** research from **2020-09-01** (the first month after IEX history starts is the 20-day warm-up) to 2025-10-01. The holdout stays pinned from 2025-10-02.

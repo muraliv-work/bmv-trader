@@ -1,11 +1,12 @@
 # Flatten backstop (launchd)
 
 If the engine dies, hangs or the Mac sleeps, Alpaca still holds every stop and target. This job also
-closes anything left near the close. It runs `bmv-trader backstop` every 2 minutes:
+closes anything left near the close. It closes everything in the account, including any position
+you opened by hand. It runs `bmv-trader backstop` every 2 minutes:
 
 - Between closes it exits at once, with no network call and no Keychain read.
-- From 3 minutes before today's close (13:00 or 16:00 ET, taken from Alpaca's calendar) until 15
-  minutes after it, it checks positions and orders. If anything is open, it flattens and logs the
+- From 3 minutes before today's close (13:00 or 16:00 ET, taken from Alpaca's calendar) until 1
+  minute after it, it checks positions and orders. If anything is open, it flattens and logs the
   result to `data/backstop.log`.
 
 The engine flattens at 5 minutes before the close, so on a normal day the backstop finds the account

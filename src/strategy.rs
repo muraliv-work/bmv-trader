@@ -226,7 +226,8 @@ pub fn gap_long(
         return None;
     }
     let gap = bars[0].open / prev_close - 1.0;
-    if gap < GAP_MIN_FRAC || v.cur.close <= prev_close {
+    // allow for float rounding: a gap of exactly 1% counts
+    if gap < GAP_MIN_FRAC - 1e-9 || v.cur.close <= prev_close {
         return None;
     }
     let avg_volume = first_breakout(&v)?;

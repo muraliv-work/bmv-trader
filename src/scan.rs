@@ -69,17 +69,24 @@ pub fn pick_gappers(
             }
             let window = &bars[i - LIQUIDITY_DAYS..i];
             let prev = window.last()?;
+            // Cheap tests first: most symbol-days have no gap. Today: the open only (known at 09:30).
+            let open = bars[i].open;
+            if !(open.is_finite() && open > 0.0)
+                || &prev.date != yesterday
+                || prev.close < MIN_PRICE
+            {
+                return None;
+            }
+            let gap = open / prev.close - 1.0;
+            if !in_gap_range(gap) {
+                return None;
+            }
             let sane = |b: &DailyBar| {
                 [b.open, b.high, b.low, b.close]
                     .iter()
                     .all(|p| p.is_finite() && *p > 0.0)
             };
-            if &prev.date != yesterday
-                || window[0].date < *oldest
-                || !window.iter().all(sane)
-                || !sane(&bars[i])
-                || prev.close < MIN_PRICE
-            {
+            if window[0].date < *oldest || !window.iter().all(sane) {
                 return None;
             }
             let dollar_volume = window
@@ -87,13 +94,10 @@ pub fn pick_gappers(
                 .map(|b| b.close * b.volume as f64)
                 .sum::<f64>()
                 / LIQUIDITY_DAYS as f64;
-            let gap = bars[i].open / prev.close - 1.0;
-            (dollar_volume >= MIN_DOLLAR_VOLUME && (GAP_MIN..=GAP_MAX).contains(&gap)).then(|| {
-                Pick {
-                    symbol: symbol.clone(),
-                    prev_close: prev.close,
-                    gap,
-                }
+            (dollar_volume >= MIN_DOLLAR_VOLUME).then(|| Pick {
+                symbol: symbol.clone(),
+                prev_close: prev.close,
+                gap,
             })
         })
         .collect();
@@ -104,6 +108,23 @@ pub fn pick_gappers(
     });
     picks.truncate(PICKS_PER_DAY);
     picks
+}
+
+/// Inclusive at both ends, allowing for float rounding: 13.00 over 10.00 is a +30% gap.
+fn in_gap_range(gap: f64) -> bool {
+    const EPS: f64 = 1e-9;
+    (GAP_MIN - EPS..=GAP_MAX + EPS).contains(&gap)
+}
+
+fn range_path(dir: &Path) -> PathBuf {
+    dir.join("daily").join(history::FEED).join("_range.json")
+}
+
+/// The one date range the daily files cover, so a later scan can't run on short data.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct DailyRange {
+    from: String,
+    to: String,
 }
 
 fn universe_path(dir: &Path) -> PathBuf {
@@ -122,12 +143,18 @@ fn picks_path(dir: &Path, date: &str) -> PathBuf {
 
 /// A common-stock ticker: 1–5 letters, optionally a share class (`BRK.B`). The inactive list also
 /// holds CUSIP-like codes for rights and escrows (`0029900E0`), which the bars API rejects.
+/// ETFs and ETNs still pass (Alpaca doesn't mark them): a known limit of the universe.
 pub fn is_ticker(s: &str) -> bool {
     let (base, class) = s.split_once('.').unwrap_or((s, ""));
     let letters = |t: &str, n: std::ops::RangeInclusive<usize>| {
         n.contains(&t.len()) && t.bytes().all(|b| b.is_ascii_uppercase())
     };
-    letters(base, 1..=5) && (!s.contains('.') || letters(class, 1..=2)) && history::valid_symbol(s)
+    // Nasdaq's fifth letter W, U or R marks a warrant, unit or right, not the common stock.
+    let derivative = base.len() == 5 && base.ends_with(['W', 'U', 'R']);
+    letters(base, 1..=5)
+        && !derivative
+        && (!s.contains('.') || letters(class, 1..=2))
+        && history::valid_symbol(s)
 }
 
 #[derive(Deserialize)]
@@ -204,6 +231,22 @@ pub fn fetch_daily(
 ) -> Result<usize, String> {
     let universe: Vec<String> = history::read_json(&universe_path(dir))
         .map_err(|e| format!("{e}: run `bmv-trader universe` first"))?;
+    // Resuming skips symbols that have a file, so every file must cover the same range.
+    let range = DailyRange {
+        from: from.into(),
+        to: to.into(),
+    };
+    match history::read_json::<DailyRange>(&range_path(dir)) {
+        Ok(r) if r != range => {
+            return Err(format!(
+                "daily bars already cover {}..{}; delete data/daily/{} to fetch {from}..{to}",
+                r.from,
+                r.to,
+                history::FEED
+            ));
+        }
+        _ => history::write_json(&range_path(dir), &range)?,
+    }
     let todo: Vec<&String> = universe
         .iter()
         .filter(|s| !daily_path(dir, s).exists())
@@ -213,9 +256,14 @@ pub fn fetch_daily(
         let mut names: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
         let mut got: BTreeMap<String, Vec<DailyBar>> = BTreeMap::new();
         let mut token: Option<String> = None;
+        let mut pages = 0;
         loop {
             if names.is_empty() {
                 break;
+            }
+            pages += 1;
+            if pages > 1_000 {
+                return Err("more than 1,000 pages for one batch: Alpaca is looping".into());
             }
             let mut path = format!(
                 "/v2/stocks/bars?symbols={}&timeframe=1Day&start={from}&end={to}&feed={}&adjustment=raw&limit=10000",
@@ -303,9 +351,17 @@ pub fn scan_range(
     to: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<ScanReport, String> {
-    let daily = load_daily(dir)?;
     // Sessions from 60 days earlier, so the first day has its 30-session lookback.
     let start = (history::canonical_date(from)? - chrono::Days::new(60)).to_string();
+    let covered: DailyRange = history::read_json(&range_path(dir))
+        .map_err(|e| format!("{e}: run `bmv-trader fetch-daily` first"))?;
+    if covered.from.as_str() > start.as_str() || covered.to.as_str() < to {
+        return Err(format!(
+            "daily bars cover {}..{}, but scanning {from}..{to} needs {start}..{to}",
+            covered.from, covered.to
+        ));
+    }
+    let daily = load_daily(dir)?;
     let rows: Vec<history::CalendarRow> = alpaca.get(
         Api::Trading,
         &format!("/v2/calendar?start={start}&end={to}"),
@@ -362,6 +418,22 @@ pub fn load_scan_range(dir: &Path, from: &str, to: &str) -> Result<Vec<Day>, Str
         .filter(|d| d.as_str() >= from && d.as_str() <= to)
         .collect();
     dates.sort();
+    let sessions: Vec<String> = std::fs::read_dir(dir.join("history").join("sessions"))
+        .map_err(|e| format!("no sessions: {e}"))?
+        .filter_map(|e| {
+            e.ok()?
+                .file_name()
+                .to_str()?
+                .strip_suffix(".json")
+                .map(str::to_string)
+        })
+        .filter(|d| d.as_str() >= from && d.as_str() <= to)
+        .collect();
+    if let Some(missing) = sessions.iter().find(|d| !dates.contains(d)) {
+        return Err(format!(
+            "session {missing} has no scan: run `bmv-trader scan` over {from}..{to}"
+        ));
+    }
     if dates.is_empty() {
         return Err(format!(
             "no scanned days in {from}..{to}: run `bmv-trader scan`"
@@ -480,6 +552,34 @@ mod tests {
     }
 
     #[test]
+    fn exact_two_and_thirty_percent_gaps_count() {
+        assert!(in_gap_range(13.0 / 10.0 - 1.0));
+        assert!(in_gap_range(10.2 / 10.0 - 1.0));
+        assert!(!in_gap_range(10.19 / 10.0 - 1.0));
+        assert!(!in_gap_range(13.01 / 10.0 - 1.0));
+    }
+
+    #[test]
+    fn a_liquidity_window_older_than_thirty_sessions_is_skipped() {
+        let cal: Vec<String> = (0..50).map(|i| format!("D{i:03}")).collect();
+        let on = |i: usize, open: f64| d(&cal[i], open, 10.0, 200_000);
+        // 19 days long ago, then yesterday (D048) and a gap today (D049)
+        let mut stale: Vec<DailyBar> = (0..19).map(|i| on(i, 10.0)).collect();
+        stale.extend([on(48, 10.0), on(49, 11.0)]);
+        let fresh: Vec<DailyBar> = (29..49)
+            .map(|i| on(i, 10.0))
+            .chain([on(49, 11.0)])
+            .collect();
+        let daily: BTreeMap<String, Vec<DailyBar>> =
+            [("OLD".to_string(), stale), ("NEW".to_string(), fresh)].into();
+        let got: Vec<String> = pick_gappers(&cal[49], &cal, &daily)
+            .into_iter()
+            .map(|p| p.symbol)
+            .collect();
+        assert_eq!(got, ["NEW"]);
+    }
+
+    #[test]
     fn at_most_ten_and_never_on_the_first_session() {
         let (sessions, bars) = setup(11.0);
         let many: Vec<(String, Vec<DailyBar>)> = (0..15)
@@ -497,6 +597,9 @@ mod tests {
             assert!(is_ticker(ok), "{ok}");
         }
         for bad in [
+            "ACAHW",
+            "ACAHU",
+            "ACAHR",
             "0029900E0",
             "003CVR016",
             "ABCDEF",

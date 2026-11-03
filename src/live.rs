@@ -896,10 +896,19 @@ pub fn startup(
 /// Held for the whole run, so a second `run` (another terminal, a stray launchd job) fails
 /// instead of trading the same account twice. The OS releases it when the process exits.
 #[derive(Debug)]
-pub struct RunLock(#[allow(dead_code)] std::fs::File);
+pub struct RunLock(std::fs::File);
+
+impl RunLock {
+    /// The locked file; holding the RunLock is what matters.
+    pub fn file(&self) -> &std::fs::File {
+        &self.0
+    }
+}
 
 pub fn lock_run(home: &Path) -> Result<RunLock, String> {
     let path = home.join("data").join("run.lock");
+    std::fs::create_dir_all(home.join("data"))
+        .map_err(|e| format!("run lock {}: {e}", path.display()))?;
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -918,8 +927,9 @@ pub fn lock_run(home: &Path) -> Result<RunLock, String> {
 
 /// The backstop acts from this long before the close (the engine flattens at 5 minutes)...
 pub const BACKSTOP_BEFORE_SECS: i64 = 180;
-/// ...until this long after it.
-pub const BACKSTOP_AFTER_SECS: i64 = 900;
+/// ...until this long after it. Not longer: after the close a market order queues for tomorrow's
+/// open, and flatten would keep cancelling and resubmitting it.
+pub const BACKSTOP_AFTER_SECS: i64 = 60;
 
 /// Cheap local check, no network: could `now` be near a regular (16:00) or half-day (13:00) close?
 /// Weekends never are. The calendar then decides exactly.
@@ -2059,8 +2069,8 @@ mod tests {
     #[test]
     fn a_second_run_lock_is_refused_until_the_first_is_dropped() {
         let t = Tmp::new();
-        std::fs::create_dir_all(t.0.join("data")).unwrap();
-        let first = lock_run(&t.0).unwrap();
+        let first = lock_run(&t.0).unwrap(); // creates data/
+        assert!(first.file().metadata().is_ok());
         let err = lock_run(&t.0).unwrap_err();
         assert!(err.contains("another `run` is active"), "{err}");
         drop(first);

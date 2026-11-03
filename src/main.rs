@@ -170,6 +170,7 @@ fn main() {
                     holdout_again: args.has("--holdout-again"),
                     trend: args.has("--trend"),
                     scan: args.has("--scan"),
+                    symbols_given: args.get("--symbols").is_some(),
                     orb: orb_params(&args),
                     strategy: match args.get("--strategy").unwrap_or("orb") {
                         "orb" => Strategy::Orb,
@@ -462,6 +463,7 @@ struct Opts {
     trend: bool,
     /// Trade each day's scanned gappers (`bmv-trader scan`) instead of `--symbols`.
     scan: bool,
+    symbols_given: bool,
     orb: OrbParams,
     strategy: Strategy,
 }
@@ -547,6 +549,9 @@ fn folds(results: &[DayResult], fold_days: usize) -> Vec<Vec<DayResult>> {
 }
 
 fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<(), String> {
+    if o.scan && o.symbols_given {
+        return Err("--scan trades each day's scanned gappers; drop --symbols".into());
+    }
     if o.scan && o.trend {
         return Err("--trend needs SPY, which the scan doesn't trade: use one or the other".into());
     }
