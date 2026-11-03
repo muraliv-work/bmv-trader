@@ -376,6 +376,7 @@ More AI authority is earned one level at a time. Each level is enabled only afte
 Trial 4 was starved: ten mega-caps rarely gap 1%. This trial keeps trial 4's rules unchanged (§7b) and only changes **which stocks** it may trade.
 
 - **Universe:** every US stock on NYSE, NASDAQ, AMEX, ARCA or BATS that Alpaca lists, **active and inactive**, so delisted stocks stay in the past.
+  - Only common-stock tickers count: 1–5 letters plus an optional class such as `BRK.B`. Added before any scan ran, because Alpaca's inactive list also holds CUSIP-style codes for rights and escrows that the bars API rejects.
   - Alpaca's inactive list is incomplete, so some survivorship bias remains. It flatters results, so treat a pass with extra care.
 - **Daily data:** IEX daily bars at raw prices (`fetch-daily`).
 - **The daily scan** (`scan`) uses only what is known at 09:30. A stock is eligible when:

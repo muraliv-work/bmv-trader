@@ -120,6 +120,16 @@ fn picks_path(dir: &Path, date: &str) -> PathBuf {
         .join(format!("{date}.json"))
 }
 
+/// A common-stock ticker: 1–5 letters, optionally a share class (`BRK.B`). The inactive list also
+/// holds CUSIP-like codes for rights and escrows (`0029900E0`), which the bars API rejects.
+pub fn is_ticker(s: &str) -> bool {
+    let (base, class) = s.split_once('.').unwrap_or((s, ""));
+    let letters = |t: &str, n: std::ops::RangeInclusive<usize>| {
+        n.contains(&t.len()) && t.bytes().all(|b| b.is_ascii_uppercase())
+    };
+    letters(base, 1..=5) && (!s.contains('.') || letters(class, 1..=2)) && history::valid_symbol(s)
+}
+
 #[derive(Deserialize)]
 struct Asset {
     symbol: String,
@@ -138,9 +148,7 @@ pub fn fetch_universe(alpaca: &Alpaca, dir: &Path) -> Result<usize, String> {
         symbols.extend(
             assets
                 .into_iter()
-                .filter(|a| {
-                    EXCHANGES.contains(&a.exchange.as_str()) && history::valid_symbol(&a.symbol)
-                })
+                .filter(|a| EXCHANGES.contains(&a.exchange.as_str()) && is_ticker(&a.symbol))
                 .map(|a| a.symbol),
         );
     }
@@ -165,6 +173,15 @@ struct DailyPage {
     #[serde(default)]
     bars: Option<BTreeMap<String, Vec<RawDaily>>>,
     next_page_token: Option<String>,
+}
+
+/// The symbol in Alpaca's `{"message":"invalid symbol: X"}` refusal, if that's what `err` is.
+fn rejected_symbol(err: &str) -> Option<&str> {
+    let rest = &err[err.find("invalid symbol: ")? + "invalid symbol: ".len()..];
+    let end = rest
+        .find(|c: char| c == '"' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    Some(&rest[..end]).filter(|s| !s.is_empty())
 }
 
 /// A daily bar's time is New York midnight; its New York date is the trading date.
@@ -193,10 +210,13 @@ pub fn fetch_daily(
         .collect();
     let mut done = 0;
     for batch in todo.chunks(DAILY_BATCH) {
-        let names: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
+        let mut names: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
         let mut got: BTreeMap<String, Vec<DailyBar>> = BTreeMap::new();
         let mut token: Option<String> = None;
         loop {
+            if names.is_empty() {
+                break;
+            }
             let mut path = format!(
                 "/v2/stocks/bars?symbols={}&timeframe=1Day&start={from}&end={to}&feed={}&adjustment=raw&limit=10000",
                 history::encode(&names.join(",")),
@@ -206,7 +226,21 @@ pub fn fetch_daily(
                 path.push_str(&format!("&page_token={}", history::encode(t)));
             }
             std::thread::sleep(std::time::Duration::from_millis(history::CALL_SPACING_MS));
-            let page: DailyPage = alpaca.get(Api::MarketData, &path)?;
+            let page: DailyPage = match alpaca.get(Api::MarketData, &path) {
+                Ok(p) => p,
+                // Alpaca names one symbol it won't serve: drop it (it gets no bars) and retry the batch.
+                Err(e) => {
+                    match rejected_symbol(&e).filter(|r| names.contains(r) && token.is_none()) {
+                        Some(bad) => {
+                            let bad = bad.to_string();
+                            names.retain(|n| *n != bad);
+                            got.clear();
+                            continue;
+                        }
+                        None => return Err(e),
+                    }
+                }
+            };
             for (sym, raw) in page.bars.unwrap_or_default() {
                 let bars = got.entry(sym).or_default();
                 for r in raw {
@@ -455,6 +489,28 @@ mod tests {
         assert_eq!(pick_gappers(&sessions[24], &sessions, &daily).len(), 10);
         assert!(pick_gappers(&sessions[0], &sessions, &daily).is_empty());
         assert!(pick_gappers("1999-01-01", &sessions, &daily).is_empty());
+    }
+
+    #[test]
+    fn only_real_tickers_and_alpacas_refusals_are_parsed() {
+        for ok in ["A", "AAPL", "GOOGL", "BRK.B", "BF.A"] {
+            assert!(is_ticker(ok), "{ok}");
+        }
+        for bad in [
+            "0029900E0",
+            "003CVR016",
+            "ABCDEF",
+            "BRK.",
+            ".B",
+            "AB.CDE",
+            "aapl",
+            "",
+        ] {
+            assert!(!is_ticker(bad), "{bad}");
+        }
+        let e = r#"Alpaca /v2/stocks/bars?... HTTP 400: {"message":"invalid symbol: XYZQ"}"#;
+        assert_eq!(rejected_symbol(e), Some("XYZQ"));
+        assert_eq!(rejected_symbol("HTTP 500: oops"), None);
     }
 
     #[test]
