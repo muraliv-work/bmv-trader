@@ -12,5 +12,6 @@ pub mod risk;
 pub mod safety;
 pub mod stats;
 pub mod strategy;
+pub mod ui;
 pub mod vetting;
 pub mod watch;

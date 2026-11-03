@@ -80,6 +80,11 @@ pub fn journal_path(home: &Path) -> PathBuf {
     home.join("data").join("journal.jsonl")
 }
 
+/// The unix time of `run`'s latest tick, so monitors can tell a quiet engine from a dead one.
+pub fn heartbeat_path(home: &Path) -> PathBuf {
+    home.join("data").join("heartbeat")
+}
+
 /// Append-only, one fsynced JSON line per record.
 pub struct Journal {
     file: std::fs::File,
@@ -891,8 +896,13 @@ pub fn startup(
 /// Ticks every LOOP_SECS until the day is done. On an error, closes everything and returns it.
 pub fn run(r: &mut Runner<Alpaca>, home: &Path) -> Result<(), String> {
     let stop = safety::stop_path(home);
+    let beat = heartbeat_path(home);
     loop {
         let now = chrono::Utc::now().timestamp();
+        // Only monitors read this; a failed write shows there as "engine not running".
+        if let Err(e) = std::fs::write(&beat, now.to_string()) {
+            eprintln!("heartbeat {beat:?}: {e}");
+        }
         let step = r
             .tick(now, &safety::kill_switch(&stop))
             .and_then(|_| r.finished(now));

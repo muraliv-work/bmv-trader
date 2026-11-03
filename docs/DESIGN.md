@@ -15,7 +15,8 @@ Deterministic rules find setups, Claude vets them, hard-coded risk limits have t
 **Monitoring:**
 - Alpaca's dashboard for positions, orders and P&L (from day one)
 - the terminal log plus `status` and `report` commands (P3)
-- a **read-only** local web dashboard on 127.0.0.1, reachable over Tailscale, showing candidates, Claude's verdicts, orders, P&L and Claude vs shadow (P4)
+- `watch` (terminal) and the `ui` web console on 127.0.0.1 (P3, DECISION S16): session state, account, positions, orders, journal and trials, with STOP and flatten as the only controls
+- in P4 the console adds candidates, Claude's verdicts and Claude vs shadow; Tailscale access would be a new decision
 - phone alerts (P5)
 
 No UI ever has buy or sell buttons. The only controls are STOP and flatten.

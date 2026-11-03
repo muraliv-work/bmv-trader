@@ -1,0 +1,114 @@
+/* Signal-box panel: enamel calm everywhere, colour only where it means a state. */
+:root {
+  --panel: #dce3df;
+  --surface: #eef2ef;
+  --ink: #1f2a2e;
+  --muted: #5b6b70;
+  --rule: #b9c4bf;
+  --go: #1e7f4f;
+  --caution: #b7791f;
+  --danger: #b3261e;
+  --off: #7d8a8e;
+  --lamp: var(--off);
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --panel: #1b2326;
+    --surface: #232d30;
+    --ink: #dfe7e3;
+    --muted: #93a3a8;
+    --rule: #3a474b;
+    --go: #3fb57a;
+    --caution: #e0a640;
+    --danger: #ef6a5f;
+    --off: #6c7a7e;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--panel);
+  color: var(--ink);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+main, .controls, #banners { max-width: 72rem; margin: 0 auto; padding: 0 1rem; }
+
+.signal {
+  display: flex; align-items: center; gap: 1.5rem;
+  max-width: 72rem; margin: 0 auto; padding: 2rem 1rem 1.5rem;
+  border-bottom: 2px solid var(--rule);
+}
+.signal[data-aspect="go"] { --lamp: var(--go); }
+.signal[data-aspect="caution"] { --lamp: var(--caution); }
+.signal[data-aspect="danger"] { --lamp: var(--danger); }
+.lamp {
+  flex: none; width: 4.5rem; height: 4.5rem; border-radius: 50%;
+  background: var(--lamp);
+  border: 6px solid var(--ink);
+  box-shadow: 0 0 0 3px var(--panel), 0 0 2.5rem -0.25rem var(--lamp);
+}
+.lamp.changed { animation: pulse 0.9s ease-out 2; }
+@keyframes pulse { 50% { transform: scale(1.08); } }
+@media (prefers-reduced-motion: reduce) { .lamp.changed { animation: none; } }
+.aspect h1 {
+  margin: 0; font-size: clamp(2rem, 6vw, 3.25rem); line-height: 1.05;
+  font-weight: 800; letter-spacing: -0.01em; color: var(--lamp);
+}
+.aspect { min-width: 0; }
+.aspect p { margin: 0.35rem 0 0; color: var(--muted); }
+
+.banner {
+  margin: 1rem 0 0; padding: 0.65rem 0.9rem;
+  border-left: 6px solid var(--caution); background: var(--surface);
+}
+.banner.danger { border-color: var(--danger); }
+
+section { margin: 2rem 0; }
+h2 { font-size: 1.05rem; margin: 0 0 0.6rem; }
+h3 { font-size: 1rem; margin: 0 0 0.4rem; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+
+.figures { display: flex; flex-wrap: wrap; gap: 0.5rem 3rem; margin: 0; }
+.figures dt { color: var(--muted); font-size: 0.9rem; }
+.figures dd { margin: 0; font-size: 1.75rem; font-weight: 650; }
+.pos { color: var(--go); }
+.neg { color: var(--danger); }
+.counts { color: var(--muted); margin: 0.75rem 0 0; }
+
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 26rem), 1fr)); gap: 0 2.5rem; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 0.35rem 0.6rem 0.35rem 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 0.9rem; }
+.n { text-align: right; }
+.empty td { color: var(--muted); }
+
+.journal { list-style: none; margin: 0; padding: 0; max-height: 24rem; overflow-y: auto; }
+.journal li { display: grid; grid-template-columns: 5.5rem 8.5rem minmax(0, 1fr); gap: 0.75rem; padding: 0.25rem 0; border-bottom: 1px solid var(--rule); }
+.journal time { color: var(--muted); }
+.journal .kind { font-weight: 600; }
+.journal .detail { overflow-wrap: anywhere; }
+@media (max-width: 40rem) { .journal li { grid-template-columns: 5rem 1fr; } .journal .detail { grid-column: 1 / -1; } }
+
+.controls { margin-top: 3rem; padding-top: 1.25rem; padding-bottom: 3rem; border-top: 4px double var(--danger); }
+.controls .hint { color: var(--muted); margin-top: 0; }
+.control { padding: 1rem 0; }
+.control p { margin: 0 0 0.75rem; color: var(--muted); max-width: 36rem; }
+.control label { display: block; margin-bottom: 0.6rem; }
+.control input {
+  display: block; margin-top: 0.25rem; width: 12rem; padding: 0.45rem 0.6rem;
+  font: inherit; letter-spacing: 0.08em; color: var(--ink); background: var(--surface);
+  border: 2px solid var(--rule); border-radius: 4px;
+}
+button {
+  font: inherit; font-weight: 650; padding: 0.55rem 1.1rem; border-radius: 4px; cursor: pointer;
+  color: #fff; background: var(--danger); border: 2px solid var(--danger);
+}
+button:disabled { cursor: not-allowed; color: var(--muted); background: transparent; border-color: var(--rule); }
+:focus-visible { outline: 3px solid var(--caution); outline-offset: 2px; }
+.result { font-weight: 600; min-height: 1.5em; }
+body.stale main { opacity: 0.45; }
+.result.bad { color: var(--danger); }

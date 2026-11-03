@@ -1,7 +1,7 @@
 use bmv_trader::backtest::{self, DayResult, FillModel};
 use bmv_trader::engine::{self, Entry, Settings};
 use bmv_trader::strategy::OrbParams;
-use bmv_trader::{broker, config, config::Mode, history, live, stats};
+use bmv_trader::{broker, config, config::Mode, history, live, stats, ui, watch};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::exit;
@@ -10,6 +10,7 @@ const USAGE: &str = "usage:
   bmv-trader account
   bmv-trader status                       account, positions and open orders (read-only)
   bmv-trader watch                        live read-only monitor, refreshes every 5 s (Ctrl-C quits)
+  bmv-trader ui       [--port 8765]       web console on 127.0.0.1: the watch view plus STOP and flatten
   bmv-trader run      [--symbols ...] [--trend] [--marketable]   one paper session (PAPER ONLY; live is P5)
   bmv-trader flatten                      close every position and confirm (any mode)
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
@@ -29,7 +30,14 @@ const MAX_SEEDS: usize = 50;
 
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
-const VALUE_FLAGS: [&str; 5] = ["--from", "--to", "--symbols", "--fold-days", "--seeds"];
+const VALUE_FLAGS: [&str; 6] = [
+    "--from",
+    "--to",
+    "--symbols",
+    "--fold-days",
+    "--seeds",
+    "--port",
+];
 const SWITCHES: [&str; 5] = [
     "--holdout",
     "--holdout-again",
@@ -130,6 +138,7 @@ fn main() {
             Some("account") => account(),
             Some("status") => status(),
             Some("watch") => watch(),
+            Some("ui") => ui(args.num("--port", 8765, 1024..=65535)?),
             Some("flatten") => flatten(),
             Some("run") => run(&args.symbols()?, args.has("--trend"), orb_params(&args)),
             Some("fetch") => {
@@ -204,73 +213,69 @@ fn status() -> Result<(), String> {
     Ok(())
 }
 
+fn mode_name() -> Result<String, String> {
+    Ok(format!("{:?}", config::load()?.mode()).to_uppercase())
+}
+
 /// Read-only monitor. Alpaca errors are shown and retried next refresh, never fatal.
 fn watch() -> Result<(), String> {
-    use bmv_trader::{safety, watch};
-    let mode = format!("{:?}", config::load()?.mode()).to_uppercase();
-    let a = connect()?;
-    let home = config::home()?;
-    let (journal, stop) = (live::journal_path(&home), safety::stop_path(&home));
+    let mode = mode_name()?;
+    let (a, home) = (connect()?, config::home()?);
     loop {
+        let s = watch::snapshot(&a, &home, &mode, 12);
         let mut out = String::from("\x1b[2J\x1b[H"); // clear screen, cursor home
-        let now = chrono::Utc::now().timestamp();
-        let text = match std::fs::read_to_string(&journal) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => format!("{{\"unreadable journal\": \"{e}\"}}"),
-        };
-        let s = watch::summarize(&text, 12);
-        let stop_file = match safety::kill_switch(&stop) {
-            safety::KillSwitch::Clear => "clear".to_string(),
-            safety::KillSwitch::Engaged(why) => format!("ENGAGED ({why})"),
-        };
         out += &format!(
             "bmv-trader watch · {} ET · {mode} · read-only (Ctrl-C quits)\n\n",
-            watch::et(now)
+            s.time_et
         );
         out += &format!(
-            "  state: {}   session: {}   STOP file: {stop_file}\n",
-            s.state(),
-            s.session.as_deref().unwrap_or("-")
+            "  state: {}   session: {}   STOP file: {}\n",
+            s.state,
+            s.summary.session.as_deref().unwrap_or("-"),
+            s.stop
+                .as_deref()
+                .map_or("clear".into(), |w| format!("ENGAGED ({w})"))
         );
-        if let Some(why) = &s.halted {
+        if let Some(why) = &s.summary.halted {
             out += &format!("  halt reason: {why}\n");
         }
-        if !s.unresolved.is_empty() {
-            let keys: Vec<&str> = s.unresolved.iter().map(String::as_str).collect();
+        if !s.summary.unresolved.is_empty() {
+            let keys: Vec<&str> = s.summary.unresolved.iter().map(String::as_str).collect();
             out += &format!("  unresolved: {}\n", keys.join(", "));
         }
-        if s.unreadable > 0 {
-            out += &format!("  WARNING: {} unreadable journal lines\n", s.unreadable);
+        if s.summary.unreadable > 0 {
+            out += &format!(
+                "  WARNING: {} unreadable journal lines\n",
+                s.summary.unreadable
+            );
         }
+        for (what, e) in &s.errors {
+            out += &format!("  {what}: ERROR {e}\n");
+        }
+        let c = &s.summary;
         out += &format!(
             "  today: {} candidates · {} rejected · {} orders · {} fills · {} exits\n\n",
-            s.candidates, s.rejections, s.orders, s.fills, s.exits
+            c.candidates, c.rejections, c.orders, c.fills, c.exits
         );
-        match a.account() {
-            Ok(acct) => {
-                out += &format!(
-                    "  equity {}   today P&L {}   buying power {}\n",
-                    acct.equity,
-                    acct.equity - acct.last_equity,
-                    acct.buying_power
-                )
-            }
-            Err(e) => out += &format!("  account: ERROR {e}\n"),
+        if let Some(acct) = &s.account {
+            out += &format!(
+                "  equity {}   today P&L {}   buying power {}\n",
+                acct.equity, acct.today_pnl, acct.buying_power
+            );
         }
-        match a.positions() {
-            Ok(ps) if ps.is_empty() => out += "  positions: none\n",
-            Ok(ps) => {
+        match &s.positions {
+            Some(ps) if ps.is_empty() => out += "  positions: none\n",
+            Some(ps) => {
                 out += "  positions:\n";
                 for p in ps {
                     out += &format!("    {:>6} {:>6} @ {}\n", p.symbol, p.qty, p.avg_entry_price);
                 }
             }
-            Err(e) => out += &format!("  positions: ERROR {e}\n"),
+            None => {}
         }
-        match live::open_orders(&a) {
-            Ok(os) if os.is_empty() => out += "  open orders: none\n",
-            Ok(os) => {
+        match &s.orders {
+            Some(os) if os.is_empty() => out += "  open orders: none\n",
+            Some(os) => {
                 out += "  open orders:\n";
                 for o in os {
                     out += &format!(
@@ -279,10 +284,10 @@ fn watch() -> Result<(), String> {
                     );
                 }
             }
-            Err(e) => out += &format!("  open orders: ERROR {e}\n"),
+            None => {}
         }
         out += "\n  recent journal:\n";
-        for l in &s.recent {
+        for l in &s.summary.recent {
             let detail: String = l.detail.chars().take(70).collect();
             out += &format!(
                 "    {} {:<12} {:<22} {detail}\n",
@@ -296,6 +301,13 @@ fn watch() -> Result<(), String> {
         let _ = std::io::stdout().flush();
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
+}
+
+/// Web console on 127.0.0.1 (DECISION S16); serves until Ctrl-C.
+fn ui(port: usize) -> Result<(), String> {
+    let mode = mode_name()?;
+    let port = u16::try_from(port).map_err(|_| "--port out of range".to_string())?;
+    ui::serve(&connect()?, &config::home()?, &mode, port)
 }
 
 /// The emergency exit, allowed in both modes.

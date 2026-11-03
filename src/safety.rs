@@ -30,6 +30,34 @@ pub fn kill_switch(path: &Path) -> KillSwitch {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Engaged {
+    Now,
+    /// STOP was there already; it keeps its first reason.
+    Already,
+    /// STOP exists (so it's engaged: the engine checks presence only), but the reason didn't save.
+    NowWithoutReason(String),
+}
+
+/// Creates STOP with `reason` inside. Err only when no STOP file exists afterwards. Clearing STOP
+/// is never done here: that stays a human's `rm`.
+pub fn engage(path: &Path, reason: &str) -> Result<Engaged, String> {
+    use std::io::Write;
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path);
+    let mut f = match created {
+        Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => return Ok(Engaged::Already),
+        Err(e) => return Err(format!("engage kill switch {path:?}: {e}")),
+    };
+    Ok(match writeln!(f, "{reason}").and_then(|_| f.sync_all()) {
+        Ok(()) => Engaged::Now,
+        Err(e) => Engaged::NowWithoutReason(e.to_string()),
+    })
+}
+
 /// Fresh, unique dir under the system temp dir; caller removes it.
 fn scratch_dir(tag: &str) -> Result<PathBuf, String> {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -94,6 +122,18 @@ mod tests {
         assert_eq!(kill_switch(&stop), KillSwitch::Clear);
         std::fs::write(&stop, b"").unwrap();
         assert!(matches!(kill_switch(&stop), KillSwitch::Engaged(_)));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn engage_creates_stop_once_and_keeps_the_first_reason() {
+        let d = scratch_dir("t5").unwrap();
+        let stop = d.join("STOP");
+        assert_eq!(engage(&stop, "ui 10:00"), Ok(Engaged::Now));
+        assert!(matches!(kill_switch(&stop), KillSwitch::Engaged(_)));
+        assert_eq!(engage(&stop, "ui 11:00"), Ok(Engaged::Already));
+        assert_eq!(std::fs::read_to_string(&stop).unwrap(), "ui 10:00\n");
+        assert!(engage(&d.join("missing").join("STOP"), "x").is_err());
         std::fs::remove_dir_all(&d).unwrap();
     }
 

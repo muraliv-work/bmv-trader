@@ -99,6 +99,7 @@ still decides. **In P1**, this same flow runs inside the backtest with simulated
 | **Risk gate** | Size the order, refuse it | Be bypassed: it's the only way to make an `OrderIntent` |
 | **Broker module** | Send a gate-approved bracket, cancel, close all | Send any other kind of buy |
 | **You** | Approve live orders, STOP, flatten, flip paper ↔ live in `.env` | Place a trade from any UI (there are no buy buttons) |
+| **Web console (`ui`)** | Show the session, account, orders, journal and trials; STOP; flatten (STOP first) | Clear STOP, start a run, place or change an order, be reached from another machine |
 | **Free models (OmniRoute)** | Summaries, digests, logs, research ideas | Anything in this flow |
 
 ## 6. When something goes wrong

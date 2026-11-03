@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>bmv-trader console</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="signal" id="signal" data-aspect="unknown">
+  <div class="lamp" aria-hidden="true"></div>
+  <div class="aspect">
+    <h1 id="state">Connecting</h1>
+    <p id="meta">Waiting for the first reading</p>
+  </div>
+</header>
+
+<div id="banners" role="status" aria-live="polite"></div>
+
+<main>
+  <section aria-labelledby="h-account" class="account">
+    <h2 id="h-account" class="visually-hidden">Account</h2>
+    <dl class="figures">
+      <div><dt>Equity</dt><dd id="equity">–</dd></div>
+      <div><dt>Today</dt><dd id="pnl">–</dd></div>
+      <div><dt>Buying power</dt><dd id="bp">–</dd></div>
+    </dl>
+    <p id="counts" class="counts"></p>
+  </section>
+
+  <div class="pair">
+    <section aria-labelledby="h-pos">
+      <h2 id="h-pos">Positions</h2>
+      <div class="scroll"><table><thead><tr><th>Symbol</th><th class="n">Shares</th><th class="n">Entry</th></tr></thead>
+      <tbody id="positions"></tbody></table></div>
+    </section>
+    <section aria-labelledby="h-ord">
+      <h2 id="h-ord">Open orders</h2>
+      <div class="scroll"><table><thead><tr><th>Order</th><th>Side</th><th>Status</th><th class="n">Filled</th></tr></thead>
+      <tbody id="orders"></tbody></table></div>
+    </section>
+  </div>
+
+  <section aria-labelledby="h-journal">
+    <h2 id="h-journal">Today's journal</h2>
+    <ol id="journal" class="journal" reversed></ol>
+  </section>
+
+  <section aria-labelledby="h-trials">
+    <h2 id="h-trials">Research trials</h2>
+    <div class="scroll"><table><thead><tr><th>Trial</th><th>Period</th><th class="n">Trades</th>
+      <th class="n">Expectancy</th><th class="n">CI low</th><th class="n">Profit factor</th></tr></thead>
+    <tbody id="trials"></tbody></table></div>
+  </section>
+</main>
+
+<section class="controls" aria-labelledby="h-controls">
+  <h2 id="h-controls">Emergency controls</h2>
+  <p class="hint">These only make things safer. Clearing STOP and starting a run stay in the terminal.</p>
+  <div class="pair">
+    <form class="control" data-action="stop" data-word="STOP">
+      <h3>Stop new trades</h3>
+      <p>Creates data/STOP. A running engine sees it on its next tick, takes no new entries and cancels its working ones. Open positions keep their stop and target at Alpaca.</p>
+      <label>Type STOP to confirm <input name="confirm" autocomplete="off" spellcheck="false"></label>
+      <button type="submit" disabled>Stop new trades</button>
+    </form>
+    <form class="control" data-action="flatten" data-word="FLATTEN">
+      <h3>Close everything</h3>
+      <p>Engages STOP, then closes every position and cancels every order at Alpaca, and checks the account is flat.</p>
+      <label>Type FLATTEN to confirm <input name="confirm" autocomplete="off" spellcheck="false"></label>
+      <button type="submit" disabled>Close everything</button>
+    </form>
+  </div>
+  <p id="result" class="result" role="status" aria-live="assertive"></p>
+</section>
+</body>
+</html>

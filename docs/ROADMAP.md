@@ -29,11 +29,12 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 
 ## P3 — Paper engine
 - [x] Paper run loop v1: `market_data.rs` (REST polling, SPY staleness), `live.rs` (executor, reconcile, JSONL journal, startup: skew, calendar, flat, day P&L), CLI `run` (paper only), `flatten`, `status`
+- [x] Monitors: `watch` (terminal) and `ui` (web console on 127.0.0.1: token, Host/Origin checks, CSP; STOP and flatten only; DECISION S16)
 - [ ] Websocket market data (replaces REST polling); flatten backstop launchd job; `report`; X-RateLimit back-off; single-instance lock; ⛔ first paper run needs keys
 - [ ] ⛔ 10 unattended paper days; live candidates identical to replay
 
 ## P4 — AI layer
-- [ ] `llm.rs`, `vetting.rs` parsing, prompt versioning, regression set, drift alarm; second paper account shadow; read-only web dashboard (tier 1/2)
+- [ ] `llm.rs`, `vetting.rs` parsing, prompt versioning, regression set, drift alarm; second paper account shadow; candidates and verdicts in the `ui` console (tier 1/2)
 - [ ] ⛔ 20+ paper days; pre-registered Claude-vs-shadow gate
 
 ## P5 — Live pilot
