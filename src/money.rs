@@ -82,6 +82,27 @@ impl Price {
         Price::from_cents(Usd::parse(s)?.0).ok_or_else(|| format!("price must be > 0: {s:?}"))
     }
 
+    /// From a float bar price, rounded up to the cent (e.g. a buy limit). None if not finite or ≤ 0.
+    pub fn from_f64_ceil(x: f64) -> Option<Self> {
+        // the epsilon absorbs float noise like 187.33 * 100 = 18733.000000000004
+        Self::from_f64(x, |c| (c - 1e-6).ceil())
+    }
+
+    /// From a float bar price, rounded down to the cent (e.g. a long stop). None if not finite or ≤ 0.
+    pub fn from_f64_floor(x: f64) -> Option<Self> {
+        Self::from_f64(x, |c| (c + 1e-6).floor())
+    }
+
+    fn from_f64(x: f64, round: impl Fn(f64) -> f64) -> Option<Self> {
+        let c = round(x * 100.0);
+        // the bound keeps the cast exact; no real price is near it
+        (c.is_finite() && c > 0.0 && c < 1e15).then_some(Price(c as i64))
+    }
+
+    pub fn cents(self) -> i64 {
+        self.0
+    }
+
     pub fn as_usd(self) -> Usd {
         Usd(self.0)
     }
@@ -204,6 +225,21 @@ mod tests {
             Price::parse("187.33").unwrap(),
             Price::from_cents(18_733).unwrap()
         );
+    }
+
+    #[test]
+    fn float_prices_round_in_the_stated_direction() {
+        let ceil = |x| Price::from_f64_ceil(x).map(Price::cents);
+        let floor = |x| Price::from_f64_floor(x).map(Price::cents);
+        assert_eq!((ceil(187.33), floor(187.33)), (Some(18_733), Some(18_733)));
+        assert_eq!(
+            (ceil(187.331), floor(187.339)),
+            (Some(18_734), Some(18_733))
+        );
+        assert_eq!((ceil(0.29), floor(0.29)), (Some(29), Some(29)));
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -1.0, 1e20] {
+            assert_eq!((ceil(bad), floor(bad)), (None, None), "{bad}");
+        }
     }
 
     #[test]

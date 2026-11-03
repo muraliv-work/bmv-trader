@@ -100,11 +100,12 @@ On a half-day (close at 13:00), all of this shifts automatically.
 ## 7. Strategy v1: Opening Range Breakout (ORB-15)
 
 - **Universe:** see §13 (rule-based). For P3/P4 live trading: a fixed list of 10 liquid names (SPY, QQQ, AAPL, MSFT, NVDA, AMD, META, AMZN, GOOGL, TSLA). That's within the 30-symbol websocket limit.
-- **Indicators use regular-hours bars of the current day only.** By the time of the first entry there are 15 bars, so ATR(14) and the 20-bar volume average are computed over the bars available that day, with no premarket bars and no previous day.
-- **Long entry:** a 1-minute bar closes above the opening-range high, and its volume is above the session's average bar volume
+- **Indicators use regular-hours bars of the current day only:** no premarket bars and no previous day. The opening range needs **at least 10 of its 15 bars** (IEX skips quiet minutes). Any bar that isn't sane (non-finite or ≤ 0 price, low/high not bracketing open/close, out of order, before the open) means no candidate that day for that symbol.
+- **Long entry:** the **first** bar after the opening range whose close is above the opening-range high, with volume above the average of the earlier bars today. If that first close above fails the volume filter, the day is done for that symbol, and a later re-break doesn't fire either.
+- **ATR(14):** a simple average of the last 14 true ranges, using today's bars only (the first bar's previous close is not yesterday's). Prices are converted to cents with the entry rounded up and the stop rounded down, so rounding never understates R.
 - **Stop:** the opening-range low or entry − 1.5 × ATR, whichever is closer to entry. **Minimum R = max(0.15% of price, 5¢).** If R is smaller, there's no trade.
 - **Target:** 2R. Exit at flatten time regardless.
-- **Size:** `qty = min(risk_per_trade / R, max_position / entry)` in integer cents. If qty < 1, no trade.
+- **Size** (in `risk.rs`, not the strategy): `qty = min(risk_per_trade / R, max_position / entry)` in integer cents. If qty < 1, no trade. `Candidate` carries prices only.
 - **One trade per symbol per day**, derived from today's Alpaca orders via the `client_order_id` prefix
 - **Shorts:** off in v1
 

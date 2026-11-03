@@ -3,3 +3,4 @@
 pub mod broker;
 pub mod config;
 pub mod money;
+pub mod strategy;
