@@ -100,6 +100,8 @@ struct Working {
     eligible_from: i64,
     partial: bool,
     filled: bool,
+    /// Limit above the last close when sent: it crosses the spread and fills at the next open.
+    marketable: bool,
 }
 
 /// Becomes a position the moment any shares fill (a partial fill's remainder is cancelled by the TTL).
@@ -120,6 +122,12 @@ struct Sim {
     open: BTreeMap<String, Position>,
     last_close: BTreeMap<String, f64>,
     day: DayResult,
+}
+
+/// Slippage in dollars on a fill near price `p`.
+fn slip(m: &FillModel, p: f64) -> f64 {
+    let cents = m.slippage_cents as f64 + (p * 100.0 * m.slippage_bps as f64 / 10_000.0).ceil();
+    cents / 100.0
 }
 
 /// Runs every day through one engine (so halts and limits behave as live). Rules-only: vetting must be off.
@@ -190,9 +198,7 @@ pub fn run(days: &[Day], settings: Settings, model: FillModel) -> Result<Vec<Day
 
 impl Sim {
     fn slip(&self, p: f64) -> f64 {
-        let cents = self.model.slippage_cents as f64
-            + (p * 100.0 * self.model.slippage_bps as f64 / 10_000.0).ceil();
-        cents / 100.0
+        slip(&self.model, p)
     }
 
     /// A market sell at `px` after slippage; if that isn't a valid price, the worst one (1¢).
@@ -217,7 +223,17 @@ impl Sim {
                 continue;
             }
             let limit = w.order.entry().cents() as f64 / 100.0;
-            if bar.low < limit {
+            // marketable: fills at the next open plus slippage, never above the limit;
+            // resting: only when price trades strictly through it, at the limit
+            let fill = if w.marketable && bar.open <= limit {
+                Price::from_f64_ceil(bar.open + slip(&self.model, bar.open))
+                    .map(|p| p.min(w.order.entry()))
+            } else if bar.low < limit {
+                Some(w.order.entry())
+            } else {
+                None
+            };
+            if let Some(fill) = fill {
                 let full = w.order.qty();
                 let qty = if w.partial {
                     Qty::new((full.get() / 2).max(1)).unwrap_or(full)
@@ -231,7 +247,7 @@ impl Sim {
                     Position {
                         symbol: o.symbol().to_string(),
                         qty,
-                        entry: o.entry(),
+                        entry: fill,
                         stop: o.stop(),
                         target: o.target(),
                         filled_at: bar.ts,
@@ -240,7 +256,7 @@ impl Sim {
                 events.push(Event::EntryFilled {
                     id: id.clone(),
                     cum_qty: qty,
-                    avg_price: o.entry(),
+                    avg_price: fill,
                 });
             }
         }
@@ -314,6 +330,12 @@ impl Sim {
                         // rules-only backtests submit only on a bar; anything else can never fill
                         let partial = self.roll() < self.model.partial_pct;
                         let eligible_from = is_bar_ts.map_or(i64::MAX, |ts| ts + 60);
+                        let marketable = self
+                            .last_close
+                            .get(order.symbol())
+                            // vs the close rounded up, as the strategy prices it: no buffer = resting
+                            .and_then(|&c| Price::from_f64_ceil(c))
+                            .is_some_and(|c| order.entry() > c);
                         self.working.insert(
                             id,
                             Working {
@@ -321,6 +343,7 @@ impl Sim {
                                 eligible_from,
                                 partial,
                                 filled: false,
+                                marketable,
                             },
                         );
                     }
@@ -469,6 +492,50 @@ mod tests {
             (ExitReason::Target, 24, 10_150, 10_450)
         );
         assert!((t.r_multiple() - 2.0).abs() < 1e-9);
+    }
+
+    fn marketable() -> Settings {
+        Settings {
+            orb: OrbParams {
+                entry_buffer_bps: 5,
+                ..OrbParams::default()
+            },
+            ..rules()
+        }
+    }
+
+    #[test]
+    fn a_marketable_entry_fills_at_the_next_open_where_a_resting_one_misses() {
+        // the breakout keeps going: never trades back down to 101.50
+        let after = || vec![bar(16, 101.52, 101.9, 101.51, 101.8, 900)];
+        assert!(
+            one(day(after())).trades.is_empty(),
+            "resting limit at the close misses"
+        );
+        let r = run(&[day(after())], marketable(), no_partials())
+            .unwrap()
+            .remove(0);
+        let t = &r.trades[0];
+        // limit 101.56; open 101.52 + slippage (1¢ + 3¢) = 101.56, capped at the limit
+        assert_eq!(t.entry.cents(), 10_156);
+        assert_eq!(r.missed, 0);
+    }
+
+    #[test]
+    fn a_marketable_entry_is_capped_at_its_limit() {
+        // opens above the 101.56 limit and never comes back: no fill, entry cancelled by the TTL
+        let r = run(
+            &[day(vec![
+                bar(16, 101.70, 101.9, 101.60, 101.8, 900),
+                bar(17, 101.80, 101.9, 101.70, 101.8, 900),
+            ])],
+            marketable(),
+            no_partials(),
+        )
+        .unwrap()
+        .remove(0);
+        assert!(r.trades.is_empty());
+        assert_eq!(r.missed, 1);
     }
 
     #[test]

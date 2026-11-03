@@ -9,11 +9,11 @@ use std::process::exit;
 const USAGE: &str = "usage:
   bmv-trader account
   bmv-trader status                       account, positions and open orders (read-only)
-  bmv-trader run      [--symbols ...] [--trend]   one paper session (PAPER ONLY; live is P5)
+  bmv-trader run      [--symbols ...] [--trend] [--marketable]   one paper session (PAPER ONLY; live is P5)
   bmv-trader flatten                      close every position and confirm (any mode)
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
   bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--symbols ...] [--fold-days 21]
-                      [--seeds 5] [--holdout] [--holdout-again] [--trend]
+                      [--seeds 5] [--holdout] [--holdout-again] [--trend] [--marketable]
 
 The holdout start date is pinned in data/holdout_from on the first backtest (the last 63 sessions
 loaded) and research never uses days from it on. --holdout evaluates it once; a second evaluation
@@ -29,7 +29,13 @@ const MAX_SEEDS: usize = 50;
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
 const VALUE_FLAGS: [&str; 5] = ["--from", "--to", "--symbols", "--fold-days", "--seeds"];
-const SWITCHES: [&str; 4] = ["--holdout", "--holdout-again", "--trend", "--allow-gaps"];
+const SWITCHES: [&str; 5] = [
+    "--holdout",
+    "--holdout-again",
+    "--trend",
+    "--allow-gaps",
+    "--marketable",
+];
 
 struct Args {
     values: BTreeMap<String, String>,
@@ -123,7 +129,7 @@ fn main() {
             Some("account") => account(),
             Some("status") => status(),
             Some("flatten") => flatten(),
-            Some("run") => run(&args.symbols()?, args.has("--trend")),
+            Some("run") => run(&args.symbols()?, args.has("--trend"), orb_params(&args)),
             Some("fetch") => {
                 let (from, to) = args.dates()?;
                 fetch(&from, &to, &args.symbols()?, args.has("--allow-gaps"))
@@ -136,6 +142,7 @@ fn main() {
                     holdout: args.has("--holdout"),
                     holdout_again: args.has("--holdout-again"),
                     trend: args.has("--trend"),
+                    orb: orb_params(&args),
                 };
                 run_backtest(&from, &to, &args.symbols()?, &opts)
             }
@@ -205,7 +212,7 @@ fn flatten() -> Result<(), String> {
     Ok(())
 }
 
-fn run(symbols: &[String], trend: bool) -> Result<(), String> {
+fn run(symbols: &[String], trend: bool, orb: OrbParams) -> Result<(), String> {
     let cfg = config::load()?;
     let mode = cfg.mode();
     live::refuse_live(mode)?;
@@ -213,7 +220,7 @@ fn run(symbols: &[String], trend: bool) -> Result<(), String> {
     let home = config::home()?;
     let settings = Settings {
         vetting: false,
-        orb: OrbParams::default(),
+        orb,
         entry: Entry::Orb,
         trend_filter: trend,
     };
@@ -279,6 +286,21 @@ struct Opts {
     holdout_again: bool,
     /// Only trade while SPY and the symbol trend up today; a separate trial from plain ORB.
     trend: bool,
+    orb: OrbParams,
+}
+
+/// The one pre-registered entry variant: a fixed buffer, not a tunable knob, so it's one trial.
+const MARKETABLE_BUFFER_BPS: i64 = 5;
+
+fn orb_params(args: &Args) -> OrbParams {
+    OrbParams {
+        entry_buffer_bps: if args.has("--marketable") {
+            MARKETABLE_BUFFER_BPS
+        } else {
+            0
+        },
+        ..OrbParams::default()
+    }
 }
 
 /// The pinned holdout start: read from `data/holdout_from`, or set once from the loaded days.
@@ -361,7 +383,7 @@ fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<()
         eprintln!("evaluating the holdout {period}");
     }
 
-    let orb = OrbParams::default();
+    let orb = o.orb.clone();
     let settings = |entry| Settings {
         vetting: false,
         orb: orb.clone(),
@@ -385,7 +407,16 @@ fn run_backtest(from: &str, to: &str, symbols: &[String], o: &Opts) -> Result<()
     let period = format!("{}..{}", research_days[0].date, research_days[cut - 1].date);
     let when = chrono::Utc::now().to_rfc3339();
     let params = format!("{orb:?} trend_filter={}", o.trend);
-    let strategy_name = if o.trend { "orb+trend" } else { "orb" };
+    let strategy_name = format!(
+        "orb{}{}",
+        if o.trend { "+trend" } else { "" },
+        if o.orb.entry_buffer_bps > 0 {
+            "+mkt"
+        } else {
+            ""
+        }
+    );
+    let strategy_name = strategy_name.as_str();
     stats::record_trial(
         &log,
         &stats::Trial::from_summary(&when, strategy_name, &params, &period, &s, ci.map(|c| c.0)),

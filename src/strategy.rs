@@ -99,6 +99,9 @@ pub struct OrbParams {
     /// Minimum R as a fraction of entry (0.0015 = 0.15%).
     pub min_r_frac: f64,
     pub min_r_cents: i64,
+    /// Entry limit this many bps above the signal close: 0 rests at the close (fills only if price
+    /// comes back down); > 0 is a marketable limit that fills at once, capped at that price.
+    pub entry_buffer_bps: i64,
 }
 
 impl Default for OrbParams {
@@ -111,6 +114,7 @@ impl Default for OrbParams {
             target_r: 2.0,
             min_r_frac: 0.0015,
             min_r_cents: 5,
+            entry_buffer_bps: 0,
         }
     }
 }
@@ -127,7 +131,8 @@ impl OrbParams {
             && self.target_r >= 1.0
             && self.min_r_frac.is_finite()
             && self.min_r_frac >= 0.0
-            && self.min_r_cents >= 0;
+            && self.min_r_cents >= 0
+            && (0..=50).contains(&self.entry_buffer_bps);
         if ok {
             Ok(())
         } else {
@@ -282,7 +287,7 @@ fn long_with_exits(
     } else {
         atr_stop
     };
-    let entry = Price::from_f64_ceil(close)?;
+    let entry = Price::from_f64_ceil(close * (1.0 + p.entry_buffer_bps as f64 / 10_000.0))?;
     let stop = Price::from_f64_floor(stop)?;
     let r = risk_per_share(entry, stop)?;
     let min_r = ((entry.cents() as f64 * p.min_r_frac).ceil() as i64).max(p.min_r_cents);
@@ -663,5 +668,35 @@ mod tests {
         let mut bad = rising.clone();
         bad[3].close = f64::NAN;
         assert_eq!(trend(&bad, 10), Trend::Flat, "bad bar");
+    }
+
+    #[test]
+    fn entry_buffer_raises_only_the_entry_and_keeps_the_target_at_target_r() {
+        let mut bars = opening_range();
+        bars.push(bar(15, 101.6, 100.9, 101.5, 3000));
+        let at_close = orb_long("SPY", OPEN, &bars, &OrbParams::default()).unwrap();
+        let p = OrbParams {
+            entry_buffer_bps: 5,
+            ..OrbParams::default()
+        };
+        let marketable = orb_long("SPY", OPEN, &bars, &p).unwrap();
+        // 101.50 × 1.0005 = 101.55075 → ceil to 101.56; same stop; target = entry + 2R
+        assert_eq!(marketable.entry().cents(), 10_156);
+        assert_eq!(marketable.stop(), at_close.stop());
+        let r = marketable.entry().cents() - marketable.stop().cents();
+        assert_eq!(
+            marketable.target().cents(),
+            marketable.entry().cents() + 2 * r
+        );
+        for bad in [-1, 51] {
+            assert!(
+                OrbParams {
+                    entry_buffer_bps: bad,
+                    ..OrbParams::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
     }
 }
