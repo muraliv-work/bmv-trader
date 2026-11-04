@@ -431,7 +431,7 @@ mod tests {
                 &addr,
                 "POST",
                 "/v1/strategies",
-                Some(res),
+                Some(res.clone()),
                 Some(json!({"name": "x", "role": "board"}))
             )
             .await
@@ -459,5 +459,23 @@ mod tests {
         .await
         .unwrap();
         assert!(reply.starts_with("HTTP/1.1 421"), "{reply}");
+
+        // the agents' MCP tools reach the same desk with the same token
+        let (addr2, res2) = (addr.clone(), res.clone());
+        let r = tokio::task::spawn_blocking(move || {
+            let desk = |m: &str, p: &str, b: Option<&Value>| call(&addr2, m, p, Some(&res2), b);
+            let msg = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                             "params": {"name": "whoami", "arguments": {}}});
+            crate::mcp::handle(&msg, &desk).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(r["result"]["isError"], false);
+        assert!(
+            r["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("researcher")
+        );
     }
 }

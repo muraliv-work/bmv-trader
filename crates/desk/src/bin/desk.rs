@@ -49,17 +49,31 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 const DEFAULT_DB: &str = "data/desk/desk.db";
 
-/// Opens (creating if needed) the database at a plain path.
+/// Opens (creating if needed) the database at a plain path, private to the user running this:
+/// the file 600, and its directory 700 when made here, so no agent can read or edit it directly.
 async fn open(db: &str) -> Result<Store, String> {
+    use std::os::unix::fs::PermissionsExt;
     if db.contains(['?', '#', '%']) {
         return Err(format!("{db}: a database path can't contain ? # or %"));
     }
-    if let Some(dir) = std::path::Path::new(db).parent() {
+    let private = |path: &std::path::Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let path = std::path::Path::new(db);
+    // only a directory made here is locked down; an existing one (a home, /tmp) is left alone
+    if let Some(dir) = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty() && !d.exists())
+    {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        private(dir, 0o700)?;
     }
-    Store::open(&format!("sqlite://{db}?mode=rwc"))
+    let store = Store::open(&format!("sqlite://{db}?mode=rwc"))
         .await
-        .map_err(|e| format!("{db}: {e}"))
+        .map_err(|e| format!("{db}: {e}"))?;
+    private(path, 0o600)?;
+    Ok(store)
 }
 
 fn serve(args: &[String]) -> Result<(), String> {
@@ -91,7 +105,10 @@ fn key_file() -> Result<String, String> {
 
 /// The signer built by scripts/build-desk-sign.sh, next to this binary.
 fn desk_sign(args: &[&str], stdin: &str) -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // the real file, so a symlinked `desk` still finds its own desk-sign
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|e| e.to_string())?;
     let path = exe.with_file_name("desk-sign");
     let bin = path.display();
     let mut child = Command::new(&path)

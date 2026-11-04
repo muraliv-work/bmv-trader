@@ -5,6 +5,7 @@
 pub mod api;
 pub mod audit;
 pub mod lifecycle;
+pub mod mcp;
 pub mod owner;
 pub mod permissions;
 pub mod store;

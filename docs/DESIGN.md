@@ -307,6 +307,32 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - **Use `BEGIN IMMEDIATE`,** or one writer process, once more than one process opens the database.
   - **The spec's §11 items "halt cancels orders within 5 s" and "a Validator mismatch is an automatic FAIL"** arrive with steps 6 and 3.
 
+### Step 2 as built: owner approvals, Desk API, MCP tools, the desk user
+- **Owner approvals (`owner.rs`, `swift/desk-sign.swift`):**
+  - Each human-only action waits as a request, with a nonce and a 10-minute expiry. At most 5 can wait per agent.
+  - It runs only after the owner's Secure Enclave key signs that request's exact text, which needs Touch ID or the password.
+  - The desk keeps only the public key. Each approval is redeemed once, and a request reopens if its action fails.
+  - `desk sign` rebuilds the text from the action it shows before Touch ID.
+- **Desk API (`api.rs`):**
+  - axum on 127.0.0.1:8790 only, and Host must be loopback.
+  - One bearer token per agent, stored as SHA-256. Reissuing a token revokes the old one.
+  - The role comes from the store. Bodies are 64 KB at most, and unknown fields are refused.
+  - There's no HTTP way to become the owner: `desk init` registers in-process, as the database's user.
+  - A lifecycle step collects signatures for one version in one transaction. A signature from a role the step doesn't need is refused and never kept.
+- **MCP tools (`mcp.rs`, `desk-mcp`):**
+  - A stdio bridge that Paperclip starts per agent with that agent's `DESK_TOKEN`. Each tool is one API call.
+  - Owner-only routes (approve, audit) have no tool. A refusal returns to the agent as an `isError` result.
+- **The desk user (`scripts/desk-setup.sh`, run by the owner with sudo):**
+  - A hidden `bmvdesk` user, with no shell and no login.
+  - Root-owned binaries in `/usr/local/libexec/bmv-desk`.
+  - The database in `/usr/local/var/bmv-desk`: directory mode 700, file mode 600, and umask 077.
+  - The LaunchDaemon `com.bmv.desk`.
+- **Still open:**
+  - **The audit head isn't anchored outside the database.** Only `bmvdesk` and root can now write it, but either could rewrite the whole chain.
+  - **The server has no connection limit or slow-client timeout.** Due before agents connect in step 5.
+  - **`BEGIN IMMEDIATE`** is needed if a second long-lived writer appears. Today only `desk init` writes alongside the server, and only once.
+  - **Secure Enclave key rotation** isn't designed yet.
+
 ### Build order (the spec's §12; the owner's go-ahead after each step)
 1. The `store`, `audit`, `lifecycle` and `permissions` crates, with the spec's §11 tests.
 2. `desk_api` (axum) plus MCP tools.
