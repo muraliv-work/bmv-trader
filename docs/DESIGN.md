@@ -497,6 +497,7 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
   - the weighted mean R is above 0
 
   Logged once as trial 12, "ai-veto retro local".
+- **Sample frozen 2026-11-04, before any untouched-year analysis:** 261 signals, 2025-10-02 → 2026-10-15. `data/retro/sample.json` has SHA-256 `8baa638040052740a631ed8ca4147f57be6fc47a4210d9ca006c0e2bc0199454`. Speed check on 3 research-period signals with the 8B: 3 of 3 rated, 15–20 minutes each.
 - **Failures (added 2026-11-04 after the security review, before any trial 12 run):**
   - `retro-run` starts only if Ollama answers and has the model, and it stops after 3 failures in a row. That way an outage pauses the run instead of marking the sample as failed.
   - A failure that is recorded stays final (the first answer counts).
