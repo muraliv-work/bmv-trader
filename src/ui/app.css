@@ -175,7 +175,7 @@ body.stale main { opacity: 0.5; }
 .safety .pair { margin: 0; }
 .control p { margin: 0 0 12px; color: var(--muted); font-size: 14px; max-width: 34rem; }
 
-.actions { white-space: nowrap; }
+.actions, .services td.actions { white-space: nowrap; }
 .actions button + button { margin-left: 6px; }
 button.small { font-size: 13px; padding: 4px 12px; }
 button.quiet { color: var(--ink); background: var(--raised); border-color: var(--line); }
