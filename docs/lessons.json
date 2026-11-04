@@ -1,0 +1,12 @@
+[
+  {"trial": 1, "log_row": 1, "lesson": "Opening-range breakout on 10 liquid names loses after costs (-0.105R, PF 0.86).", "next": "Try a trend filter, then a marketable entry.", "acted_on_by": "2, 3"},
+  {"trial": 2, "log_row": 2, "lesson": "Trading only in a rising market didn't help (-0.120R); it beat random entries but not costs.", "next": "Test whether resting limits only filled failing breakouts.", "acted_on_by": "3"},
+  {"trial": 3, "log_row": 3, "lesson": "A marketable entry didn't fix it (-0.117R): ORB has no edge here after costs. Stop tuning ORB.", "next": "Move to a new family: gap days, which carry news.", "acted_on_by": "4"},
+  {"trial": 4, "log_row": 4, "lesson": "Gap-and-go on mega-caps was the best intraday result (-0.036R) but indistinguishable from zero, and starved of gap days (385 trades).", "next": "Scan the whole market for gappers to get more trades.", "acted_on_by": "6"},
+  {"trial": 5, "log_row": 5, "lesson": "VWAP pullback did no better than random entries (-0.219R): the signal adds nothing.", "next": "Leave short-term pullbacks.", "acted_on_by": "7"},
+  {"trial": 6, "log_row": 6, "lesson": "Scanned gappers were worse (-0.256R): more trades, but the edge didn't survive costs on small, volatile names.", "next": "Leave intraday rules: try the factor with the longest record, monthly momentum.", "acted_on_by": "7"},
+  {"trial": 7, "log_row": 7, "lesson": "Monthly 12-1 momentum was the first positive result (+1.5%/month), but CAGR 9.9% lost to SPY's 14.9% with a 55% drawdown.", "next": "Try a swing signal with defined risk (stops and targets).", "acted_on_by": "8"},
+  {"trial": 8, "log_row": 8, "lesson": "The swing signal lost badly (-0.517R): T-bill and bond ETFs with tiny stops dominated, so costs swamped the risk unit.", "next": "Same rules, stocks only, with a volatility floor.", "acted_on_by": "9"},
+  {"trial": 9, "log_row": 9, "lesson": "With stocks only and a volatility floor the swing signal came to break-even (0.000R, PF 1.00): fixed the hole, found no edge.", "next": "Ask whether an AI analyst can filter a break-even stream; search broader formulas.", "acted_on_by": "10, 11"},
+  {"trial": 11, "log_row": 10, "lesson": "815k searched formulas shrank from IC ~0.05 to 0.01-0.04 on validation; the surviving signal (near the 52-week high, low volatility) is real but too weak to beat costs.", "next": "Price and volume alone aren't enough: add a new kind of data (an LLM reading news and filings).", "acted_on_by": "12"}
+]

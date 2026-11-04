@@ -67,5 +67,10 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 - [ ] Speed check on 3 research-period signals (outcomes discarded); fix k if needed
 - [ ] `retro-run` over several days, then `retro-verdict` once
 
+## Lessons layer (DESIGN §13d, DECISION S27)
+- [x] Rules, plus curated lessons for trials 1–9 and 11 (`docs/lessons.json`)
+- [ ] `trial-autopsy`: reproduce each trial, break it down, write `data/lessons.jsonl`
+- [ ] Console Lessons card
+
 ## P5 — Live pilot
 - [ ] ⛔ Mac mini, phone approvals, live limits, 30 live days
