@@ -361,6 +361,9 @@ fn child_env(key: &str, workspace: Option<&str>, run: &Path) -> Vec<(&'static st
         ("TRADINGAGENTS_MEMORY_LOG_PATH", at("memory.md")),
         ("TRADINGAGENTS_CACHE_DIR", at("cache")),
         ("BMV_USAGE_FILE", at("usage.jsonl")),
+        ("TMPDIR", at("tmp")),
+        ("TMP", at("tmp")),
+        ("TEMP", at("tmp")),
     ];
     if let Some(w) = workspace {
         env.push(("BMV_ANTHROPIC_WORKSPACE_ID", w.to_string()));
@@ -368,9 +371,11 @@ fn child_env(key: &str, workspace: Option<&str>, run: &Path) -> Vec<(&'static st
     env
 }
 
-/// macOS sandbox for the sidecar: no reading the project (except the sidecar itself), the
-/// Keychain, or the `security` tool. Keeps broker keys out of reach of its ~85 dependencies.
-fn sandbox_profile(project: &Path, sidecar: &Path, user_home: &Path) -> String {
+/// macOS sandbox for the sidecar (DECISION S23): it reads nothing in the user's home except its
+/// run folder, the sidecar and uv's Python; never the project, the Keychain or `security`; and
+/// writes only to its run folder (its HOME and TMPDIR). The network stays open: the analyst needs
+/// Anthropic and its data, so what it can read is what it could leak.
+fn sandbox_profile(project: &Path, sidecar: &Path, user_home: &Path, run: &Path) -> String {
     let q = |p: &Path| {
         p.display()
             .to_string()
@@ -379,14 +384,27 @@ fn sandbox_profile(project: &Path, sidecar: &Path, user_home: &Path) -> String {
     };
     format!(
         "(version 1)\n(allow default)\n\
-         (deny file-read-data (subpath \"{}\"))\n\
-         (allow file-read-data (subpath \"{}\"))\n\
-         (deny file-read* (subpath \"{}\"))\n\
+         (deny file-read-data (subpath \"{home}\"))\n\
+         (deny file-read-data (subpath \"{project}\"))\n\
+         (allow file-read-data (subpath \"{sidecar}\"))\n\
+         (allow file-read-data (subpath \"{run}\"))\n\
+         (allow file-read-data (subpath \"{python}\"))\n\
+         (deny file-read* (subpath \"{keychains}\"))\n\
          (deny process-exec (literal \"/usr/bin/security\"))\n\
-         (deny mach-lookup (global-name \"com.apple.SecurityServer\") (global-name \"com.apple.securityd\"))\n",
-        q(project),
-        q(sidecar),
-        q(&user_home.join("Library").join("Keychains"))
+         (deny mach-lookup (global-name \"com.apple.SecurityServer\") (global-name \"com.apple.securityd\"))\n\
+         (deny file-write*)\n\
+         (allow file-write* (subpath \"{run}\") (subpath \"/dev\"))\n",
+        home = q(user_home),
+        project = q(project),
+        sidecar = q(sidecar),
+        run = q(run),
+        // uv keeps the interpreter the sidecar's venv points at here
+        python = q(&user_home
+            .join(".local")
+            .join("share")
+            .join("uv")
+            .join("python")),
+        keychains = q(&user_home.join("Library").join("Keychains")),
     )
 }
 
@@ -460,11 +478,15 @@ fn validate(out: &SidecarOut, ticker: &str, date: &str, calls: &[Call]) -> Resul
     Rating::parse(&out.rating).ok_or_else(|| format!("no usable rating: {:?}", trim(&out.rating)))
 }
 
-/// Usage the sidecar wrote call by call, so a crashed run can still be priced.
+/// Usage the sidecar wrote call by call, so a crashed run can still be priced. The sidecar
+/// controls this file: only a regular file is read, and only its first 1 MB.
 fn read_usage(path: &Path) -> Vec<Call> {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
+    let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
+    let mut text = String::new();
+    if let Some(f) = regular.then(|| std::fs::File::open(path).ok()).flatten() {
+        let _ = f.take(MAX_OUTPUT).read_to_string(&mut text);
+    }
+    text.lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect()
 }
@@ -546,6 +568,7 @@ fn spawn_and_wait(
     std::fs::create_dir_all(run).map_err(|e| format!("cannot create {}: {e}", run.display()))?;
     // outside the project and with no .env above it, so TradingAgents' load_dotenv() finds none
     let run = std::fs::canonicalize(run).map_err(|e| format!("run folder: {e}"))?;
+    std::fs::create_dir_all(run.join("tmp")).map_err(|e| format!("run tmp folder: {e}"))?;
     if run.starts_with(&project) {
         return Err("the analyst's folder is inside the project".into());
     }
@@ -557,7 +580,7 @@ fn spawn_and_wait(
         .append(true)
         .open(logs.join(format!("{date}-{ticker}.log")))
         .map_err(|e| format!("cannot open the analyst log: {e}"))?;
-    let profile = sandbox_profile(&project, &sidecar, user_home);
+    let profile = sandbox_profile(&project, &sidecar, user_home, &run);
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-p")
         .arg(profile)
@@ -973,7 +996,10 @@ mod tests {
                 "TRADINGAGENTS_RESULTS_DIR",
                 "TRADINGAGENTS_MEMORY_LOG_PATH",
                 "TRADINGAGENTS_CACHE_DIR",
-                "BMV_USAGE_FILE"
+                "BMV_USAGE_FILE",
+                "TMPDIR",
+                "TMP",
+                "TEMP"
             ]
         );
         assert!(env.iter().all(|(k, v)| !k.starts_with("ALPACA")
@@ -984,7 +1010,20 @@ mod tests {
             ws.last(),
             Some(&("BMV_ANTHROPIC_WORKSPACE_ID", "wrkspc_1".to_string()))
         );
-        let p = sandbox_profile(Path::new("/p"), Path::new("/p/s"), Path::new("/u"));
+        let p = sandbox_profile(
+            Path::new("/p"),
+            Path::new("/p/s"),
+            Path::new("/u"),
+            Path::new("/r"),
+        );
+        assert!(
+            p.contains("(deny file-write*)\n"),
+            "writes denied by default"
+        );
+        assert!(
+            p.contains("(allow file-write* (subpath \"/r\")"),
+            "only the run folder"
+        );
         assert!(p.contains("(deny file-read-data (subpath \"/p\"))"));
         assert!(p.contains("(allow file-read-data (subpath \"/p/s\"))"));
         assert!(p.contains("/u/Library/Keychains"));
@@ -1124,5 +1163,72 @@ mod tests {
             100,
             "after 6 months, everything from those months"
         );
+    }
+
+    /// Runs the real profile: the analyst can't read or write the project, only its run folder.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_sandbox_really_blocks_project_reads_and_writes() {
+        // outside the temp folders the profile allows, like the real project in ~/Documents
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let base = std::fs::canonicalize(&target)
+            .unwrap()
+            .join(format!("sbx-test-{}", std::process::id()));
+        // the real layout: project, sidecar and run folder all inside the user's home
+        let home = base.join("home");
+        let project = home.join("Documents/proj");
+        let sidecar = project.join("side");
+        let run = home.join("Library/Caches/run");
+        for d in [&sidecar, &run, &home.join(".ssh")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(project.join("secret.env"), "ALPACA=x").unwrap();
+        std::fs::write(home.join(".ssh/id"), "key").unwrap();
+        std::fs::write(sidecar.join("run.py"), "print()").unwrap();
+        let profile = sandbox_profile(&project, &sidecar, &home, &run);
+        let sh = |cmd: String| {
+            Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "/bin/sh", "-c", &cmd])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let d = |p: &Path| p.display().to_string();
+        assert!(
+            sh(format!("echo ok > {}/out && cat {}/out", d(&run), d(&run))),
+            "run folder usable"
+        );
+        assert!(
+            sh(format!("cat {}/run.py", d(&sidecar))),
+            "sidecar readable"
+        );
+        assert!(
+            !sh(format!("echo x > {}/evil", d(&project))),
+            "project write blocked"
+        );
+        assert!(
+            !sh(format!("echo x > {}/evil", d(&sidecar))),
+            "sidecar write blocked"
+        );
+        assert!(
+            !sh(format!("cat {}/secret.env", d(&project))),
+            "project read blocked"
+        );
+        assert!(
+            !sh(format!("cat {}/.ssh/id", d(&home))),
+            "the rest of home unreadable"
+        );
+        assert!(
+            !sh(format!(
+                "echo x > /private/tmp/bmv-sbx-{}",
+                std::process::id()
+            )),
+            "shared /tmp not writable"
+        );
+        assert!(!project.join("evil").exists());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
