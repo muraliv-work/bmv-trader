@@ -73,7 +73,7 @@ pub fn detectable(se: f64, trials: usize, power: f64) -> f64 {
 }
 
 /// Average ranks (ties share their mean rank), 1-based.
-fn ranks(x: &[f64]) -> Vec<f64> {
+pub fn ranks(x: &[f64]) -> Vec<f64> {
     let mut idx: Vec<usize> = (0..x.len()).collect();
     idx.sort_by(|&a, &b| x[a].total_cmp(&x[b]));
     let mut out = vec![0.0; x.len()];

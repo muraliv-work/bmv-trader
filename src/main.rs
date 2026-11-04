@@ -20,6 +20,7 @@ const USAGE: &str = "usage:
                       (raw IEX for the scan; --adjusted: split- and dividend-adjusted SIP, for momentum)
   bmv-trader momentum                     trial 7: 12-1 month momentum on the adjusted daily bars (DESIGN §13c)
   bmv-trader power                        the smallest effect trials 11 and 12 could detect (spreads from trial 7)
+  bmv-trader lab-search [--minutes 5] [--seed 1]  evolve ranking formulas on the search months only (DESIGN §7h)
   bmv-trader desk-run                     trial 10 nightly (20 min after the close): live bars, signals, analyst ratings, scores
   bmv-trader desk-report                  trial 10 so far: signals, ratings, spend, outcomes
   bmv-trader desk-analyse --symbols X --date YYYY-MM-DD  one analyst run outside the trial (measures cost)
@@ -175,6 +176,10 @@ fn main() {
             }
             Some("momentum") => momentum(),
             Some("power") => power(),
+            Some("lab-search") => lab_search(
+                args.num("--minutes", 5, 1..=600)?,
+                args.num("--seed", 1, 1..=1_000_000)? as u64,
+            ),
             Some("desk-run") => desk_run(),
             Some("desk-report") => {
                 let (home, dir) = (config::home()?, data_dir()?);
@@ -436,6 +441,168 @@ fn fetch_daily(from: &str, to: &str, adjusted: bool) -> Result<(), String> {
 }
 
 /// Trial 7 (DESIGN §13c): research months only; logs the trial, then prints the gate.
+/// The lab's panel (DESIGN §7h): trial 7's bars and calendar, stocks only, labels before `until`.
+fn lab_panel(
+    dir: &Path,
+    until: &str,
+) -> Result<(bmv_trader::momentum::Calendar, bmv_trader::lab::Panel), String> {
+    use bmv_trader::momentum::{self as mo, Calendar};
+    use bmv_trader::scan::ADJUSTED_SIP;
+    let (from, to) = bmv_trader::scan::daily_range(dir, ADJUSTED_SIP)?;
+    if (from.as_str(), to.as_str()) != (mo::DATA_FROM, mo::DATA_TO) {
+        return Err(format!(
+            "adjusted bars cover {from}..{to}, but the lab is pre-registered on {}..{}",
+            mo::DATA_FROM,
+            mo::DATA_TO
+        ));
+    }
+    let spy = bmv_trader::scan::read_daily(dir, ADJUSTED_SIP, mo::BENCHMARK)?;
+    let cal = Calendar::new(&spy)?;
+    let names = bmv_trader::scan::read_asset_names(dir)?;
+    let mut panel = bmv_trader::lab::Panel::new(&cal, until);
+    let mut seen = 0;
+    bmv_trader::scan::for_each_daily(dir, ADJUSTED_SIP, &mut |s, bars| {
+        seen += 1;
+        if seen % 2000 == 0 {
+            eprintln!("  {seen} symbols");
+        }
+        if s == mo::BENCHMARK || names.get(s).is_some_and(|n| bmv_trader::swing::is_fund(n)) {
+            return Ok(());
+        }
+        panel.add(s, &bars, &cal);
+        Ok(())
+    })?;
+    Ok((cal, panel))
+}
+
+fn append_jsonl<T: serde::Serialize>(path: &Path, rows: &[T]) -> Result<(), String> {
+    use std::io::Write;
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut text = String::new();
+    for r in rows {
+        text.push_str(&serde_json::to_string(r).map_err(|e| e.to_string())?);
+        text.push('\n');
+    }
+    f.write_all(text.as_bytes())
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Trial 11's search stage (DESIGN §7h): only months whose labels end before 2023 are loaded.
+fn lab_search(minutes: usize, seed: u64) -> Result<(), String> {
+    use bmv_trader::lab::{self, Candidate, Expr};
+    let dir = data_dir()?;
+    let lab_dir = dir.join("lab");
+    if lab_dir.join("validated").exists() {
+        return Err("the lab has been validated: the search is closed (DESIGN §7h)".into());
+    }
+    let t0 = std::time::Instant::now();
+    let (cal, panel) = lab_panel(&dir, lab::SEARCH_END)?;
+    let months = panel.range(&cal, lab::SEARCH_START, lab::SEARCH_END);
+    let rows: usize = months.iter().map(|&k| panel.months[k].len()).sum();
+    eprintln!(
+        "panel: {} symbols, {} search months ({}..{}), {rows} rows, built in {:.0} s",
+        panel.symbols.len(),
+        months.len(),
+        months.first().map_or("", |&k| panel.dates[k].as_str()),
+        months.last().map_or("", |&k| panel.dates[k].as_str()),
+        t0.elapsed().as_secs_f64()
+    );
+    // earlier bests and parsed local-model ideas start the population
+    let mut seeds: Vec<(Expr, String)> = Vec::new();
+    let read = |name: &str| std::fs::read_to_string(lab_dir.join(name)).unwrap_or_default();
+    let mut old: Vec<Candidate> = read("candidates.jsonl")
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    old.sort_by(|a, b| b.stats.fitness.total_cmp(&a.stats.fitness));
+    seeds.extend(
+        old.into_iter()
+            .take(50)
+            .map(|c| (c.expr, "earlier".to_string())),
+    );
+    for l in read("ideas.jsonl").lines() {
+        if let Ok(e) = Expr::parse(l) {
+            seeds.push((e, "llm".into()));
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(minutes as u64 * 60);
+    let mut batch: Vec<Candidate> = Vec::new();
+    let path = lab_dir.join("candidates.jsonl");
+    let mut write_err = None;
+    let started = std::time::Instant::now();
+    let (pop, tries) = lab::search(
+        &panel,
+        &months,
+        seeds,
+        seed,
+        &mut |_| std::time::Instant::now() < deadline,
+        &mut |c| {
+            batch.push(c.clone());
+            if batch.len() >= 500 {
+                if let Err(e) = append_jsonl(&path, &batch) {
+                    write_err = Some(e);
+                }
+                batch.clear();
+            }
+        },
+    );
+    append_jsonl(&path, &batch)?;
+    if let Some(e) = write_err {
+        return Err(e);
+    }
+    let secs = started.elapsed().as_secs_f64();
+    append_jsonl(
+        &lab_dir.join("runs.jsonl"),
+        &[serde_json::json!({
+            "when": chrono::Utc::now().to_rfc3339(),
+            "seed": seed,
+            "minutes": minutes,
+            "tries": tries,
+        })],
+    )?;
+    let all_tries: usize = read("runs.jsonl")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["tries"].as_u64())
+        .sum::<u64>() as usize;
+    let sd = bmv_trader::momentum::mean(
+        &pop.iter()
+            .take(20)
+            .map(|c| c.stats.ic_sd)
+            .collect::<Vec<_>>(),
+    );
+    println!(
+        "{tries} tries in {secs:.0} s ({:.0}/s); {all_tries} tries across all runs",
+        tries as f64 / secs.max(0.001)
+    );
+    println!(
+        "luck line: the best search IC expected by chance from {all_tries} tries is about {:.3}",
+        lab::luck_line(sd, months.len(), all_tries)
+    );
+    println!(
+        "{:>8} {:>8} {:>10} {:>9}  formula",
+        "IC", "fitness", "excess/mo", "turnover"
+    );
+    for c in pop.iter().take(5) {
+        println!(
+            "{:>8.3} {:>8.3} {:>9.2}% {:>8.0}%  {}",
+            c.stats.ic_mean,
+            c.stats.fitness,
+            c.stats.excess_mean * 100.0,
+            c.stats.turnover * 100.0,
+            c.key
+        );
+    }
+    Ok(())
+}
+
 /// Trial 7's calendar and every symbol's monthly score and return, from the pre-registered bars.
 fn trial7_months(
     dir: &Path,

@@ -152,7 +152,7 @@ pub(crate) fn liquid(on: &[Option<&DailyBar>], s: usize) -> bool {
 
 /// Bought at the open of session `entry`, sold at the open of `exit`; if it has no bar there
 /// (delisted), sold at its last close before.
-fn held_return(on: &[Option<&DailyBar>], entry: usize, exit: usize) -> Option<f64> {
+pub(crate) fn held_return(on: &[Option<&DailyBar>], entry: usize, exit: usize) -> Option<f64> {
     let buy = on[entry]?.open;
     let sell = match on[exit] {
         Some(b) => b.open,

@@ -6,6 +6,7 @@ pub mod config;
 pub mod desk;
 pub mod engine;
 pub mod history;
+pub mod lab;
 pub mod live;
 pub mod llm;
 pub mod market_data;
