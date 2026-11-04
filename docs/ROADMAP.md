@@ -72,5 +72,16 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 - [x] `trial-autopsy`: all 10 finished trials reproduce exactly; breakdowns in `data/lessons.jsonl`
 - [x] Console Lessons card
 
+## Quant Desk (DESIGN §4c, DECISION R12, S29–S34)
+- [x] Design and decisions
+- [ ] Step 1: `store`, `audit`, `lifecycle`, `permissions` crates with the spec's §11 tests
+- [ ] Step 2: `desk_api` (axum) plus MCP tools
+- [ ] Step 3: backtest and stress harness, deflated Sharpe; the Validator reproduces all 11 trials (R12 part A). ⛔ Owner picks the Validator's model family
+- [ ] Step 4: risk and execution, paper only, wrapping `risk::gate` and the engine
+- [ ] Step 5: Paperclip company config, wave 1. ⛔ Owner creates the desk's Anthropic workspace key
+- [ ] Step 6: Ops: reconciliation, a 5-second halt, the daily report
+- [ ] Step 7: dashboard: pipeline, approval pack, halts, budgets, audit
+- [ ] Feedback report by 2026-11-30
+
 ## P5 — Live pilot
 - [ ] ⛔ Mac mini, phone approvals, live limits, 30 live days

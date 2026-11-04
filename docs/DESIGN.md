@@ -216,6 +216,91 @@ Three local services sit **above** the Rust engine. They can only propose; the e
 - **Desk Rules for agents** are a read-only file, `data/desk_rules.md`, generated from the Rust `Limits`. Prompts can't drift from the code.
 - **Sidecars install from pinned public releases** (PyPI, npm or a git commit), never from `REFERENCE-REPOS/`, which is reading material only and may be deleted.
 
+## 4c. Quant Desk: Paperclip agents in segregated roles (owner's spec, decided 2026-11-04)
+
+The owner's "Autonomous Quant Trading Desk" spec is the target. Agents do knowledge work; deterministic Rust does every number and every order. **The Rust Desk API is the only authority** (S30). Paperclip schedules agents (org chart, tickets, heartbeats, budgets), but it can't open a gate. Built in the spec's order (§12 of the spec), stopping after each step for the owner. The existing engine, risk gate and order path are kept and wrapped, not rewritten.
+
+### Roles
+
+| Agent | Line | Model (S31, S32) | Desk API tools (everything else refused) | Never |
+|---|---|---|---|---|
+| Head of Desk | Orchestration | local, Claude for the daily summary | tickets, status, reports | sign, approve, change limits |
+| Quant Researcher | Front office | OmniRoute research route (free or local) | read market data (research period only), create Hypothesis, run exploratory stats | write code, official backtests, sign, see the account |
+| Quant Strategist | Front office | free or local for drafts, Claude for the final consistency pass | create and edit StrategySpec in DRAFT, request research | implement, run official backtests, change criteria after the first backtest |
+| Quant Developer | Front office | Claude Code (coder) | submit StrategyVersion (code in `strategies/`), dev backtests in-sample | touch `execution/`, `risk/`, `validation/` or `stress/`; read held-out data; mark own work validated |
+| Trading Platform Engineer | Technology | Claude Code (coder) | submit changes to `execution/` and data plumbing | strategy logic, limits, approvals |
+| Independent Model Validator | Second line, reports to the Board | **a non-Anthropic family**, chosen before step 3 (S31) | read artifacts (spec, code, results), run the official backtest, read held-out data, file ValidationReport | edit code or specs, see authors' conversations |
+| Stress Testing Lead | Second line | Claude, direct | run the stress battery, read held-out data, file StressReport | modify strategy or limits |
+| Market & Trading Risk Manager | Second line | local for routine checks, Claude for incidents | propose limits, tighten limits, halt | loosen any limit, approve own proposal, place orders |
+| Compliance Officer | Second line | Claude, direct | file ComplianceReview, block, halt | approve live alone |
+| Trading Ops / SRE | Operations | local for routine checks, Claude for write-ups | read positions and orders (read-only), reconcile, halt, cancel, restart services | resume after a risk halt, change strategy or limits |
+| Strategy Product Owner | Assistant to the Board | Claude, direct | file StrategyReview, trigger re-validation, halt on decay thresholds | approve changes to a live strategy |
+| **Board (the owner, human)** | — | — | sign LIVE_APPROVED, raise or loosen a limit, resume after a risk halt, change the org | — |
+
+### Rules enforced in code
+- **Identity:** each agent has its own Desk API token, mapped to one role. Every endpoint checks, in order: permission, state legality, maker-checker (approver role ≠ author role and approver agent ≠ author agent), budget, and only then writes an audit row.
+- **Free or local models may author, never sign** (A5 kept). Every signer uses a pinned strong model, called directly with the model name checked in every reply (A4 kept for the second line). The research routes go through OmniRoute.
+- **The human signature:**
+  - LIVE_APPROVED, loosening or raising a limit, and resuming after a risk halt need a Keychain item that asks for **Touch ID or the owner's password**. No agent can satisfy that prompt.
+  - Agents have no shell: only Desk API tools over MCP. The exception is the coding agents below.
+- **Coding agents (Developer, Platform Engineer):**
+  - Each works in its own git worktree, under a macOS sandbox with no Keychain, no held-out data, and no broker keys.
+  - A scope check rejects any change outside the role's folders.
+  - **A merge needs the scope check, then a Validator PASS, then the owner's approval** (S29).
+- **Held-out data (S33):**
+  - The untouched year is spent by trial 12.
+  - New strategies get a **screen** on 2023–2025, kept from front-office agents. The screen can only reject.
+  - The **verdict** is on data that arrives after the spec freeze (forward or paper, 3–6 months).
+  - The Desk API serves held-out rows only to the Validator and Stress Lead.
+- **Variants:** every variant counts toward its hypothesis's significance bar. The Validator applies the deflated Sharpe ratio, and FAILs a strategy that passes only because many variants were tried.
+- **Rerun (R12):**
+  - **First,** the Validator reproduces all 11 logged trials exactly, as the desk's acceptance test.
+  - **Then** agents may propose new variants on 2016–2025. Each is pre-registered and counted as a new trial, and none can pass on old data alone: the forward verdict decides.
+- **No agent can reach Alpaca** (S20). Orders come only from the Rust engine, through the risk gate, for a strategy in a LIVE state.
+
+### Lifecycle (who signs each step)
+IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criteria and held-out period locked) → IMPLEMENTED (Strategist reviews the Developer's code against the spec) → VALIDATED (Validator) → STRESS_TESTED (Stress Lead) → LIMITS_SET (Risk proposes, **Board** approves) → COMPLIANCE_CLEARED (Compliance) → PAPER_TRADING (automatic; at least 20 trading days **and** 30 trades) → PAPER_REVIEWED (Product Owner and Risk; paper results within tolerance of the backtest) → LIVE_APPROVED (**Board**, Touch ID, with the approval pack) → LIVE (25% of limits for 10 days) → LIVE_FULL_SIZE (**Board**).
+- Anyone can move anything to HALTED.
+- Leaving HALTED after a risk or compliance halt is **Board** only.
+- RETIRED is **Board** only.
+- A FAIL returns the strategy to SPEC or IMPLEMENTED, and the version increments.
+- A material change creates a new StrategyVersion, which restarts at IMPLEMENTED.
+
+### Data (SQLite through sqlx, schema ready for Postgres)
+- **Tables:**
+  - agents, roles, permissions, raci
+  - strategies, strategy_versions (content hash), hypotheses, specs, artifacts
+  - backtest_runs (hashes of inputs and results), validation_reports, stress_reports
+  - risk_limits (versioned, with approver), compliance_reviews, approvals, state_transitions
+  - tickets, incidents, halts, budgets, llm_calls
+  - orders, fills, positions, reconciliations
+  - audit_log
+- **audit_log** is append-only. Each row stores the SHA-256 of the previous one, a daily job verifies the chain, and no role can update or delete rows.
+- **The existing JSONL files** (journal, trials, lessons) are imported into the database, and stay readable.
+
+### Paperclip containment (S34)
+- **Version:** an exact version, never `@latest`, with a monthly check for security updates.
+- **Network:** its own folder; dashboard and API on 127.0.0.1 only.
+- **Telemetry:** off. Traces are never shared, and its network connections are checked on first run.
+- **Keys:** a **separate Anthropic key and workspace with a hard monthly limit**, set in Anthropic's console and kept apart from trial 10's key. The owner creates it; it lives in the Keychain.
+- **Budget:** **$100 a month in total** across all paid models. Risk and Ops do routine checks on the local model. The second line gets budget priority: research pauses first.
+- **Rollout in waves:**
+  - **Wave 1:** Head of Desk, Researcher, Validator, Stress Lead.
+  - **Wave 2:** Strategist, Developer, once a hypothesis passes the screen.
+  - **Wave 3:** Risk, Compliance, Ops, Product Owner, Platform Engineer, once a strategy heads to paper.
+- **Compliance:** supports margin under $25k (the PDT limit of 3 day trades in 5 days), margin of $25k or more, and cash accounts (settled cash only). It tracks wash sales. The owner picks the account before any live approval.
+
+### Build order (the spec's §12; the owner's go-ahead after each step)
+1. The `store`, `audit`, `lifecycle` and `permissions` crates, with the spec's §11 tests.
+2. `desk_api` (axum) plus MCP tools.
+3. Backtest and stress harness: deterministic run hashes, Monte Carlo, cost shocks, parameter sensitivity, regime split, deflated Sharpe. The Validator reproduces all 11 trials.
+4. Risk and execution, paper only: wrap `risk::gate` and the engine; add a drawdown auto-halt and a ticker allow-list.
+5. Paperclip company config, wave 1.
+6. Ops: reconciliation every 15 minutes, a halt that cancels orders within 5 s (tested with a mock broker), and the daily report.
+7. Dashboard: the pipeline board, the approval pack with its dissent section, halts, budgets, and audit verification.
+
+The 30 November feedback report draws on whatever exists by then: trial 12, the stress battery, deflated Sharpe, the cost check.
+
 ## 5. Components → files
 
 | Module | Responsibility |
