@@ -32,6 +32,8 @@ const SUMMARY_CHARS: usize = 2000;
 const MAX_OUTPUT: u64 = 1 << 20;
 /// The sidecar marks its answer line with this, so stray library output can't be mistaken for it.
 const RESULT_PREFIX: &str = "BMV_RESULT ";
+/// The sidecar's exit code when Anthropic refused the request before any call was billed.
+const REJECTED_EXIT: i32 = 4;
 
 /// TradingAgents' five-tier rating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,9 +351,9 @@ fn no_dotenv_above(dir: &Path) -> Result<(), String> {
 
 /// The environment the sidecar gets, nothing else from ours. `run` is a fresh folder per run: its
 /// HOME, memory log and cache, so no run can read what an earlier one learned.
-fn child_env(key: &str, run: &Path) -> Vec<(&'static str, String)> {
+fn child_env(key: &str, workspace: Option<&str>, run: &Path) -> Vec<(&'static str, String)> {
     let at = |p: &str| run.join(p).display().to_string();
-    vec![
+    let mut env = vec![
         ("ANTHROPIC_API_KEY", key.to_string()),
         ("HOME", run.display().to_string()),
         ("PATH", "/usr/bin:/bin".to_string()),
@@ -359,7 +361,11 @@ fn child_env(key: &str, run: &Path) -> Vec<(&'static str, String)> {
         ("TRADINGAGENTS_MEMORY_LOG_PATH", at("memory.md")),
         ("TRADINGAGENTS_CACHE_DIR", at("cache")),
         ("BMV_USAGE_FILE", at("usage.jsonl")),
-    ]
+    ];
+    if let Some(w) = workspace {
+        env.push(("BMV_ANTHROPIC_WORKSPACE_ID", w.to_string()));
+    }
+    env
 }
 
 /// macOS sandbox for the sidecar: no reading the project (except the sidecar itself), the
@@ -385,7 +391,7 @@ fn sandbox_profile(project: &Path, sidecar: &Path, user_home: &Path) -> String {
 }
 
 /// The sidecar's verdict on `ticker` at `date`, or why there isn't one, with what it cost.
-pub fn analyse(home: &Path, key: &str, ticker: &str, date: &str) -> (Status, Vec<Call>) {
+pub fn analyse(home: &Path, key: &Credentials, ticker: &str, date: &str) -> (Status, Vec<Call>) {
     let (result, calls) = run_sidecar(home, key, ticker, date);
     let reported: f64 = calls.iter().map(call_cost).sum();
     match result {
@@ -410,8 +416,16 @@ pub fn analyse(home: &Path, key: &str, ticker: &str, date: &str) -> (Status, Vec
             };
             (status, calls)
         }
+        // refused before any billed call: nothing spent
+        Err(Failure::Rejected(reason)) if reported == 0.0 => (
+            Status::Failed {
+                reason,
+                cost_usd: 0.0,
+            },
+            calls,
+        ),
         // a crashed run is charged what it reported, or a full day's budget if it reported nothing
-        Err(reason) => (
+        Err(Failure::Rejected(reason) | Failure::Other(reason)) => (
             Status::Failed {
                 reason,
                 cost_usd: if reported > 0.0 {
@@ -459,17 +473,43 @@ fn read_usage(path: &Path) -> Vec<Call> {
 fn kill_group(child: &mut std::process::Child) {
     let _ = Command::new("/bin/kill")
         .args(["-KILL", &format!("-{}", child.id())])
+        .stderr(Stdio::null())
         .status();
     let _ = child.kill();
     let _ = child.wait();
 }
 
+/// Why the sidecar gave no answer.
+enum Failure {
+    /// Anthropic refused the request (bad key, missing workspace) before any billed call.
+    Rejected(String),
+    Other(String),
+}
+
+impl From<String> for Failure {
+    fn from(s: String) -> Self {
+        Failure::Other(s)
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(s: &str) -> Self {
+        Failure::Other(s.to_string())
+    }
+}
+
+/// The Anthropic key, and the workspace ID a key not scoped to a workspace needs.
+pub struct Credentials {
+    pub key: String,
+    pub workspace: Option<String>,
+}
+
 fn run_sidecar(
     home: &Path,
-    key: &str,
+    key: &Credentials,
     ticker: &str,
     date: &str,
-) -> (Result<SidecarOut, String>, Vec<Call>) {
+) -> (Result<SidecarOut, Failure>, Vec<Call>) {
     let user_home = match std::env::var("HOME") {
         Ok(h) => PathBuf::from(h),
         Err(_) => return (Err("HOME is not set".into()), Vec::new()),
@@ -489,17 +529,17 @@ fn run_sidecar(
 
 fn spawn_and_wait(
     home: &Path,
-    key: &str,
+    key: &Credentials,
     ticker: &str,
     date: &str,
     user_home: &Path,
     run: &Path,
-) -> Result<SidecarOut, String> {
+) -> Result<SidecarOut, Failure> {
     use std::os::unix::process::CommandExt;
     if !crate::history::valid_symbol(ticker) {
-        return Err(format!("invalid ticker {:?}", trim(ticker)));
+        return Err(format!("invalid ticker {:?}", trim(ticker)).into());
     }
-    crate::history::canonical_date(date)?;
+    crate::history::canonical_date(date).map_err(Failure::Other)?;
     let project = std::fs::canonicalize(home).map_err(|e| format!("project path: {e}"))?;
     let sidecar = project.join("sidecars").join("tradingagents");
     let python = sidecar.join(".venv").join("bin").join("python");
@@ -528,7 +568,7 @@ fn spawn_and_wait(
         .arg(date)
         .current_dir(&run)
         .env_clear()
-        .envs(child_env(key, &run))
+        .envs(child_env(&key.key, key.workspace.as_deref(), &run))
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -552,34 +592,46 @@ fn spawn_and_wait(
             Ok(None) => std::thread::sleep(Duration::from_millis(500)),
             Err(e) => {
                 kill_group(&mut child);
-                return Err(format!("waiting for the analyst: {e}"));
+                return Err(format!("waiting for the analyst: {e}").into());
             }
         }
     };
     // a helper still holding stdout open would block the reader: end the group first
     let _ = Command::new("/bin/kill")
         .args(["-KILL", &format!("-{}", child.id())])
+        .stderr(Stdio::null())
         .status();
     let text = reader
         .join()
         .map_err(|_| "analyst output reader panicked".to_string())?
         .map_err(|e| format!("cannot read the analyst output: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "analyst exited with {status} (see data/desk/ta-logs)"
+    if status.code() == Some(REJECTED_EXIT) {
+        return Err(Failure::Rejected(
+            "Anthropic refused the request: check the key and workspace (see data/desk/ta-logs)"
+                .into(),
         ));
+    }
+    if !status.success() {
+        return Err(format!("analyst exited with {status} (see data/desk/ta-logs)").into());
     }
     let line = text
         .lines()
         .rev()
         .find_map(|l| l.strip_prefix(RESULT_PREFIX))
         .ok_or("analyst gave no answer line")?;
-    serde_json::from_str(line).map_err(|e| format!("analyst output: {e}"))
+    serde_json::from_str(line).map_err(|e| format!("analyst output: {e}").into())
 }
 
-/// The Anthropic key, from the Keychain only (service `bmv-trader`, account `ANTHROPIC_API_KEY`).
-pub fn anthropic_key() -> Result<Option<String>, String> {
-    crate::config::keychain("ANTHROPIC_API_KEY")
+/// The Anthropic key, from the Keychain only (service `bmv-trader`, account `ANTHROPIC_API_KEY`),
+/// with the optional `ANTHROPIC_WORKSPACE_ID` beside it.
+pub fn anthropic_key() -> Result<Option<Credentials>, String> {
+    let Some(key) = crate::config::keychain("ANTHROPIC_API_KEY")? else {
+        return Ok(None);
+    };
+    Ok(Some(Credentials {
+        key,
+        workspace: crate::config::keychain("ANTHROPIC_WORKSPACE_ID")?,
+    }))
 }
 
 /// The session's signals from the live bars, best volume ratio first, then symbol. SPY is only the
@@ -910,7 +962,7 @@ mod tests {
 
     #[test]
     fn child_env_holds_only_what_it_needs() {
-        let env = child_env("k", Path::new("/tmp/run"));
+        let env = child_env("k", None, Path::new("/tmp/run"));
         let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             names,
@@ -927,6 +979,11 @@ mod tests {
         assert!(env.iter().all(|(k, v)| !k.starts_with("ALPACA")
             && *k != "ANTHROPIC_BASE_URL"
             && (*k == "ANTHROPIC_API_KEY" || *k == "PATH" || v.starts_with("/tmp/run"))));
+        let ws = child_env("k", Some("wrkspc_1"), Path::new("/tmp/run"));
+        assert_eq!(
+            ws.last(),
+            Some(&("BMV_ANTHROPIC_WORKSPACE_ID", "wrkspc_1".to_string()))
+        );
         let p = sandbox_profile(Path::new("/p"), Path::new("/p/s"), Path::new("/u"));
         assert!(p.contains("(deny file-read-data (subpath \"/p\"))"));
         assert!(p.contains("(allow file-read-data (subpath \"/p/s\"))"));

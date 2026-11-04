@@ -56,6 +56,8 @@ Before installing:
 ```sh
 # the analyst's only key; it is passed to the sidecar and nothing else is
 security add-generic-password -s bmv-trader -a ANTHROPIC_API_KEY -w
+# only if Anthropic says the key "is not scoped to a workspace": the workspace ID (wrkspc_...)
+security add-generic-password -s bmv-trader -a ANTHROPIC_WORKSPACE_ID -w
 # one manual run first, to measure what an analysis costs (counts toward the budget)
 mkdir -p data/desk
 target/release/bmv-trader desk-analyse --symbols AAPL --date 2026-11-03

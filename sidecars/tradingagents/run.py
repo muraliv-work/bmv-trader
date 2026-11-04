@@ -14,6 +14,8 @@ QUICK_MODEL = "claude-haiku-5-5"
 DEEP_MODEL = "claude-sonnet-5-5"
 SUMMARY_CHARS = 2000
 RESULT_PREFIX = "BMV_RESULT "
+# exit code for "Anthropic refused the request before any call was billed" (bad key, workspace)
+REJECTED = 4
 FORBIDDEN = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "ANTHROPIC_AUTH_TOKEN")
 # the only TradingAgents settings bmv-trader passes; any other could redirect or change the run
 ALLOWED_TA = ("TRADINGAGENTS_RESULTS_DIR", "TRADINGAGENTS_MEMORY_LOG_PATH", "TRADINGAGENTS_CACHE_DIR")
@@ -30,6 +32,13 @@ def check_env(when):
         sys.exit(3)
 
 
+def chain(e):
+    """The exception and everything it was raised from."""
+    while e is not None:
+        yield e
+        e = e.__cause__ or e.__context__
+
+
 def main():
     if len(sys.argv) != 3:
         sys.stderr.write("usage: run.py TICKER YYYY-MM-DD\n")
@@ -41,7 +50,21 @@ def main():
             sys.stderr.write(f"refusing to run: {k} is not set\n")
             sys.exit(3)
     usage_file = os.environ["BMV_USAGE_FILE"]
+    workspace = os.environ.get("BMV_ANTHROPIC_WORKSPACE_ID", "")
     out, sys.stdout = sys.stdout, sys.stderr
+
+    import anthropic
+
+    if workspace:
+        # keys not scoped to a workspace need this header on every request
+        for cls in (anthropic.Anthropic, anthropic.AsyncAnthropic):
+            def with_workspace(init):
+                def wrapped(self, *args, default_headers=None, **kwargs):
+                    headers = dict(default_headers or {})
+                    headers["anthropic-workspace-id"] = workspace
+                    init(self, *args, default_headers=headers, **kwargs)
+                return wrapped
+            cls.__init__ = with_workspace(cls.__init__)
 
     # importing tradingagents runs load_dotenv() from the working directory
     import tradingagents
@@ -97,7 +120,16 @@ def main():
         config=config,
         callbacks=[usage],
     )
-    state, rating = graph.propagate(ticker, date)
+    try:
+        state, rating = graph.propagate(ticker, date)
+    except Exception as e:
+        status = next(
+            (x.status_code for x in chain(e) if isinstance(x, anthropic.APIStatusError)), None
+        )
+        if not usage.calls and status in (400, 401, 403):
+            sys.stderr.write(f"rejected by Anthropic (HTTP {status}) before any billed call\n")
+            raise SystemExit(REJECTED) from e
+        raise
     summary = str(state.get("final_trade_decision") or "")[:SUMMARY_CHARS]
     out.write(RESULT_PREFIX + json.dumps({
         "ticker": ticker,
