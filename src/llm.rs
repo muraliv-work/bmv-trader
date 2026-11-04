@@ -83,6 +83,8 @@ pub struct Note(pub String);
 struct ChatRequest<'a> {
     model: &'a str,
     max_tokens: u32,
+    /// Qwen3 on this Ollama ignores `/no_think`; only this turns its hidden reasoning off.
+    reasoning_effort: &'a str,
     messages: Vec<Message<'a>>,
 }
 
@@ -217,7 +219,13 @@ fn configured_url() -> Result<String, String> {
 fn complete_with(base: &str, key: &str, task: Tier2Task, facts: &str) -> Result<Note, String> {
     let body = ChatRequest {
         model: TIER2_MODEL,
-        max_tokens: MAX_TOKENS,
+        // five one-line formulas need far less than a note
+        max_tokens: if task == Tier2Task::LabIdea {
+            600
+        } else {
+            MAX_TOKENS
+        },
+        reasoning_effort: "none",
         messages: vec![
             Message {
                 role: "system",
