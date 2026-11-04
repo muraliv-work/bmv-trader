@@ -35,22 +35,23 @@
   </section>
 
   <section class="card" aria-labelledby="h-services">
-    <h2 id="h-services">Every moving part</h2>
-    <p class="note">Each fix is a command to run in Terminal from the project folder
-      (<code>cd ~/Documents/projects/bmv/bmv-trader</code>). Checked at most every 30 seconds.</p>
-    <div class="scroll"><table><thead><tr><th>Status</th><th>Part</th><th>Detail</th><th>Fix</th></tr></thead>
+    <div class="card-head">
+      <h2 id="h-services">Every moving part</h2>
+      <p class="note">Each fix is a command to run in Terminal from the project folder
+        (<code>cd ~/Documents/projects/bmv/bmv-trader</code>). Checked at most every 30 seconds.
+        Buttons start or restart a part; none of them can place an order, and the trading engine stays terminal-only.</p>
+    </div>
+    <div class="scroll"><table><thead><tr><th>Status</th><th>Part</th><th>Detail</th><th>Fix</th><th class="n">Actions</th></tr></thead>
     <tbody id="components"></tbody></table></div>
-  </section>
 
-  <section class="card" aria-labelledby="h-run">
-    <h2 id="h-run">Run a job now</h2>
-    <p class="note">For a night the Mac was shut down. After sleep, launchd runs a missed job by itself on wake.
-      A job that is already running is left alone. None of these places an order. Desk calls Claude
-      (about $0.10–0.80 a night, within its budget) and does nothing before 20 minutes after the close.</p>
-    <form id="run" class="run">
-      <label>Job <select name="job"><option value="">Choose</option></select></label>
-      <label>Type RUN to confirm <input name="confirm" autocomplete="off" spellcheck="false"></label>
-      <button type="submit" disabled>Run now</button>
+    <form id="run" class="confirm" hidden>
+      <h3 id="confirm-title"></h3>
+      <p id="confirm-warning" class="note"></p>
+      <div class="confirm-row">
+        <label><span id="confirm-label">Type the word to confirm</span> <input name="confirm" autocomplete="off" spellcheck="false"></label>
+        <button type="submit" disabled>Confirm</button>
+        <button type="button" id="confirm-cancel" class="quiet">Cancel</button>
+      </div>
     </form>
     <p id="run-result" class="result" role="status" aria-live="assertive"></p>
   </section>

@@ -42,9 +42,10 @@ pub struct Component {
     pub detail: String,
     /// A command to run in Terminal from the project folder; empty when nothing is needed.
     pub fix: String,
-    /// The job the console's Run-now button starts (`ui::RUNNABLE`); empty when there is none or
-    /// it is running now.
-    pub run: String,
+    /// What the console may start or restart from this row (`ui::TARGETS`); empty for none.
+    pub target: String,
+    /// The buttons this row offers now: "start", "run" and/or "restart" (DECISION S28).
+    pub actions: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,7 +65,8 @@ fn c(name: &str, status: &'static str, detail: String, fix: &str) -> Component {
             .take(200)
             .collect(),
         fix: fix.into(),
-        run: String::new(),
+        target: String::new(),
+        actions: Vec::new(),
     }
 }
 
@@ -204,8 +206,13 @@ fn job(
             } else {
                 c(&name, "ok", detail, "")
             };
-            if state != "running" && crate::ui::RUNNABLE.contains(&short) {
-                out.run = short.into();
+            if crate::ui::RUNNABLE.contains(&short) {
+                out.target = short.into();
+                out.actions = if state == "running" {
+                    vec!["restart"]
+                } else {
+                    vec!["run", "restart"]
+                };
             }
             out
         }
@@ -213,16 +220,26 @@ fn job(
 }
 
 fn ollama() -> Component {
-    match llm::ollama_has_model(HTTP_TIMEOUT) {
-        Ok(d) => c("Ollama", "ok", d, ""),
-        Err(e) if e.contains("missing") => c(
-            "Ollama",
-            "down",
-            e,
-            &format!("ollama pull {}", llm::LOCAL_MODEL),
+    let (mut out, actions) = match llm::ollama_has_model(HTTP_TIMEOUT) {
+        Ok(d) => (c("Ollama", "ok", d, ""), vec!["restart"]),
+        // a missing model needs a pull, which a restart won't fix
+        Err(e) if e.contains("missing") => (
+            c(
+                "Ollama",
+                "down",
+                e,
+                &format!("ollama pull {}", llm::LOCAL_MODEL),
+            ),
+            vec![],
         ),
-        Err(e) => c("Ollama", "down", e, "brew services start ollama"),
-    }
+        Err(e) => (
+            c("Ollama", "down", e, "brew services start ollama"),
+            vec!["start"],
+        ),
+    };
+    out.target = "ollama".into();
+    out.actions = actions;
+    out
 }
 
 /// What an OpenAI-compatible GET /v1/models looks like, without a key: a model list, or a refusal
@@ -257,7 +274,14 @@ fn omniroute(configured: Result<u16, String>) -> Component {
         }
     }
     let seen: Vec<(u16, Option<&str>)> = ports.iter().map(|&p| (p, probe_port(p))).collect();
-    omniroute_verdict(configured, &seen)
+    let mut out = omniroute_verdict(configured, &seen);
+    out.target = "omniroute".into();
+    out.actions = if out.status == "down" {
+        vec!["start"]
+    } else {
+        vec!["restart"]
+    };
+    out
 }
 
 fn omniroute_verdict(configured: Result<u16, String>, seen: &[(u16, Option<&str>)]) -> Component {
@@ -508,7 +532,7 @@ mod tests {
             ok.detail,
             "loaded, not running, last exit 0; runs every 2 min"
         );
-        assert_eq!(ok.run, "", "the backstop has no Run-now button");
+        assert!(ok.actions.is_empty(), "the backstop has no buttons");
         let failed = loaded.replace("code = 0", "code = 78: Function not implemented");
         let bad = job(l, log, every, Some(true), Some((0, failed)));
         assert_eq!(
@@ -520,12 +544,16 @@ mod tests {
         assert_eq!(never.status, "ok");
         assert!(never.detail.contains("last exit none yet"));
         let (d, dlog, dev) = JOBS[1];
+        let idle = job(d, dlog, dev, Some(true), Some((0, loaded.into())));
         assert_eq!(
-            job(d, dlog, dev, Some(true), Some((0, loaded.into()))).run,
-            "desk"
+            (idle.target.as_str(), idle.actions.clone()),
+            ("desk", vec!["run", "restart"])
         );
         let running = loaded.replace("state = not running", "state = running");
-        assert_eq!(job(d, dlog, dev, Some(true), Some((0, running))).run, "");
+        assert_eq!(
+            job(d, dlog, dev, Some(true), Some((0, running))).actions,
+            ["restart"]
+        );
         let missing = job(l, log, every, Some(false), Some((113, String::new())));
         assert_eq!(missing.status, "down");
         assert!(
@@ -605,7 +633,10 @@ mod tests {
             let o = comp.as_object().unwrap();
             let mut keys: Vec<&str> = o.keys().map(String::as_str).collect();
             keys.sort();
-            assert_eq!(keys, ["detail", "fix", "name", "run", "status"]);
+            assert_eq!(
+                keys,
+                ["actions", "detail", "fix", "name", "status", "target"]
+            );
             assert!(["ok", "warn", "down", "unknown"].contains(&o["status"].as_str().unwrap()));
         }
         assert_eq!(comps[1]["status"], "ok", "the console reports itself up");

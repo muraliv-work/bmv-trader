@@ -175,8 +175,15 @@ body.stale main { opacity: 0.5; }
 .safety .pair { margin: 0; }
 .control p { margin: 0 0 12px; color: var(--muted); font-size: 14px; max-width: 34rem; }
 
-.run { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0 20px; margin-top: 12px; }
-.run button { margin-bottom: 10px; }
+.actions { white-space: nowrap; }
+.actions button + button { margin-left: 6px; }
+button.small { font-size: 13px; padding: 4px 12px; }
+button.quiet { color: var(--ink); background: var(--raised); border-color: var(--line); }
+button.quiet:hover { border-color: var(--accent); }
+.confirm { margin-top: 16px; padding: 16px; border-radius: var(--radius); background: var(--raised); border: 1px solid var(--accent); }
+.confirm h3 { margin: 0; }
+.confirm-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0 12px; margin-top: 12px; }
+.confirm-row button { margin-bottom: 10px; }
 
 /* Services page */
 .services td { white-space: normal; vertical-align: top; }

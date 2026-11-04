@@ -38,6 +38,24 @@ const RESEARCH_SECS: u64 = 60;
 
 /// The launchd jobs Run-now may start (DECISION S24): none of them can place an order.
 pub const RUNNABLE: [&str; 3] = ["desk", "notes", "llm"];
+/// What the Services buttons may act on (DECISION S28), and the actions each takes. The trading
+/// engine isn't here: starting it stays terminal-only.
+pub const TARGETS: [(&str, &[&str]); 5] = [
+    ("ollama", &["start", "restart"]),
+    ("omniroute", &["start", "restart"]),
+    ("desk", &["run", "restart"]),
+    ("notes", &["run", "restart"]),
+    ("llm", &["run", "restart"]),
+];
+
+/// The word a person types for an action.
+pub fn word(action: &str) -> &'static str {
+    match action {
+        "restart" => "RESTART",
+        "start" => "START",
+        _ => "RUN",
+    }
+}
 
 /// Every route there is. A test pins it, so a new control can't slip in unreviewed.
 pub const ROUTES: [(&str, &str); 15] = [
@@ -119,8 +137,8 @@ pub struct Ctx<'a> {
     pub equity: &'a (dyn Fn() -> Result<String, String> + Sync),
     /// `data/lessons.jsonl` as a JSON array (DESIGN §13d).
     pub lessons: &'a (dyn Fn() -> Result<String, String> + Sync),
-    /// Start one of `RUNNABLE` through launchd; Ok is what to tell the user.
-    pub kickstart: &'a (dyn Fn(&str) -> Result<String, String> + Sync),
+    /// Do one of `TARGETS`' actions; Ok is what to tell the user.
+    pub service: &'a (dyn Fn(&str, &str) -> Result<String, String> + Sync),
 }
 
 /// Fails reads past `until`, so a client dribbling bytes can't hold a thread for long.
@@ -302,8 +320,9 @@ fn post_checks(req: &Request, host: &str) -> Option<Response> {
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunJob {
-    job: String,
+struct Act {
+    target: String,
+    action: String,
     confirm: String,
 }
 
@@ -311,22 +330,29 @@ fn run_job(req: &Request, ctx: &Ctx, host: &str) -> Response {
     if let Some(r) = post_checks(req, host) {
         return r;
     }
-    let Ok(r) = serde_json::from_slice::<RunJob>(&req.body) else {
-        return Response::json(400, false, "send {\"job\": ..., \"confirm\": \"RUN\"}");
+    let Ok(r) = serde_json::from_slice::<Act>(&req.body) else {
+        return Response::json(
+            400,
+            false,
+            "send {\"target\": ..., \"action\": ..., \"confirm\": ...}",
+        );
     };
-    // the label is built from our own list, never from the request's text
-    let Some(job) = RUNNABLE.iter().find(|j| **j == r.job) else {
-        return Response::json(400, false, "unknown job");
+    // target and action are taken from our own list, never from the request's text
+    let Some((target, actions)) = TARGETS.iter().find(|(t, _)| *t == r.target) else {
+        return Response::json(400, false, "unknown target");
     };
-    if r.confirm != "RUN" {
-        return Response::json(400, false, "type RUN to confirm");
+    let Some(action) = actions.iter().find(|a| **a == r.action) else {
+        return Response::json(400, false, "that action isn't offered for this target");
+    };
+    if r.confirm != word(action) {
+        return Response::json(400, false, &format!("type {} to confirm", word(action)));
     }
     let now = chrono::Utc::now().timestamp();
     eprintln!(
-        "{} ET  Run now: {job}, from the web console",
+        "{} ET  {action} {target}, from the web console",
         watch::et(now)
     );
-    let result = match (ctx.kickstart)(job) {
+    let result = match (ctx.service)(target, action) {
         Ok(m) => Response::json(200, true, &m),
         Err(e) => Response::json(502, false, &e),
     };
@@ -334,24 +360,49 @@ fn run_job(req: &Request, ctx: &Ctx, host: &str) -> Response {
     result
 }
 
-/// `launchctl kickstart` without -k: a job that is already running is left alone.
-fn kickstart(job: &str) -> Result<String, String> {
-    let label = format!("com.bmv-trader.{job}");
+/// Does one allowlisted action. launchd: `kickstart` (a running job is left alone) or
+/// `kickstart -k` (restart). OmniRoute: its own CLI, from ~/.omniroute with a cleared environment.
+fn service(target: &str, action: &str) -> Result<String, String> {
+    if target == "omniroute" {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or("HOME is not set")?;
+        if action == "restart" {
+            // stopping one that isn't running is fine: serve brings it up either way
+            let _ = crate::llm::omniroute_control(&home, &["stop"]);
+        }
+        crate::llm::omniroute_control(&home, &["serve", "--daemon"])?;
+        return Ok(
+            "OmniRoute is starting in the background; its row turns green within 30 s.".into(),
+        );
+    }
+    let label = if target == "ollama" {
+        "sh.brew.ollama".to_string()
+    } else {
+        format!("com.bmv-trader.{target}")
+    };
     let uid = services::uid().ok_or("couldn't read the user id")?;
-    let (code, _) = services::run(
-        "/bin/launchctl",
-        &["kickstart", &format!("gui/{uid}/{label}")],
-        &[],
-        false,
-    )
-    .ok_or("launchctl didn't answer")?;
+    let domain = format!("gui/{uid}/{label}");
+    let args: Vec<&str> = if action == "restart" {
+        vec!["kickstart", "-k", &domain]
+    } else {
+        vec!["kickstart", &domain]
+    };
+    let (code, _) =
+        services::run("/bin/launchctl", &args, &[], false).ok_or("launchctl didn't answer")?;
     if code == 0 {
         Ok(format!(
-            "{job} started (or was already running). Its row shows the result within 30 s."
+            "{target}: {} sent. Its row shows the result within 30 s.",
+            if action == "restart" {
+                "restart"
+            } else {
+                "start"
+            }
         ))
     } else {
         Err(format!(
-            "launchctl kickstart {label} failed (exit {code}); is the job installed?"
+            "launchctl {} failed (exit {code}); is {label} installed?",
+            args.join(" ")
         ))
     }
 }
@@ -607,7 +658,7 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
         desk: &desk,
         equity: &equity,
         lessons: &lessons,
-        kickstart: &kickstart,
+        service: &service,
     };
     println!(
         "web console ({mode}), this Mac only. Open:\n\n  http://{ADDR}:{port}/#{}\n",
@@ -744,9 +795,9 @@ mod tests {
             log("lessons".into());
             Ok("[]".to_string())
         };
-        let kickstart = |job: &str| {
-            log(format!("kickstart {job}"));
-            Ok(format!("{job} started"))
+        let service = |target: &str, action: &str| {
+            log(format!("{action} {target}"));
+            Ok(format!("{target} {action}"))
         };
         let ctx = Ctx {
             port: 8765,
@@ -759,7 +810,7 @@ mod tests {
             desk: &desk,
             equity: &equity,
             lessons: &lessons,
-            kickstart: &kickstart,
+            service: &service,
         };
         let resp = route(r, &ctx);
         let engaged = stop.exists();
@@ -974,7 +1025,7 @@ mod tests {
             desk: &state,
             equity: &state,
             lessons: &state,
-            kickstart: &|_| Err("not in this test".into()),
+            service: &|_, _| Err("not in this test".into()),
         };
         let resp = route(r, &ctx);
         std::fs::remove_file(&dir).unwrap();
@@ -996,7 +1047,7 @@ mod tests {
             desk: &state,
             equity: &state,
             lessons: &state,
-            kickstart: &|_| Err("not in this test".into()),
+            service: &|_, _| Err("not in this test".into()),
         };
         for path in [
             "/api/state",
@@ -1119,18 +1170,42 @@ mod tests {
     }
 
     #[test]
-    fn run_now_starts_only_listed_jobs_with_the_word() {
-        let ok = r#"{"job":"notes","confirm":"RUN"}"#;
+    fn service_actions_are_allowlisted_and_need_their_word() {
+        let ok = r#"{"target":"notes","action":"run","confirm":"RUN"}"#;
         let (resp, engaged, calls) = call(&req("POST", "/api/run", &[AUTH, JSON], ok));
         assert_eq!((resp.status, engaged), (200, false), "{}", resp.body);
-        assert_eq!(calls, ["kickstart notes"]);
+        assert_eq!(calls, ["run notes"]);
+        for (body, want) in [
+            (
+                r#"{"target":"ollama","action":"restart","confirm":"RESTART"}"#,
+                "restart ollama",
+            ),
+            (
+                r#"{"target":"omniroute","action":"start","confirm":"START"}"#,
+                "start omniroute",
+            ),
+            (
+                r#"{"target":"desk","action":"restart","confirm":"RESTART"}"#,
+                "restart desk",
+            ),
+        ] {
+            let (resp, _, calls) = call(&req("POST", "/api/run", &[AUTH, JSON], body));
+            assert_eq!(
+                (resp.status, calls),
+                (200, vec![want.to_string()]),
+                "{body}"
+            );
+        }
         for bad in [
-            r#"{"job":"notes","confirm":"run"}"#,
-            r#"{"job":"backstop","confirm":"RUN"}"#,
-            r#"{"job":"run","confirm":"RUN"}"#,
-            r#"{"job":"notes; rm -rf /","confirm":"RUN"}"#,
-            r#"{"job":"notes","confirm":"RUN","extra":1}"#,
-            r#"{"confirm":"RUN"}"#,
+            r#"{"target":"notes","action":"run","confirm":"run"}"#,
+            r#"{"target":"desk","action":"restart","confirm":"RUN"}"#,
+            r#"{"target":"desk","action":"start","confirm":"START"}"#,
+            r#"{"target":"ollama","action":"run","confirm":"RUN"}"#,
+            r#"{"target":"run","action":"start","confirm":"START"}"#,
+            r#"{"target":"engine","action":"start","confirm":"START"}"#,
+            r#"{"target":"ollama; rm -rf /","action":"restart","confirm":"RESTART"}"#,
+            r#"{"target":"notes","action":"run","confirm":"RUN","extra":1}"#,
+            r#"{"job":"notes","confirm":"RUN"}"#,
         ] {
             let (resp, _, calls) = call(&req("POST", "/api/run", &[AUTH, JSON], bad));
             assert_eq!((resp.status, calls.len()), (400, 0), "{bad}");
@@ -1141,10 +1216,11 @@ mod tests {
         let (resp, _, calls) = call(&req("POST", "/api/run", &[AUTH, JSON, evil], ok));
         assert_eq!((resp.status, calls.len()), (403, 0));
         assert_eq!(call(&req("GET", "/api/run", &[AUTH], "")).0.status, 405);
+        let targets: Vec<&str> = TARGETS.iter().map(|t| t.0).collect();
         assert_eq!(
-            RUNNABLE,
-            ["desk", "notes", "llm"],
-            "none of these places an order"
+            targets,
+            ["ollama", "omniroute", "desk", "notes", "llm"],
+            "no trading engine, nothing that can place an order"
         );
     }
 

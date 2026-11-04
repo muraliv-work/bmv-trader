@@ -362,6 +362,36 @@ pub fn cli_call(user_home: &Path, args: &[&str]) -> CliCall {
     }
 }
 
+/// Runs an OmniRoute command that may leave a daemon behind (`serve --daemon`, `stop`): output goes
+/// nowhere, so a daemon holding it can't hang us, and the command gets the CLI time limit.
+pub fn omniroute_control(user_home: &Path, args: &[&str]) -> Result<(), String> {
+    let call = cli_call(user_home, args);
+    let mut child = Command::new(call.program)
+        .args(&call.args)
+        .current_dir(&call.dir)
+        .env_clear()
+        .envs(call.env.iter().map(|(k, v)| (*k, v.as_str())))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e}", call.program))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) if s.success() => return Ok(()),
+            Ok(Some(s)) => return Err(format!("omniroute {} exited with {s}", args.join(" "))),
+            Ok(None) if start.elapsed() > CLI_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("omniroute {} timed out", args.join(" ")));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(e) => return Err(format!("waiting for omniroute: {e}")),
+        }
+    }
+}
+
 /// Runs the CLI with a time limit; stdout is returned to the caller and never printed.
 fn run_cli(call: &CliCall) -> Result<String, String> {
     let mut child = Command::new(call.program)
