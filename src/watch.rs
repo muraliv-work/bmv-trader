@@ -213,10 +213,7 @@ pub fn snapshot(a: &Alpaca, home: &Path, mode: &str, keep: usize) -> Snapshot {
                 today: &today_et(now),
                 stop_file: stop.is_some(),
                 journal_ok: !errors.contains_key("journal"),
-                heartbeat_age: std::fs::read_to_string(live::heartbeat_path(home))
-                    .ok()
-                    .and_then(|t| t.trim().parse::<i64>().ok())
-                    .map(|t| now - t),
+                heartbeat_age: heartbeat_age(home, now),
                 positions_open: positions.as_ref().is_some_and(|p: &Vec<_>| !p.is_empty()),
             },
         ),
@@ -245,6 +242,14 @@ fn parse_trials(text: &str, errors: &mut BTreeMap<&'static str, String>) -> Vec<
 
 /// No heartbeat for this long means the engine isn't running (it ticks every 5 s).
 pub const HEARTBEAT_STALE_SECS: i64 = 60;
+
+/// Seconds since `run`'s last tick; None if it never wrote one.
+pub fn heartbeat_age(home: &Path, now: i64) -> Option<i64> {
+    std::fs::read_to_string(live::heartbeat_path(home))
+        .ok()
+        .and_then(|t| t.trim().parse::<i64>().ok())
+        .map(|t| now - t)
+}
 
 /// What the monitors know besides the journal.
 #[derive(Clone, Copy)]
@@ -280,7 +285,7 @@ pub fn state_now(s: &Summary, seen: &Seen) -> &'static str {
     }
 }
 
-fn today_et(ts: i64) -> String {
+pub(crate) fn today_et(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|t| {
             t.with_timezone(&chrono_tz::America::New_York)

@@ -15,6 +15,7 @@ pub mod notes;
 pub mod risk;
 pub mod safety;
 pub mod scan;
+pub mod services;
 pub mod stats;
 pub mod strategy;
 pub mod swing;

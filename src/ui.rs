@@ -4,7 +4,7 @@
 
 use crate::broker::Alpaca;
 use crate::safety::{self, Engaged};
-use crate::{live, watch};
+use crate::{live, services, watch};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -26,14 +26,21 @@ const INDEX: &str = include_str!("ui/index.html");
 const HELP: &str = include_str!("ui/help.html");
 const APP_JS: &str = include_str!("ui/app.js");
 const APP_CSS: &str = include_str!("ui/app.css");
+const SERVICES: &str = include_str!("ui/services.html");
+const SERVICES_JS: &str = include_str!("ui/services.js");
+/// The Services checks (Keychain, launchctl, loopback HTTP) run at most once per this.
+const SERVICES_SECS: u64 = 30;
 
 /// Every route there is. A test pins it, so a new control can't slip in unreviewed.
-pub const ROUTES: [(&str, &str); 7] = [
+pub const ROUTES: [(&str, &str); 10] = [
     ("GET", "/"),
     ("GET", "/help"),
+    ("GET", "/services"),
     ("GET", "/app.js"),
+    ("GET", "/services.js"),
     ("GET", "/app.css"),
     ("GET", "/api/state"),
+    ("GET", "/api/services"),
     ("POST", "/api/stop"),
     ("POST", "/api/flatten"),
 ];
@@ -87,6 +94,8 @@ pub struct Ctx<'a> {
     pub stop: PathBuf,
     /// The latest snapshot as JSON, without waiting on Alpaca.
     pub state: &'a (dyn Fn() -> Result<String, String> + Sync),
+    /// The latest Services report as JSON, without waiting on the checks.
+    pub services: &'a (dyn Fn() -> Result<String, String> + Sync),
     /// Ask for a fresh snapshot now (after a control).
     pub refresh: &'a (dyn Fn() + Sync),
     /// Close everything and confirm flat.
@@ -216,7 +225,9 @@ pub fn route(req: &Request, ctx: &Ctx) -> Response {
     match req.path.as_str() {
         "/" => return Response::ok("text/html; charset=utf-8", INDEX),
         "/help" => return Response::ok("text/html; charset=utf-8", HELP),
+        "/services" => return Response::ok("text/html; charset=utf-8", SERVICES),
         "/app.js" => return Response::ok("text/javascript; charset=utf-8", APP_JS),
+        "/services.js" => return Response::ok("text/javascript; charset=utf-8", SERVICES_JS),
         "/app.css" => return Response::ok("text/css; charset=utf-8", APP_CSS),
         _ => {}
     }
@@ -231,10 +242,17 @@ pub fn route(req: &Request, ctx: &Ctx) -> Response {
         );
     }
     match req.path.as_str() {
-        "/api/state" => match (ctx.state)() {
-            Ok(json) => Response::ok("application/json", &json),
-            Err(e) => Response::json(503, false, &e),
-        },
+        "/api/state" | "/api/services" => {
+            let read = if req.path == "/api/state" {
+                ctx.state
+            } else {
+                ctx.services
+            };
+            match read() {
+                Ok(json) => Response::ok("application/json", &json),
+                Err(e) => Response::json(503, false, &e),
+            }
+        }
         "/api/stop" => control(req, ctx, host, "STOP"),
         _ => control(req, ctx, host, "FLATTEN"),
     }
@@ -388,6 +406,12 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
         l.clone()
             .unwrap_or_else(|| Err("first reading not ready yet".to_string()))
     };
+    let checked: Mutex<Option<Result<String, String>>> = Mutex::new(None);
+    let services = || {
+        let l = checked.lock().unwrap_or_else(|p| p.into_inner());
+        l.clone()
+            .unwrap_or_else(|| Err("first check still running".to_string()))
+    };
     let refresh = || dirty.store(true, Ordering::SeqCst);
     let flatten = || {
         let _one = flattening
@@ -400,6 +424,7 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
         token,
         stop: safety::stop_path(home),
         state: &state,
+        services: &services,
         refresh: &refresh,
         flatten: &flatten,
     };
@@ -422,6 +447,15 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
                     }
                     std::thread::sleep(Duration::from_millis(250));
                 }
+            }
+        });
+        // its own thread: a slow Keychain or launchctl never delays the account reading
+        s.spawn(|| {
+            loop {
+                let json = serde_json::to_string(&services::check(home, port))
+                    .map_err(|e| format!("services: {e}"));
+                *checked.lock().unwrap_or_else(|p| p.into_inner()) = Some(json);
+                std::thread::sleep(Duration::from_secs(SERVICES_SECS));
             }
         });
         for stream in listener.incoming() {
@@ -498,6 +532,10 @@ mod tests {
             log("state".into());
             Ok("{}".to_string())
         };
+        let services = || {
+            log("services".into());
+            Ok(r#"{"now":1,"components":[]}"#.to_string())
+        };
         let refresh = || log("refresh".into());
         let flatten = || {
             // STOP must already be engaged when the broker is asked to close
@@ -509,6 +547,7 @@ mod tests {
             token: TOKEN.into(),
             stop: stop.clone(),
             state: &state,
+            services: &services,
             refresh: &refresh,
             flatten: &flatten,
         };
@@ -530,13 +569,44 @@ mod tests {
             [
                 "GET /",
                 "GET /help",
+                "GET /services",
                 "GET /app.js",
+                "GET /services.js",
                 "GET /app.css",
                 "GET /api/state",
+                "GET /api/services",
                 "POST /api/stop",
                 "POST /api/flatten"
             ]
         );
+    }
+
+    #[test]
+    fn the_services_page_is_read_only_and_its_data_needs_the_token() {
+        let page = call(&req("GET", "/services", &[], "")).0;
+        assert_eq!(page.status, 200);
+        assert!(!page.body.contains("<button") && !page.body.contains("<form"));
+        assert!(!page.body.contains("style=") && !page.body.contains("<script>"));
+        let js = call(&req("GET", "/services.js", &[], "")).0;
+        assert_eq!(js.status, 200);
+        assert!(!js.body.contains("innerHTML") && !js.body.contains("method:"));
+        assert_eq!(call(&req("GET", "/api/services", &[], "")).0.status, 401);
+        let bad = ("authorization", "Bearer nope");
+        assert_eq!(call(&req("GET", "/api/services", &[bad], "")).0.status, 401);
+        let (resp, _, calls) = call(&req("GET", "/api/services", &[AUTH], ""));
+        assert_eq!((resp.status, calls), (200, vec!["services".to_string()]));
+        assert_eq!(resp.content_type, "application/json");
+        assert_eq!(
+            call(&req("POST", "/api/services", &[AUTH], "")).0.status,
+            405
+        );
+        for page in ["/", "/help"] {
+            let body = call(&req("GET", page, &[], "")).0.body;
+            assert!(
+                body.contains("href=\"/services\""),
+                "{page} links to Services"
+            );
+        }
     }
 
     #[test]
@@ -677,6 +747,7 @@ mod tests {
             token: TOKEN.into(),
             stop: stop.clone(),
             state: &state,
+            services: &state,
             refresh: &refresh,
             flatten: &flatten,
         };
@@ -694,13 +765,13 @@ mod tests {
             token: TOKEN.into(),
             stop: PathBuf::from("/nonexistent/STOP"),
             state: &state,
+            services: &state,
             refresh: &refresh,
             flatten: &flatten,
         };
-        assert_eq!(
-            route(&req("GET", "/api/state", &[AUTH], ""), &ctx).status,
-            503
-        );
+        for path in ["/api/state", "/api/services"] {
+            assert_eq!(route(&req("GET", path, &[AUTH], ""), &ctx).status, 503);
+        }
     }
 
     #[test]

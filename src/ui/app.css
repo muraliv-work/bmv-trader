@@ -114,7 +114,12 @@ body.stale main { opacity: 0.45; }
 .result.bad { color: var(--danger); }
 
 a { color: inherit; text-underline-offset: 0.2em; }
-.howto { margin-left: auto; align-self: flex-start; color: var(--muted); }
+.howto { margin-left: auto; align-self: flex-start; color: var(--muted); display: flex; gap: 1rem; }
+
+/* Services page: the console's signal header over one read-only table. */
+.services td { white-space: normal; vertical-align: top; }
+.services td:first-child { white-space: nowrap; }
+.services td code { overflow-wrap: anywhere; }
 
 /* How-to page: same panel, reading width, no signal colour except the legend dots. */
 .help main, .help-head { max-width: 46rem; }

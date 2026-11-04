@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Loopback only; never read from the environment.
-pub const OMNIROUTE: &str = "http://127.0.0.1:20128";
+/// Loopback only; never read from the environment. Only OmniRoute's port is configurable.
+pub const OMNIROUTE_HOST: &str = "127.0.0.1";
+pub const OMNIROUTE_DEFAULT_PORT: u16 = 20128;
 pub const OLLAMA: &str = "http://127.0.0.1:11434";
 /// The OmniRoute combo that holds only the local model.
 pub const TIER2_MODEL: &str = "bmv-local";
@@ -141,9 +142,48 @@ fn key() -> Result<String, String> {
         .ok_or_else(|| "no OMNIROUTE_API_KEY in the Keychain (deploy/README.md)".into())
 }
 
+/// `data/omniroute.json`, optional and non-secret: `{"port": N}`.
+pub fn omniroute_port_path(home: &Path) -> PathBuf {
+    home.join("data").join("omniroute.json")
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortFile {
+    port: u16,
+}
+
+/// Only a non-privileged port; anything else in the file is an error, never a silent default.
+pub fn parse_port(bytes: &[u8]) -> Result<u16, String> {
+    let p = serde_json::from_slice::<PortFile>(bytes)
+        .map_err(|e| format!("omniroute.json must be {{\"port\": 1024..65535}}: {e}"))?
+        .port;
+    if p < 1024 {
+        return Err(format!("omniroute.json: port {p} is below 1024"));
+    }
+    Ok(p)
+}
+
+/// The configured OmniRoute port: the file's, or the default when there is no file.
+pub fn omniroute_port(home: &Path) -> Result<u16, String> {
+    match std::fs::read(omniroute_port_path(home)) {
+        Ok(b) => parse_port(&b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(OMNIROUTE_DEFAULT_PORT),
+        Err(e) => Err(format!("cannot read omniroute.json: {e}")),
+    }
+}
+
+pub fn omniroute_url(port: u16) -> String {
+    format!("http://{OMNIROUTE_HOST}:{port}")
+}
+
 fn client() -> Result<reqwest::blocking::Client, String> {
+    client_within(TIMEOUT)
+}
+
+pub(crate) fn client_within(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
-        .timeout(TIMEOUT)
+        .timeout(timeout)
         // loopback only: no proxy may see the key, and no redirect may leave the Mac
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -154,10 +194,14 @@ fn client() -> Result<reqwest::blocking::Client, String> {
 /// Asks the local model to do `task` with `facts`. Any failure is an error for the caller to
 /// turn into a numbers-only note; it never falls back to another tier.
 pub fn complete(task: Tier2Task, facts: &str) -> Result<Note, String> {
-    complete_with(&key()?, task, facts)
+    complete_with(&configured_url()?, &key()?, task, facts)
 }
 
-fn complete_with(key: &str, task: Tier2Task, facts: &str) -> Result<Note, String> {
+fn configured_url() -> Result<String, String> {
+    Ok(omniroute_url(omniroute_port(&crate::config::home()?)?))
+}
+
+fn complete_with(base: &str, key: &str, task: Tier2Task, facts: &str) -> Result<Note, String> {
     let body = ChatRequest {
         model: TIER2_MODEL,
         max_tokens: MAX_TOKENS,
@@ -173,7 +217,7 @@ fn complete_with(key: &str, task: Tier2Task, facts: &str) -> Result<Note, String
         ],
     };
     let resp = client()?
-        .post(format!("{OMNIROUTE}/v1/chat/completions"))
+        .post(format!("{base}/v1/chat/completions"))
         .bearer_auth(key)
         .json(&body)
         .send()
@@ -236,8 +280,8 @@ struct OllamaModel {
     name: String,
 }
 
-fn ollama_has_model() -> Result<String, String> {
-    let tags: OllamaTags = client()?
+pub fn ollama_has_model(timeout: Duration) -> Result<String, String> {
+    let tags: OllamaTags = client_within(timeout)?
         .get(format!("{OLLAMA}/api/tags"))
         .send()
         .and_then(|r| r.error_for_status())
@@ -254,7 +298,7 @@ fn ollama_has_model() -> Result<String, String> {
 /// Ollama is up and has the local model; a tiny Tier-2 call through OmniRoute works.
 pub fn probe_checks() -> Vec<Check> {
     vec![
-        Check::of("ollama has the local model", ollama_has_model()),
+        Check::of("ollama has the local model", ollama_has_model(TIMEOUT)),
         Check::of(
             "Tier-2 probe through OmniRoute",
             complete(
@@ -456,6 +500,7 @@ pub fn rotate(user_home: &Path) -> Result<String, String> {
         )
     })?;
     complete_with(
+        &configured_url()?,
         &new_key,
         Tier2Task::DeskBrief,
         "Facts: 1 test. Reply with the word ok.",
@@ -531,7 +576,34 @@ mod tests {
 
     #[test]
     fn hosts_are_loopback_constants() {
-        assert!(OMNIROUTE.starts_with("http://127.0.0.1:"));
+        assert!(omniroute_url(20131).starts_with("http://127.0.0.1:"));
         assert!(OLLAMA.starts_with("http://127.0.0.1:"));
+    }
+
+    #[test]
+    fn the_port_file_takes_only_a_non_privileged_port() {
+        assert_eq!(parse_port(br#"{"port": 20131}"#), Ok(20131));
+        assert_eq!(parse_port(br#"{"port": 1024}"#), Ok(1024));
+        assert_eq!(parse_port(br#"{"port": 65535}"#), Ok(65535));
+        for bad in [
+            r#"{"port": 0}"#,
+            r#"{"port": 80}"#,
+            r#"{"port": 70000}"#,
+            r#"{"port": -1}"#,
+            r#"{"port": 20128.5}"#,
+            r#"{"port": "20128"}"#,
+            r#"{"port": 20128, "host": "evil.example"}"#,
+            "{}",
+            "20128",
+            "",
+        ] {
+            assert!(parse_port(bad.as_bytes()).is_err(), "{bad}");
+        }
+        let dir = std::env::temp_dir().join(format!("bmv-port-{}", std::process::id()));
+        assert_eq!(omniroute_port(&dir), Ok(OMNIROUTE_DEFAULT_PORT), "no file");
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(omniroute_port_path(&dir), r#"{"port": 80}"#).unwrap();
+        assert!(omniroute_port(&dir).is_err(), "a bad file is an error");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

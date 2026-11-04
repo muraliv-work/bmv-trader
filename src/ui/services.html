@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>bmv-trader services</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/services.js" defer></script>
+</head>
+<body class="services">
+<header class="signal" id="signal" data-aspect="unknown">
+  <div class="lamp" aria-hidden="true"></div>
+  <div class="aspect">
+    <h1 id="state">Checking</h1>
+    <p id="meta">Waiting for the first check</p>
+  </div>
+  <nav class="howto" aria-label="Pages"><a href="/">Console</a><a href="/help">How to</a></nav>
+</header>
+
+<main>
+  <section aria-labelledby="h-services">
+    <h2 id="h-services">Every moving part</h2>
+    <p class="note">Read-only. Each fix is a command to run in Terminal from the project folder
+      (<code>cd ~/Documents/projects/bmv/bmv-trader</code>). Checked at most every 30 seconds.</p>
+    <div class="scroll"><table><thead><tr><th>Status</th><th>Part</th><th>Detail</th><th>Fix</th></tr></thead>
+    <tbody id="components"></tbody></table></div>
+  </section>
+</main>
+</body>
+</html>
