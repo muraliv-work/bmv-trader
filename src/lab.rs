@@ -609,68 +609,84 @@ pub fn search(
     log: &mut dyn FnMut(&Candidate),
 ) -> (Vec<Candidate>, usize) {
     const POP: usize = 200;
+    // children per round: made in order, scored in parallel, applied in order, so a seed always
+    // gives the same search however the threads finish
+    const BATCH: usize = 64;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut rng = Rng::new(seed);
     let mut seen: HashSet<String> = HashSet::new();
     let mut pop: Vec<Candidate> = Vec::new();
     let mut tries = 0;
-    let mut consider = |e: Expr, source: &str, pop: &mut Vec<Candidate>, tries: &mut usize| {
-        if !seen.insert(e.key()) {
-            return;
+    let mut queue: Vec<(Expr, String)> = seeds.into_iter().filter(|(e, _)| e.fits()).collect();
+    queue.reverse();
+    while budget(tries) {
+        let mut batch: Vec<(Expr, String)> = Vec::new();
+        let mut attempts = 0;
+        while batch.len() < BATCH && attempts < BATCH * 4 {
+            attempts += 1;
+            let next = if let Some(s) = queue.pop() {
+                Some(s)
+            } else if pop.len() < POP / 2 || rng.chance(0.1) {
+                Some((random_expr(&mut rng, 3), "random".to_string()))
+            } else {
+                let pick = |rng: &mut Rng| -> usize {
+                    (0..4)
+                        .map(|_| rng.below(pop.len()))
+                        .max_by(|&a, &b| pop[a].stats.fitness.total_cmp(&pop[b].stats.fitness))
+                        .unwrap_or(0)
+                };
+                let (a, b) = (pick(&mut rng), pick(&mut rng));
+                child(&pop[a].expr, &pop[b].expr, &mut rng).map(|e| (e, "mutation".to_string()))
+            };
+            if let Some((e, source)) = next
+                && seen.insert(e.key())
+            {
+                batch.push((e, source));
+            }
         }
-        *tries += 1;
-        let Some(stats) = evaluate(&e, panel, months) else {
-            return;
-        };
-        let c = Candidate {
-            key: e.key(),
-            expr: e,
-            source: source.into(),
-            seed,
-            stats,
-        };
-        log(&c);
-        // a candidate counts only if its top 20 beats random after costs
-        if c.stats.excess_mean <= 0.0 {
-            return;
-        }
-        if pop.len() < POP {
-            pop.push(c);
-        } else if let Some((w, worst)) = pop
-            .iter()
-            .enumerate()
-            .min_by(|a, b| a.1.stats.fitness.total_cmp(&b.1.stats.fitness))
-            && c.stats.fitness > worst.stats.fitness
-        {
-            pop[w] = c;
-        }
-    };
-    for (e, source) in seeds {
-        if e.fits() {
-            consider(e, &source, &mut pop, &mut tries);
-        }
-    }
-    while pop.len() < POP / 2 && budget(tries) {
-        let e = random_expr(&mut rng, 3);
-        consider(e, "random", &mut pop, &mut tries);
-    }
-    while budget(tries) && !pop.is_empty() {
-        let pick = |rng: &mut Rng, pop: &[Candidate]| -> usize {
-            (0..4)
-                .map(|_| rng.below(pop.len()))
-                .max_by(|&a, &b| pop[a].stats.fitness.total_cmp(&pop[b].stats.fitness))
-                .unwrap_or(0)
-        };
-        let (a, b) = (pick(&mut rng, &pop), pick(&mut rng, &pop));
-        let (ea, eb) = (pop[a].expr.clone(), pop[b].expr.clone());
-        let next = if rng.chance(0.1) {
-            Some(random_expr(&mut rng, 3))
-        } else {
-            child(&ea, &eb, &mut rng)
-        };
-        if let Some(e) = next {
-            consider(e, "mutation", &mut pop, &mut tries);
-        } else {
-            tries += 1; // count failed breeding so a stuck population still ends
+        // count failed breeding too, so a stuck population still ends
+        tries += batch.len().max(1);
+        let chunk = batch.len().div_ceil(threads).max(1);
+        let scored: Vec<Option<Stats>> = std::thread::scope(|s| {
+            let handles: Vec<_> = batch
+                .chunks(chunk)
+                .map(|part| {
+                    s.spawn(move || {
+                        part.iter()
+                            .map(|(e, _)| evaluate(e, panel, months))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        for ((e, source), stats) in batch.into_iter().zip(scored) {
+            let Some(stats) = stats else { continue };
+            let c = Candidate {
+                key: e.key(),
+                expr: e,
+                source,
+                seed,
+                stats,
+            };
+            log(&c);
+            // a candidate counts only if its top 20 beats random after costs
+            if c.stats.excess_mean <= 0.0 {
+                continue;
+            }
+            if pop.len() < POP {
+                pop.push(c);
+            } else if let Some((w, worst)) = pop
+                .iter()
+                .enumerate()
+                .min_by(|a, b| a.1.stats.fitness.total_cmp(&b.1.stats.fitness))
+                && c.stats.fitness > worst.stats.fitness
+            {
+                pop[w] = c;
+            }
         }
     }
     pop.sort_by(|a, b| b.stats.fitness.total_cmp(&a.stats.fitness));
@@ -812,6 +828,17 @@ mod tests {
             let s = evaluate(&c.expr, &fresh, &months).unwrap();
             assert!(s.ic_mean.abs() < 0.03, "{}", s.ic_mean);
         }
+    }
+
+    #[test]
+    fn the_same_seed_gives_the_same_search() {
+        let noise = panel(30, 80, 4, &|_, rng| rng.below(1000) as f32);
+        let months: Vec<usize> = (0..30).collect();
+        let run = || {
+            let (pop, tries) = search(&noise, &months, vec![], 9, &mut |t| t < 600, &mut |_| {});
+            (pop.iter().map(|c| c.key.clone()).collect::<Vec<_>>(), tries)
+        };
+        assert_eq!(run(), run());
     }
 
     #[test]
