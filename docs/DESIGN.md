@@ -333,6 +333,22 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - **`BEGIN IMMEDIATE`** is needed if a second long-lived writer appears. Today only `desk init` writes alongside the server, and only once.
   - **Secure Enclave key rotation** isn't designed yet.
 
+### Step 3 as built: run hashes and the stress battery
+- **`bmv-trader stress-battery`** re-runs every finished trial twice through the same code as `trial-autopsy`.
+  - Each run gets an inputs hash (trial, parameters, period, cost and a data fingerprint) and a results hash (every row's date, exact value and exit).
+  - It then runs the owner's bars from `src/stress.rs`, fixed before the first run:
+    - Monte Carlo
+    - cost ×2 (×3 is reported)
+    - parameters ±20%, for trials 1–6 only; the others have compiled constants and count as not tested
+    - by year and by SPY regime
+    - deflated Sharpe, against all registered trials.
+  - A test that didn't run is never a pass. Output goes to `data/stress.jsonl`, and the table to `docs/REPORT-2026-11.md`.
+- **The desk:**
+  - `record_backtest` reports whether a run reproduces.
+  - An official run with the same inputs as an earlier run of the version, but different results, fails the strategy back to SPEC_FROZEN and a new version. That's the spec's §11 automatic FAIL.
+  - The VALIDATED gate refuses any version with a mismatched pair.
+- **First run (2026-11-04):** all 10 finished trials reproduce, and all 10 fail. Momentum (trial 7) is the only one that survives costs and most years.
+
 ### Build order (the spec's §12; the owner's go-ahead after each step)
 1. The `store`, `audit`, `lifecycle` and `permissions` crates, with the spec's §11 tests.
 2. `desk_api` (axum) plus MCP tools.

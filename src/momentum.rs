@@ -214,6 +214,7 @@ pub type Chooser<'a> = dyn FnMut(&[(&str, f64, f64)]) -> Vec<usize> + 'a;
 pub fn simulate(
     by_symbol: &BTreeMap<String, Vec<Month>>,
     months: std::ops::Range<usize>,
+    cost_per_side: f64,
     choose: &mut Chooser<'_>,
 ) -> Vec<f64> {
     let mut held: BTreeSet<String> = BTreeSet::new();
@@ -234,7 +235,7 @@ pub fn simulate(
                     moved as f64 / of as f64
                 }
             };
-            let cost = COST_PER_SIDE
+            let cost = cost_per_side
                 * (side(now.difference(&held).count(), now.len())
                     + side(held.difference(&now).count(), held.len()));
             held = now;
@@ -264,6 +265,16 @@ pub fn study(
     cal: &Calendar,
     holdout_from: &str,
 ) -> Result<Study, String> {
+    study_at_cost(by_symbol, cal, holdout_from, COST_PER_SIDE)
+}
+
+/// The study at another cost per side: the stress battery's cost shock.
+pub fn study_at_cost(
+    by_symbol: &BTreeMap<String, Vec<Month>>,
+    cal: &Calendar,
+    holdout_from: &str,
+    cost_per_side: f64,
+) -> Result<Study, String> {
     let n = cal.rebalances.len();
     let first = (0..n)
         .find(|&k| eligible(by_symbol, k).len() >= HOLD)
@@ -282,7 +293,7 @@ pub fn study(
         })
         .collect::<Result<Vec<f64>, String>>()?;
     let (mut thin_months, mut held) = (0, BTreeMap::new());
-    let strategy = simulate(by_symbol, first..end, &mut |c| {
+    let strategy = simulate(by_symbol, first..end, cost_per_side, &mut |c| {
         let t = top(c);
         thin_months += usize::from(c.len() < HOLD);
         for &i in &t {
@@ -293,11 +304,12 @@ pub fn study(
     let mut baseline = vec![0.0; end - first];
     for seed in 1..=RANDOM_SEEDS {
         let mut rng = splitmix(seed);
-        for (b, r) in baseline
-            .iter_mut()
-            .zip(simulate(by_symbol, first..end, &mut |c| {
-                random(c, &mut rng)
-            }))
+        for (b, r) in
+            baseline
+                .iter_mut()
+                .zip(simulate(by_symbol, first..end, cost_per_side, &mut |c| {
+                    random(c, &mut rng)
+                }))
         {
             *b += r / RANDOM_SEEDS as f64;
         }
@@ -589,7 +601,7 @@ mod tests {
         let syms: Vec<String> = (0..20).map(|i| format!("S{i:02}")).collect();
         let rows: Vec<(&str, f64, f64)> = syms.iter().map(|s| (s.as_str(), 1.0, 0.01)).collect();
         let u = universe(&rows, 3);
-        let r = simulate(&u, 0..3, &mut |c| top(c));
+        let r = simulate(&u, 0..3, COST_PER_SIDE, &mut |c| top(c));
         assert!((r[0] - (0.01 - COST_PER_SIDE)).abs() < 1e-12, "buying in");
         assert!((r[1] - 0.01).abs() < 1e-12, "same names, no cost");
         let mut swapped = u.clone();
@@ -604,10 +616,10 @@ mod tests {
                 3
             ],
         );
-        let r = simulate(&swapped, 0..3, &mut |c| top(c));
+        let r = simulate(&swapped, 0..3, COST_PER_SIDE, &mut |c| top(c));
         let expect = 0.01 - COST_PER_SIDE * (1.0 / 20.0 + 1.0 / 20.0);
         assert!((r[2] - expect).abs() < 1e-12, "one in, one out");
-        let empty = simulate(&BTreeMap::new(), 0..1, &mut |c| top(c));
+        let empty = simulate(&BTreeMap::new(), 0..1, COST_PER_SIDE, &mut |c| top(c));
         assert_eq!(empty, vec![0.0], "nothing eligible is cash");
     }
 

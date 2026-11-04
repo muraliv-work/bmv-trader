@@ -22,6 +22,7 @@ pub mod scan;
 pub mod services;
 pub mod stats;
 pub mod strategy;
+pub mod stress;
 pub mod swing;
 pub mod ui;
 pub mod vetting;

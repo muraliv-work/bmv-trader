@@ -704,6 +704,10 @@ impl Store {
 
     /// Records a backtest of the current version by its input and result hashes. Developers and
     /// Researchers run development backtests; only the Validator runs official ones.
+    /// Records a backtest run. Returns false when it doesn't reproduce: an earlier run of this
+    /// version had the same inputs and different results. A non-reproducing official run is an
+    /// automatic FAIL (spec §11): the strategy fails back to SPEC_FROZEN and a new version, so the
+    /// code must be submitted again, and the VALIDATED gate stays shut for this version anyway.
     pub async fn record_backtest(
         &self,
         agent_id: &str,
@@ -711,7 +715,7 @@ impl Store {
         official: bool,
         inputs_hash: &str,
         results_hash: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         plain("inputs hash", inputs_hash)?;
         plain("results hash", results_hash)?;
         let action = if official {
@@ -722,6 +726,16 @@ impl Store {
         self.authorize(agent_id, action).await?;
         let mut tx = self.pool.begin().await?;
         let version = version_in(&mut tx, strategy).await?;
+        let differing: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM backtest_runs WHERE strategy_id = ? AND version = ? AND inputs_hash = ? AND results_hash <> ?",
+        )
+        .bind(strategy)
+        .bind(version)
+        .bind(inputs_hash)
+        .bind(results_hash)
+        .fetch_one(&mut *tx)
+        .await?;
+        let reproduces = differing == 0;
         sqlx::query(
             "INSERT INTO backtest_runs (strategy_id, version, agent_id, official, inputs_hash, results_hash, at)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -739,11 +753,38 @@ impl Store {
             &mut tx,
             agent_id,
             "record_backtest",
-            json!({"strategy": strategy, "version": version, "official": official, "inputs": inputs_hash, "results": results_hash}),
+            json!({"strategy": strategy, "version": version, "official": official, "inputs": inputs_hash, "results": results_hash, "reproduces": reproduces}),
         )
         .await?;
+        if official && !reproduces {
+            let state: String = sqlx::query_scalar("SELECT state FROM strategies WHERE id = ?")
+                .bind(strategy)
+                .fetch_one(&mut *tx)
+                .await?;
+            let state = State::parse(&state)
+                .ok_or_else(|| DeskError::Corrupt(format!("stored state {state:?}")))?;
+            // only a strategy past SPEC_FROZEN that can step back does; one that can't (halted,
+            // retired, not yet coded) keeps its state, the run is still recorded, and the
+            // VALIDATED gate still refuses this version
+            let can_fail_back = lifecycle::rule(state, State::SpecFrozen, None)
+                .is_some_and(|r| r.kind == Kind::Back);
+            if can_fail_back {
+                let back = vec![Signer {
+                    agent_id: agent_id.into(),
+                    proof: None,
+                }];
+                transition_in(&mut tx, strategy, State::SpecFrozen, back).await?;
+            }
+            append(
+                &mut tx,
+                agent_id,
+                "reproduction_fail",
+                json!({"strategy": strategy, "version": version, "inputs": inputs_hash}),
+            )
+            .await?;
+        }
         tx.commit().await?;
-        Ok(())
+        Ok(reproduces)
     }
 
     /// Ops records the paper results the PAPER_REVIEWED gate reads (never the caller's numbers).
@@ -1042,7 +1083,7 @@ async fn transition_in(
         State::SpecFrozen if criteria.is_none() => Some("pre-registered criteria"),
         State::Implemented if code_author.is_none() => Some("submitted code for this version"),
         State::Validated if !official_run(&mut *tx, strategy, version).await? => {
-            Some("an official backtest of this version")
+            Some("an official backtest of this version that reproduces")
         }
         State::LimitsSet => {
             let n: i64 =
@@ -1188,7 +1229,18 @@ async fn official_run(
     .bind(version)
     .fetch_one(&mut **tx)
     .await?;
-    Ok(n > 0)
+    // any two runs of this version with the same inputs and different results: it doesn't reproduce
+    let mismatched: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM backtest_runs a JOIN backtest_runs b
+           ON a.strategy_id = b.strategy_id AND a.version = b.version
+          AND a.inputs_hash = b.inputs_hash AND a.results_hash <> b.results_hash
+         WHERE a.strategy_id = ? AND a.version = ?",
+    )
+    .bind(strategy)
+    .bind(version)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(n > 0 && mismatched == 0)
 }
 
 /// Appends one audit entry, chained to the last, inside the caller's transaction.
@@ -1642,6 +1694,78 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn an_official_run_that_does_not_reproduce_fails_the_strategy_back() {
+        let s = desk().await;
+        let id = implemented(&s).await;
+        let v = s.version(id).await.unwrap();
+        assert!(
+            s.record_backtest("dev-1", id, false, "in1", "out1")
+                .await
+                .unwrap()
+        );
+        // same inputs, same results: it reproduces, and the gate can open
+        assert!(
+            s.record_backtest("val-1", id, true, "in1", "out1")
+                .await
+                .unwrap()
+        );
+
+        let id2 = implemented(&s).await;
+        let v2 = s.version(id2).await.unwrap();
+        s.record_backtest("dev-1", id2, false, "in2", "out2")
+            .await
+            .unwrap();
+        assert!(
+            !s.record_backtest("val-1", id2, true, "in2", "other")
+                .await
+                .unwrap()
+        );
+        assert_eq!(s.state(id2).await.unwrap(), State::SpecFrozen);
+        assert_eq!(s.version(id2).await.unwrap(), v2 + 1, "a new version");
+        assert!(
+            s.transition(id2, State::Implemented, by("strat-1"))
+                .await
+                .is_err(),
+            "the code must be submitted again"
+        );
+        let trail = s.audit_entries().await.unwrap();
+        assert!(trail.iter().any(|e| e.action == "reproduction_fail"));
+
+        // a mismatched pair keeps the gate shut even if nothing could move the strategy back
+        let id3 = implemented(&s).await;
+        s.record_backtest("val-1", id3, true, "in3", "a")
+            .await
+            .unwrap();
+        s.record_backtest("dev-1", id3, false, "in3", "b")
+            .await
+            .unwrap();
+        assert!(denied(
+            s.transition(id3, State::Validated, by("val-1")).await,
+            "reproduces"
+        ));
+        s.transition(id, State::Validated, by("val-1"))
+            .await
+            .unwrap();
+        assert_eq!(s.version(id).await.unwrap(), v);
+
+        // before any code there is nothing to fail back, but the run is still recorded
+        let early = s.create_strategy("res-1", "early idea").await.unwrap();
+        s.transition(early, State::HypothesisApproved, by("strat-1"))
+            .await
+            .unwrap();
+        s.record_backtest("dev-1", early, false, "in4", "x")
+            .await
+            .unwrap();
+        assert!(
+            !s.record_backtest("val-1", early, true, "in4", "y")
+                .await
+                .unwrap()
+        );
+        assert_eq!(s.state(early).await.unwrap(), State::HypothesisApproved);
+        s.verify_audit().await.unwrap();
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ const USAGE: &str = "usage:
   bmv-trader power                        the smallest effect trials 11 and 12 could detect (spreads from trial 7)
   bmv-trader lab-search [--minutes 5] [--seed 1]  evolve ranking formulas on the search months only (DESIGN §7h)
   bmv-trader trial-autopsy                every finished trial, reproduced and broken down: data/lessons.jsonl (DESIGN §13d)
+  bmv-trader stress-battery               every finished trial reproduced twice with run hashes, then stress-tested: data/stress.jsonl
   bmv-trader retro-power                  trial 12's power gate: research-period signals only (DESIGN §7i)
   bmv-trader retro-sample                 trial 12: freeze each untouched-year session's top signal (once)
   bmv-trader retro-speed [--count 3]      the local analyst on 2024 signals: minutes per run (outcomes unused)
@@ -192,6 +193,7 @@ fn main() {
             Some("lab-validate") => lab_validate(),
             Some("retro-power") => retro_power(),
             Some("trial-autopsy") => trial_autopsy(),
+            Some("stress-battery") => stress_battery(),
             Some("retro-sample") => retro_sample(),
             Some("retro-speed") => retro_speed(args.num("--count", 3, 1..=20)?),
             Some("retro-run") => retro_run(args.num("--hours", 8, 1..=72)?),
@@ -1385,29 +1387,61 @@ fn regime_before(reg: &BTreeMap<String, bool>, date: &str) -> Option<bool> {
     reg.range(..date.to_string()).next_back().map(|(_, u)| *u)
 }
 
-/// `bmv-trader trial-autopsy` (DESIGN §13d, DECISION S27): every finished trial, reproduced from its
-/// own code path and options, then broken down; written to data/lessons.jsonl.
-fn trial_autopsy() -> Result<(), String> {
-    use bmv_trader::autopsy::{self, Row};
+/// What a trial rerun shares: the data, the hold-out cut, SPY's regime and the watchlist.
+struct TrialCtx {
+    dir: std::path::PathBuf,
+    cut_date: String,
+    reg: std::collections::BTreeMap<String, bool>,
+    watch: Vec<String>,
+}
+
+/// One trial's reproduced results.
+struct Rerun {
+    rows: Vec<bmv_trader::autopsy::Row>,
+    trades: usize,
+    expectancy: f64,
+    /// Before costs, where the trial has one (plain reruns only).
+    gross: Option<f64>,
+    units: &'static str,
+}
+
+fn trial_ctx() -> Result<TrialCtx, String> {
     use bmv_trader::momentum as mo;
     use bmv_trader::scan::ADJUSTED_SIP;
-    use bmv_trader::swing as sw;
-    let (home, dir) = (config::home()?, data_dir()?);
-    let logged: Vec<stats::Trial> = std::fs::read_to_string(dir.join("trials.jsonl"))
-        .map_err(|e| format!("trials.jsonl: {e}"))?
-        .lines()
-        .map(serde_json::from_str)
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("trials.jsonl: {e}"))?;
-    let curated: Vec<serde_json::Value> = serde_json::from_str(
-        &std::fs::read_to_string(home.join("docs/lessons.json"))
-            .map_err(|e| format!("docs/lessons.json: {e}"))?,
-    )
-    .map_err(|e| format!("docs/lessons.json: {e}"))?;
+    let dir = data_dir()?;
     let cut_date = holdout_from(&dir, &[])?;
     let spy = bmv_trader::scan::read_daily(&dir, ADJUSTED_SIP, mo::BENCHMARK)?;
-    let reg = autopsy::spy_regime(&spy);
-    let watch: Vec<String> = WATCHLIST.split(',').map(str::to_string).collect();
+    let reg = bmv_trader::autopsy::spy_regime(&spy);
+    let watch = WATCHLIST.split(',').map(str::to_string).collect();
+    Ok(TrialCtx {
+        dir,
+        cut_date,
+        reg,
+        watch,
+    })
+}
+
+fn no_params(orb: Option<OrbParams>) -> Result<(), String> {
+    match orb {
+        // shortcut: only trials 1-6 take parameters at run time; thread the swing and momentum constants through when one of them is worth a sensitivity run
+        Some(_) => Err("this trial's parameters are compiled constants".into()),
+        None => Ok(()),
+    }
+}
+
+/// Reruns one finished trial from its own code path and options, at `cost` times its costs and,
+/// for trials 1-6, with other ORB parameters.
+fn rerun(
+    trial: usize,
+    t: &stats::Trial,
+    c: &TrialCtx,
+    cost: f64,
+    orb: Option<OrbParams>,
+) -> Result<Rerun, String> {
+    use bmv_trader::autopsy::Row;
+    use bmv_trader::momentum as mo;
+    use bmv_trader::swing as sw;
+    let (from, to) = t.period.split_once("..").ok_or("bad period")?;
     let opts = |strategy, trend, scan, buffer| Opts {
         fold_days: 21,
         seeds: 5,
@@ -1422,6 +1456,561 @@ fn trial_autopsy() -> Result<(), String> {
         },
         strategy,
     };
+    let (rows, trades, expectancy, gross, units): (
+        Vec<Row>,
+        usize,
+        f64,
+        Option<f64>,
+        &'static str,
+    ) = match trial {
+        1..=6 => {
+            let mut o = match trial {
+                1 => opts(Strategy::Orb, false, false, 0),
+                2 => opts(Strategy::Orb, true, false, 0),
+                3 => opts(Strategy::Orb, false, false, MARKETABLE_BUFFER_BPS),
+                4 => opts(Strategy::Gap, false, false, 0),
+                5 => opts(Strategy::Vwap, false, false, 0),
+                _ => opts(Strategy::Gap, false, true, 0),
+            };
+            if let Some(p) = orb.clone() {
+                o.orb = OrbParams {
+                    entry_buffer_bps: o.orb.entry_buffer_bps,
+                    ..p
+                };
+            }
+            let base = FillModel::default();
+            let model = FillModel {
+                slippage_cents: (base.slippage_cents as f64 * cost).round() as i64,
+                slippage_bps: (base.slippage_bps as f64 * cost).round() as i64,
+                ..base
+            };
+            let res = intraday_research(from, to, &c.watch, &o, model)?;
+            // the gross run only for the plain rerun the autopsy reads
+            let g = if cost == 1.0 && orb.is_none() {
+                let free = FillModel {
+                    slippage_cents: 0,
+                    slippage_bps: 0,
+                    ..base
+                };
+                Some(
+                    backtest::summarize(&intraday_research(from, to, &c.watch, &o, free)?)
+                        .expectancy_r,
+                )
+            } else {
+                None
+            };
+            let s = backtest::summarize(&res);
+            let rows = res
+                .iter()
+                .flat_map(|d| &d.trades)
+                .map(|tr| Row {
+                    date: tr.date.clone(),
+                    net: tr.r_multiple(),
+                    exit: match tr.reason {
+                        backtest::ExitReason::Stop => "stop",
+                        backtest::ExitReason::Target => "target",
+                        backtest::ExitReason::Flatten => "flatten",
+                    },
+                    hold: None,
+                    up_market: regime_before(&c.reg, &tr.date),
+                })
+                .collect();
+            (rows, s.trades, s.expectancy_r, g, "R")
+        }
+        7 => {
+            no_params(orb)?;
+            let (cal, by_symbol) = trial7_months(&c.dir, &c.cut_date)?;
+            let st = mo::study_at_cost(&by_symbol, &cal, &c.cut_date, mo::COST_PER_SIDE * cost)?;
+            let rows = st
+                .dates
+                .iter()
+                .zip(&st.strategy)
+                .map(|(d, r)| Row {
+                    date: d.clone(),
+                    net: *r,
+                    exit: "month",
+                    hold: None,
+                    up_market: regime_before(&c.reg, d),
+                })
+                .collect();
+            (
+                rows,
+                st.strategy.len() * mo::HOLD,
+                mo::mean(&st.strategy),
+                None,
+                "monthly return",
+            )
+        }
+        8 | 9 => {
+            no_params(orb)?;
+            let rules = if trial == 8 { sw::TRIAL_8 } else { sw::TRIAL_9 };
+            let (cal, names, days, start, cut) = swing_days(&c.dir, &rules, &c.cut_date)?;
+            let (taken, _) = sw::portfolio(&days, &names, start, cut);
+            let cost_r = |o: &sw::Outcome| 2.0 * sw::COST_PER_SIDE / o.stop_fraction.max(1e-9);
+            let rows: Vec<Row> = taken
+                .iter()
+                .map(|tk| {
+                    let o = &tk.out;
+                    let g = o.r + cost_r(o);
+                    let date = cal.sessions[o.entry].clone();
+                    Row {
+                        up_market: regime_before(&c.reg, &date),
+                        date,
+                        // a cost shock adds (cost - 1) more of the round trip's cost
+                        // shortcut: cost_r prices both sides at the entry price; rerun sw::portfolio at the shocked cost if a swing trial ever nears the bar
+                        net: o.r - (cost - 1.0) * cost_r(o),
+                        // shortcut: exit kind from the gross R (stop -1R, target +1.5R), approximate on gaps
+                        exit: if o.at_data_end {
+                            "data end"
+                        } else if g >= sw::TARGET_ATR / sw::STOP_ATR - 0.01 {
+                            "target"
+                        } else if g <= -0.99 {
+                            "stop"
+                        } else {
+                            "time"
+                        },
+                        hold: Some((o.exit - o.entry) as u32),
+                    }
+                })
+                .collect();
+            let gross = mo::mean(
+                &taken
+                    .iter()
+                    .map(|tk| tk.out.r + cost_r(&tk.out))
+                    .collect::<Vec<_>>(),
+            );
+            let e = mo::mean(&rows.iter().map(|r| r.net).collect::<Vec<_>>());
+            (rows, taken.len(), e, Some(gross), "R")
+        }
+        11 => {
+            use bmv_trader::lab;
+            no_params(orb)?;
+            if cost != 1.0 {
+                return Err("trial 11 is a ranking score before costs".into());
+            }
+            let frozen: Vec<lab::Candidate> =
+                std::fs::read_to_string(c.dir.join("lab/frozen.jsonl"))
+                    .map_err(|e| format!("lab/frozen.jsonl: {e}"))?
+                    .lines()
+                    .map(serde_json::from_str)
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| format!("lab/frozen.jsonl: {e}"))?;
+            let (cal, panel) = lab_panel(&c.dir, lab::VALIDATION_END)?;
+            let months = panel.range(&cal, lab::SEARCH_END, lab::VALIDATION_END);
+            // the pick the trial logged: the best IC bound
+            let best = frozen
+                .iter()
+                .filter_map(|c| {
+                    let s = lab::evaluate(&c.expr, &panel, &months)?;
+                    Some((c, lab::ic_bound(&s.ics, lab::TRIAL_11_NUMBER), s))
+                })
+                .max_by(|a, b| a.1.unwrap_or(f64::MIN).total_cmp(&b.1.unwrap_or(f64::MIN)))
+                .ok_or("no frozen picks")?;
+            let mut prev = Vec::new();
+            let mut rows = Vec::new();
+            for &k in &months {
+                if let Some(m) = lab::score_month(&best.0.expr, &panel.months[k], &prev) {
+                    if let Some(ic) = m.ic {
+                        rows.push(Row {
+                            date: panel.dates[k].clone(),
+                            net: ic,
+                            exit: "month",
+                            hold: None,
+                            up_market: regime_before(&c.reg, &panel.dates[k]),
+                        });
+                    }
+                    prev = m.top;
+                }
+            }
+            (
+                rows,
+                months.len() * lab::HOLD,
+                best.2.ic_mean,
+                None,
+                "monthly IC",
+            )
+        }
+        other => {
+            return Err(format!(
+                "trial {other} has no autopsy (10 and 12 wait for their verdicts)"
+            ));
+        }
+    };
+    Ok(Rerun {
+        rows,
+        trades,
+        expectancy,
+        gross,
+        units,
+    })
+}
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A fingerprint of the market data the trials read: every file's path and size, hashed. A
+/// re-downloaded or edited file changes it.
+// shortcut: sizes, not contents (64k files); hash contents if a same-size edit ever matters
+fn data_fingerprint(dir: &Path) -> Result<String, String> {
+    fn walk(root: &Path, at: &Path, out: &mut Vec<String>) -> Result<(), String> {
+        let mut entries: Vec<_> = std::fs::read_dir(at)
+            .map_err(|e| format!("{}: {e}", at.display()))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("{}: {e}", at.display()))?;
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let meta = e.metadata().map_err(|err| err.to_string())?;
+            if meta.is_dir() {
+                walk(root, &e.path(), out)?;
+            } else {
+                let rel = e.path();
+                let rel = rel.strip_prefix(root).unwrap_or(&rel).display().to_string();
+                out.push(format!("{rel}\t{}", meta.len()));
+            }
+        }
+        Ok(())
+    }
+    let mut lines = Vec::new();
+    for sub in ["history", "daily", "scan", "lab", "holdout_from"] {
+        let p = dir.join(sub);
+        if p.is_dir() {
+            walk(dir, &p, &mut lines)?;
+        } else if let Ok(m) = std::fs::metadata(&p) {
+            lines.push(format!("{sub}\t{}", m.len()));
+        }
+    }
+    Ok(sha256_hex(&lines.join("\n")))
+}
+
+/// The results of a run, as a hash: every row's date, exact value and exit.
+fn results_hash(rows: &[bmv_trader::autopsy::Row]) -> String {
+    let text: Vec<String> = rows
+        .iter()
+        .map(|r| format!("{}|{:016x}|{}", r.date, r.net.to_bits(), r.exit))
+        .collect();
+    sha256_hex(&text.join("\n"))
+}
+
+/// Each ORB number at 80% and 120%, one at a time (integers rounded, never below 1).
+fn orb_neighbours(p: &OrbParams) -> Vec<(String, OrbParams)> {
+    let i = |v: i64, f: f64| ((v as f64 * f).round() as i64).max(1);
+    let u = |v: usize, f: f64| ((v as f64 * f).round() as usize).max(1);
+    let mut out = Vec::new();
+    for f in [0.8, 1.2] {
+        let tag = |name: &str| format!("{name} x{f}");
+        out.push((
+            tag("or_minutes"),
+            OrbParams {
+                or_minutes: i(p.or_minutes, f),
+                ..p.clone()
+            },
+        ));
+        out.push((
+            tag("min_or_bars"),
+            OrbParams {
+                min_or_bars: u(p.min_or_bars, f),
+                ..p.clone()
+            },
+        ));
+        out.push((
+            tag("atr_len"),
+            OrbParams {
+                atr_len: u(p.atr_len, f),
+                ..p.clone()
+            },
+        ));
+        out.push((
+            tag("atr_mult"),
+            OrbParams {
+                atr_mult: p.atr_mult * f,
+                ..p.clone()
+            },
+        ));
+        out.push((
+            tag("target_r"),
+            OrbParams {
+                target_r: p.target_r * f,
+                ..p.clone()
+            },
+        ));
+        out.push((
+            tag("min_r_frac"),
+            OrbParams {
+                min_r_frac: p.min_r_frac * f,
+                ..p.clone()
+            },
+        ));
+        out.push((
+            tag("min_r_cents"),
+            OrbParams {
+                min_r_cents: i(p.min_r_cents, f),
+                ..p.clone()
+            },
+        ));
+    }
+    out
+}
+
+/// `bmv-trader stress-battery` (build step 3, DESIGN §4c): every finished trial reproduced twice,
+/// with input and result hashes, then put through the owner's stress tests and judged on the bars
+/// in `stress.rs`. Written to data/stress.jsonl. Nothing here trades or calls a model.
+fn stress_battery() -> Result<(), String> {
+    use bmv_trader::stress::{self, Check};
+    let (home, dir) = (config::home()?, data_dir()?);
+    let logged: Vec<stats::Trial> = std::fs::read_to_string(dir.join("trials.jsonl"))
+        .map_err(|e| format!("trials.jsonl: {e}"))?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("trials.jsonl: {e}"))?;
+    let curated: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(home.join("docs/lessons.json"))
+            .map_err(|e| format!("docs/lessons.json: {e}"))?,
+    )
+    .map_err(|e| format!("docs/lessons.json: {e}"))?;
+    let ctx = trial_ctx()?;
+    let data = data_fingerprint(&dir)?;
+    eprintln!("data fingerprint {}", &data[..16]);
+
+    struct Done {
+        trial: usize,
+        name: String,
+        units: &'static str,
+        net: Vec<f64>,
+        value: serde_json::Value,
+        checks: Vec<Check>,
+    }
+    let mut done = Vec::new();
+    for c in &curated {
+        let trial = c["trial"].as_u64().unwrap_or(0) as usize;
+        let row = c["log_row"].as_u64().unwrap_or(0) as usize;
+        let t = logged
+            .get(row.wrapping_sub(1))
+            .ok_or_else(|| format!("trial {trial}: no row {row} in trials.jsonl"))?;
+        eprintln!("trial {trial} ({}): reproducing twice", t.strategy);
+        let a = rerun(trial, t, &ctx, 1.0, None)?;
+        let b = rerun(trial, t, &ctx, 1.0, None)?;
+        let inputs = sha256_hex(
+            &serde_json::json!({"trial": trial, "strategy": t.strategy, "params": t.params,
+                                "period": t.period, "cost": 1.0, "data": data})
+            .to_string(),
+        );
+        let (ha, hb) = (results_hash(&a.rows), results_hash(&b.rows));
+        let matches_log = a.trades == t.trades && (a.expectancy - t.expectancy_r).abs() < 1e-9;
+        let reproduces = ha == hb && matches_log;
+        let net: Vec<f64> = a.rows.iter().map(|r| r.net).collect();
+        let mut checks = vec![Check {
+            test: "reproduces",
+            passed: Some(reproduces),
+            detail: if reproduces {
+                format!(
+                    "two runs, same results hash; matches the log ({} trades)",
+                    t.trades
+                )
+            } else if ha != hb {
+                "two runs gave different results".into()
+            } else {
+                format!(
+                    "logged {} trades {:+.4}, rerun {} trades {:+.4}",
+                    t.trades, t.expectancy_r, a.trades, a.expectancy
+                )
+            },
+        }];
+
+        let mc = stress::monte_carlo(&net, stress::MC_DRAWS, stress::MC_SEED);
+        checks.push(Check {
+            test: "monte carlo",
+            passed: mc.as_ref().map(|m| m.p5_mean > stress::MC_P5_MIN),
+            detail: mc.as_ref().map_or("no results".into(), |m| {
+                format!(
+                    "5th percentile {:+.4} {}, {:.0}% of resamples below 0",
+                    m.p5_mean,
+                    a.units,
+                    m.p_negative * 100.0
+                )
+            }),
+        });
+
+        eprintln!("trial {trial}: cost shocks");
+        let mut shocks = Vec::new();
+        for k in [2.0, 3.0] {
+            shocks.push((k, rerun(trial, t, &ctx, k, None).map(|r| r.expectancy)));
+        }
+        let at_double = shocks
+            .iter()
+            .find(|s| s.0 == stress::COST_SHOCK)
+            .map(|s| &s.1);
+        checks.push(Check {
+            test: "cost x2",
+            passed: at_double.and_then(|r| r.as_ref().ok()).map(|e| *e > 0.0),
+            detail: shocks
+                .iter()
+                .map(|(k, r)| match r {
+                    Ok(e) => format!("x{k}: {e:+.4}"),
+                    Err(e) => format!("x{k}: not run ({e})"),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        });
+
+        let neighbours: Vec<(String, Result<f64, String>)> = if (1..=6).contains(&trial) {
+            eprintln!("trial {trial}: 14 parameter neighbours");
+            orb_neighbours(&OrbParams::default())
+                .into_iter()
+                .map(|(name, p)| {
+                    (
+                        name,
+                        rerun(trial, t, &ctx, 1.0, Some(p)).map(|r| r.expectancy),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let ran: Vec<f64> = neighbours
+            .iter()
+            .filter_map(|n| n.1.as_ref().ok().copied())
+            .collect();
+        let same = ran
+            .iter()
+            .filter(|e| e.signum() == a.expectancy.signum())
+            .count();
+        checks.push(Check {
+            test: "parameters ±20%",
+            passed: (!ran.is_empty() && ran.len() == neighbours.len())
+                .then(|| same as f64 / ran.len() as f64 >= stress::NEIGHBOUR_SHARE),
+            detail: if neighbours.is_empty() {
+                "not tested: this trial's parameters are compiled constants".into()
+            } else {
+                format!("{same} of {} neighbours keep the sign", neighbours.len())
+            },
+        });
+
+        let years = stress::by_year(&a.rows);
+        let positive = years.iter().filter(|y| y.mean > 0.0).count();
+        checks.push(Check {
+            test: "by year",
+            passed: (!years.is_empty())
+                .then(|| positive as f64 / years.len() as f64 >= stress::YEAR_SHARE),
+            detail: format!("{positive} of {} years positive", years.len()),
+        });
+        let regimes = stress::by_regime(&a.rows);
+
+        let value = serde_json::json!({
+            "trial": trial,
+            "name": t.strategy,
+            "period": t.period,
+            "units": a.units,
+            "inputs_hash": inputs,
+            "results_hash": ha,
+            "trades": a.trades,
+            "expectancy": a.expectancy,
+            "monte_carlo": mc,
+            "cost_shocks": shocks.iter().map(|(k, r)| serde_json::json!({"x": k, "expectancy": r.as_ref().ok(), "error": r.as_ref().err()})).collect::<Vec<_>>(),
+            "neighbours": neighbours.iter().map(|(n, r)| serde_json::json!({"change": n, "expectancy": r.as_ref().ok(), "error": r.as_ref().err()})).collect::<Vec<_>>(),
+            "years": years,
+            "regimes": regimes,
+        });
+        done.push(Done {
+            trial,
+            name: t.strategy.clone(),
+            units: a.units,
+            net,
+            value,
+            checks,
+        });
+    }
+
+    // deflated Sharpe: each trial against the best of every registered trial by luck alone
+    let sharpes: Vec<f64> = done
+        .iter()
+        .filter_map(|d| stress::moments(&d.net).map(|m| m.0))
+        .collect();
+    let mean_sr = sharpes.iter().sum::<f64>() / sharpes.len().max(1) as f64;
+    let var_sr = sharpes.iter().map(|s| (s - mean_sr).powi(2)).sum::<f64>()
+        / (sharpes.len().max(2) - 1) as f64;
+    // trial 12 is registered too, though its verdict waits
+    let tried = logged
+        .len()
+        .max(done.iter().map(|d| d.trial).max().unwrap_or(0))
+        + 1;
+    let mut out = Vec::new();
+    println!("trial  name                            verdict  tests");
+    for mut d in done {
+        let dsr = stress::moments(&d.net).map(|(sr, skew, kurt)| {
+            stress::deflated_sharpe(sr, d.net.len(), skew, kurt, tried, var_sr)
+        });
+        d.checks.push(Check {
+            test: "deflated sharpe",
+            passed: dsr.map(|p| p > stress::DSR_MIN),
+            detail: dsr.map_or("too few results".into(), |p| {
+                format!("{p:.3} against {tried} trials (bar {})", stress::DSR_MIN)
+            }),
+        });
+        let pass = stress::verdict(&d.checks);
+        let marks: Vec<String> = d
+            .checks
+            .iter()
+            .map(|c| {
+                format!(
+                    "{} {}",
+                    match c.passed {
+                        Some(true) => "✓",
+                        Some(false) => "✗",
+                        None => "–",
+                    },
+                    c.test
+                )
+            })
+            .collect();
+        println!(
+            "{:>5}  {:<30}  {:<7}  {}",
+            d.trial,
+            d.name,
+            if pass { "PASS" } else { "FAIL" },
+            marks.join(", ")
+        );
+        for c in &d.checks {
+            println!("         {}: {}", c.test, c.detail);
+        }
+        let mut v = d.value;
+        v["units"] = d.units.into();
+        v["checks"] = serde_json::to_value(&d.checks).map_err(|e| e.to_string())?;
+        v["verdict"] = if pass { "PASS" } else { "FAIL" }.into();
+        out.push(v);
+    }
+    let path = dir.join("stress.jsonl");
+    let tmp = dir.join("stress.jsonl.tmp");
+    let text: String = out.iter().map(|v| format!("{v}\n")).collect();
+    std::fs::write(&tmp, text)
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+/// `bmv-trader trial-autopsy` (DESIGN §13d, DECISION S27): every finished trial, reproduced from its
+/// own code path and options, then broken down; written to data/lessons.jsonl.
+fn trial_autopsy() -> Result<(), String> {
+    use bmv_trader::autopsy;
+    let (home, dir) = (config::home()?, data_dir()?);
+    let logged: Vec<stats::Trial> = std::fs::read_to_string(dir.join("trials.jsonl"))
+        .map_err(|e| format!("trials.jsonl: {e}"))?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("trials.jsonl: {e}"))?;
+    let curated: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(home.join("docs/lessons.json"))
+            .map_err(|e| format!("docs/lessons.json: {e}"))?,
+    )
+    .map_err(|e| format!("docs/lessons.json: {e}"))?;
+    let ctx = trial_ctx()?;
     // (trial, log row, units)
     let mut out = Vec::new();
     for c in &curated {
@@ -1430,157 +2019,14 @@ fn trial_autopsy() -> Result<(), String> {
         let Some(t) = logged.get(row.wrapping_sub(1)) else {
             return Err(format!("trial {trial}: no row {row} in trials.jsonl"));
         };
-        let (from, to) = t.period.split_once("..").ok_or("bad period")?;
         eprintln!("trial {trial} ({}): rerunning {}", t.strategy, t.period);
-        let (rows, trades, expectancy, gross, units): (Vec<Row>, usize, f64, Option<f64>, &str) =
-            match trial {
-                1..=6 => {
-                    let o = match trial {
-                        1 => opts(Strategy::Orb, false, false, 0),
-                        2 => opts(Strategy::Orb, true, false, 0),
-                        3 => opts(Strategy::Orb, false, false, MARKETABLE_BUFFER_BPS),
-                        4 => opts(Strategy::Gap, false, false, 0),
-                        5 => opts(Strategy::Vwap, false, false, 0),
-                        _ => opts(Strategy::Gap, false, true, 0),
-                    };
-                    let res = intraday_research(from, to, &watch, &o, FillModel::default())?;
-                    let free = FillModel {
-                        slippage_cents: 0,
-                        slippage_bps: 0,
-                        ..FillModel::default()
-                    };
-                    let g = backtest::summarize(&intraday_research(from, to, &watch, &o, free)?)
-                        .expectancy_r;
-                    let s = backtest::summarize(&res);
-                    let rows = res
-                        .iter()
-                        .flat_map(|d| &d.trades)
-                        .map(|tr| Row {
-                            date: tr.date.clone(),
-                            net: tr.r_multiple(),
-                            exit: match tr.reason {
-                                backtest::ExitReason::Stop => "stop",
-                                backtest::ExitReason::Target => "target",
-                                backtest::ExitReason::Flatten => "flatten",
-                            },
-                            hold: None,
-                            up_market: regime_before(&reg, &tr.date),
-                        })
-                        .collect();
-                    (rows, s.trades, s.expectancy_r, Some(g), "R")
-                }
-                7 => {
-                    let (cal, by_symbol) = trial7_months(&dir, &cut_date)?;
-                    let st = mo::study(&by_symbol, &cal, &cut_date)?;
-                    let rows = st
-                        .dates
-                        .iter()
-                        .zip(&st.strategy)
-                        .map(|(d, r)| Row {
-                            date: d.clone(),
-                            net: *r,
-                            exit: "month",
-                            hold: None,
-                            up_market: regime_before(&reg, d),
-                        })
-                        .collect();
-                    (
-                        rows,
-                        st.strategy.len() * mo::HOLD,
-                        mo::mean(&st.strategy),
-                        None,
-                        "monthly return",
-                    )
-                }
-                8 | 9 => {
-                    let rules = if trial == 8 { sw::TRIAL_8 } else { sw::TRIAL_9 };
-                    let (cal, names, days, start, cut) = swing_days(&dir, &rules, &cut_date)?;
-                    let (taken, _) = sw::portfolio(&days, &names, start, cut);
-                    let cost_r =
-                        |o: &sw::Outcome| 2.0 * sw::COST_PER_SIDE / o.stop_fraction.max(1e-9);
-                    let rows: Vec<Row> = taken
-                        .iter()
-                        .map(|tk| {
-                            let o = &tk.out;
-                            let g = o.r + cost_r(o);
-                            let date = cal.sessions[o.entry].clone();
-                            Row {
-                                up_market: regime_before(&reg, &date),
-                                date,
-                                net: o.r,
-                                // shortcut: exit kind from the gross R (stop -1R, target +1.5R), approximate on gaps
-                                exit: if o.at_data_end {
-                                    "data end"
-                                } else if g >= sw::TARGET_ATR / sw::STOP_ATR - 0.01 {
-                                    "target"
-                                } else if g <= -0.99 {
-                                    "stop"
-                                } else {
-                                    "time"
-                                },
-                                hold: Some((o.exit - o.entry) as u32),
-                            }
-                        })
-                        .collect();
-                    let gross = mo::mean(
-                        &taken
-                            .iter()
-                            .map(|tk| tk.out.r + cost_r(&tk.out))
-                            .collect::<Vec<_>>(),
-                    );
-                    let e = mo::mean(&taken.iter().map(|tk| tk.out.r).collect::<Vec<_>>());
-                    (rows, taken.len(), e, Some(gross), "R")
-                }
-                11 => {
-                    use bmv_trader::lab;
-                    let frozen: Vec<lab::Candidate> =
-                        std::fs::read_to_string(dir.join("lab/frozen.jsonl"))
-                            .map_err(|e| format!("lab/frozen.jsonl: {e}"))?
-                            .lines()
-                            .map(serde_json::from_str)
-                            .collect::<Result<_, _>>()
-                            .map_err(|e| format!("lab/frozen.jsonl: {e}"))?;
-                    let (cal, panel) = lab_panel(&dir, lab::VALIDATION_END)?;
-                    let months = panel.range(&cal, lab::SEARCH_END, lab::VALIDATION_END);
-                    // the pick the trial logged: the best IC bound
-                    let best = frozen
-                        .iter()
-                        .filter_map(|c| {
-                            let s = lab::evaluate(&c.expr, &panel, &months)?;
-                            Some((c, lab::ic_bound(&s.ics, lab::TRIAL_11_NUMBER), s))
-                        })
-                        .max_by(|a, b| a.1.unwrap_or(f64::MIN).total_cmp(&b.1.unwrap_or(f64::MIN)))
-                        .ok_or("no frozen picks")?;
-                    let mut prev = Vec::new();
-                    let mut rows = Vec::new();
-                    for &k in &months {
-                        if let Some(m) = lab::score_month(&best.0.expr, &panel.months[k], &prev) {
-                            if let Some(ic) = m.ic {
-                                rows.push(Row {
-                                    date: panel.dates[k].clone(),
-                                    net: ic,
-                                    exit: "month",
-                                    hold: None,
-                                    up_market: regime_before(&reg, &panel.dates[k]),
-                                });
-                            }
-                            prev = m.top;
-                        }
-                    }
-                    (
-                        rows,
-                        months.len() * lab::HOLD,
-                        best.2.ic_mean,
-                        None,
-                        "monthly IC",
-                    )
-                }
-                other => {
-                    return Err(format!(
-                        "trial {other} has no autopsy (10 and 12 wait for their verdicts)"
-                    ));
-                }
-            };
+        let Rerun {
+            rows,
+            trades,
+            expectancy,
+            gross,
+            units,
+        } = rerun(trial, t, &ctx, 1.0, None)?;
         let reproduces = trades == t.trades && (expectancy - t.expectancy_r).abs() < 1e-9;
         let a = autopsy::autopsy(&rows, gross);
         println!(

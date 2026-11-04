@@ -168,9 +168,12 @@ async fn backtest(
     Json(b): Json<Backtest>,
 ) -> Reply {
     let agent = caller(&s, &h).await?;
-    s.record_backtest(&agent, id, b.official, &b.inputs_hash, &b.results_hash)
+    let reproduces = s
+        .record_backtest(&agent, id, b.official, &b.inputs_hash, &b.results_hash)
         .await?;
-    Ok(Json(json!({"ok": true})))
+    Ok(Json(
+        json!({"reproduces": reproduces, "state": s.state(id).await?.as_str()}),
+    ))
 }
 
 #[derive(Deserialize)]
