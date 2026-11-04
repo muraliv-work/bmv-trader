@@ -344,6 +344,20 @@ On a half-day (close at 13:00), all of this shifts automatically.
   - **Cut:** trades still open at the cut take a slot but aren't counted, so a few long holds near the cut drop out (about 10 sessions' worth).
 - **One run, logged once.** Any changed number is a new trial.
 
+## 7e. Trial 9: Desk Signal on volatile stocks (pre-registered 2026-11-03, before any data or code)
+
+Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs trended, fired signals, and their tiny stops turned costs into several R a trade (DECISION R2i). This trial keeps **every trial 8 rule and convention (§7d)** and adds two, fixed before looking at anything:
+
+- **Volatility floor:** ATR(14) at the signal close is at least **1.5% of the close**. It applies to both the signal and the random-baseline pool.
+- **Stocks only:** a symbol is excluded when its Alpaca asset name, case-insensitive, contains any of these:
+  - the whole words `ETF`, `ETN`, `ETNs` or `Fund`
+  - `iShares`, `ProShares`, `Direxion`, `Exchange-Traded` or `Exchange Traded`
+  - the whole word `SPDR`
+
+  The names are fetched once into `data/daily/asset_names.json` for the existing universe list; `universe.json` is unchanged. A symbol with no name is kept. A fund named without those words, such as "Invesco QQQ Trust", still passes. That residue is a known limit.
+- **Unchanged:** the period, holdout, costs, exits, portfolio limits, baseline and gate (§7d). The gate is Bonferroni over **9 trials** (99.444%).
+- **One run, logged once** as `swing desk-signal vol-stocks`.
+
 ## 8. Decision pipeline (one candidate)
 
 1. **Strategy** emits a `Candidate`, which is journaled.
