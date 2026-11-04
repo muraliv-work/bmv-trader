@@ -83,8 +83,15 @@
     <ol id="journal" class="journal" reversed></ol>
   </section>
 
+  <section class="card" aria-labelledby="h-lessons">
+    <h2 id="h-lessons">Lessons</h2>
+    <p class="note">Where each finished trial lost, and what it led to. From <code>bmv-trader trial-autopsy</code>, which re-runs each trial and checks it reproduces before breaking it down.</p>
+    <div class="scroll"><table class="lessons"><thead><tr><th>Trial</th><th class="n">Result</th><th>Where it lost</th><th>Lesson</th><th>Led to</th></tr></thead>
+    <tbody id="lessons"></tbody></table></div>
+  </section>
+
   <section class="card" aria-labelledby="h-trials">
-    <h2 id="h-trials">Research trials</h2>
+    <h2 id="h-trials">Trial log</h2>
     <div class="scroll"><table><thead><tr><th>Trial</th><th>Period</th><th class="n">Trades</th>
       <th class="n">Expectancy</th><th class="n">CI low</th><th class="n">Profit factor</th></tr></thead>
     <tbody id="trials"></tbody></table></div>

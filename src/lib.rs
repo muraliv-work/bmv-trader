@@ -1,5 +1,6 @@
 //! bmv-trader core: shared by the CLI, the backtester and the live engine.
 
+pub mod autopsy;
 pub mod backtest;
 pub mod broker;
 pub mod config;

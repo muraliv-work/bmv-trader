@@ -69,8 +69,8 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 
 ## Lessons layer (DESIGN §13d, DECISION S27)
 - [x] Rules, plus curated lessons for trials 1–9 and 11 (`docs/lessons.json`)
-- [ ] `trial-autopsy`: reproduce each trial, break it down, write `data/lessons.jsonl`
-- [ ] Console Lessons card
+- [x] `trial-autopsy`: all 10 finished trials reproduce exactly; breakdowns in `data/lessons.jsonl`
+- [x] Console Lessons card
 
 ## P5 — Live pilot
 - [ ] ⛔ Mac mini, phone approvals, live limits, 30 live days

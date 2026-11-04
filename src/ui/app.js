@@ -323,7 +323,51 @@ for (const b of document.querySelectorAll(".ranges button")) {
   });
 }
 
+const fmt = (x, units) => units === "R" ? `${x >= 0 ? "+" : ""}${x.toFixed(3)}R`
+  : units === "monthly IC" ? `IC ${x.toFixed(3)}` : `${x >= 0 ? "+" : ""}${(x * 100).toFixed(2)}%/mo`;
+
+function renderLessons(list) {
+  const tb = $("lessons");
+  tb.replaceChildren();
+  for (const l of list) {
+    const tr = el("tr");
+    const name = el("td");
+    name.append(el("strong", `${l.trial}`), document.createTextNode(` ${l.name}`), el("div", l.period, "years"));
+    const result = el("td", undefined, "n");
+    if (!l.reproduces) {
+      result.append(el("span", "doesn't reproduce", "badge down"));
+    } else {
+      const a = l.autopsy;
+      result.append(el("div", fmt(a.net, l.units), a.net > 0 ? "pos" : "neg"));
+      if (a.gross !== null && a.gross !== undefined) result.append(el("div", `before costs ${fmt(a.gross, l.units)}`, "years"));
+    }
+    const lost = el("td");
+    if (l.reproduces) {
+      const flags = el("div", undefined, "flags");
+      for (const f of l.autopsy.flags) flags.append(el("span", f.split(":")[0], "badge down"));
+      if (!l.autopsy.flags.length) flags.append(el("span", "no single cause", "badge"));
+      lost.append(flags);
+      const years = Object.entries(l.autopsy.by_year).map(([y, g]) => `${y} ${fmt(g.mean, l.units)}`).join("  ");
+      lost.append(el("div", years, "years"));
+    }
+    tr.append(name, result, lost, el("td", l.lesson ?? ""), el("td", `${l.next ?? ""} (trial ${l.acted_on_by ?? "open"})`));
+    tb.append(tr);
+  }
+  if (!list.length) tb.append(el("tr", undefined, "empty"));
+}
+
 async function slowPoll() {
+  api("/api/lessons").then((r) => {
+    if (r.ok) renderLessons(r.body);
+    else {
+      const tb = $("lessons");
+      const tr = el("tr", undefined, "empty");
+      const td = el("td", r.body.message);
+      td.colSpan = 5;
+      tr.append(td);
+      tb.replaceChildren(tr);
+    }
+  }).catch(() => {});
   try {
     const [d, e] = await Promise.all([api("/api/desk"), api("/api/equity")]);
     if (d.ok) renderDesk(d.body);

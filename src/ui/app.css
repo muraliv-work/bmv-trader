@@ -101,6 +101,10 @@ h3 { font-size: 1rem; margin: 0 0 0.4rem; }
 .badge.down { background: rgb(255 104 95 / 0.16); color: var(--danger); }
 
 .scroll { overflow-x: auto; }
+.lessons td { white-space: normal; vertical-align: top; }
+.lessons td:first-child, .lessons td.n { white-space: nowrap; }
+.lessons .flags { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.lessons .years { color: var(--muted); font-size: 0.85rem; margin-top: 0.3rem; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 0.5rem 0.75rem 0.5rem 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
 th { color: var(--muted); font-weight: 500; font-size: 0.85rem; }

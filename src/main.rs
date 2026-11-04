@@ -21,6 +21,7 @@ const USAGE: &str = "usage:
   bmv-trader momentum                     trial 7: 12-1 month momentum on the adjusted daily bars (DESIGN §13c)
   bmv-trader power                        the smallest effect trials 11 and 12 could detect (spreads from trial 7)
   bmv-trader lab-search [--minutes 5] [--seed 1]  evolve ranking formulas on the search months only (DESIGN §7h)
+  bmv-trader trial-autopsy                every finished trial, reproduced and broken down: data/lessons.jsonl (DESIGN §13d)
   bmv-trader retro-power                  trial 12's power gate: research-period signals only (DESIGN §7i)
   bmv-trader retro-sample                 trial 12: freeze each untouched-year session's top signal (once)
   bmv-trader retro-speed [--count 3]      the local analyst on 2024 signals: minutes per run (outcomes unused)
@@ -190,6 +191,7 @@ fn main() {
             Some("power") => power(),
             Some("lab-validate") => lab_validate(),
             Some("retro-power") => retro_power(),
+            Some("trial-autopsy") => trial_autopsy(),
             Some("retro-sample") => retro_sample(),
             Some("retro-speed") => retro_speed(args.num("--count", 3, 1..=20)?),
             Some("retro-run") => retro_run(args.num("--hours", 8, 1..=72)?),
@@ -1347,6 +1349,280 @@ fn retro_verdict() -> Result<(), String> {
             "trial 12 failed"
         }
     );
+    Ok(())
+}
+
+/// The intraday trials' research-period results, rerun exactly as logged (DESIGN §13d). Nothing is
+/// logged; the holdout split is the same as `run_backtest`'s, so holdout days are never run.
+fn intraday_research(
+    from: &str,
+    to: &str,
+    symbols: &[String],
+    o: &Opts,
+    model: FillModel,
+) -> Result<Vec<DayResult>, String> {
+    let dir = data_dir()?;
+    let days = if o.scan {
+        bmv_trader::scan::load_scan_range(&dir, from, to)?
+    } else {
+        history::load_range(&dir, symbols, from, to)?
+    };
+    let dates: Vec<&str> = days.iter().map(|d| d.date.as_str()).collect();
+    let cut_date = holdout_from(&dir, &dates)?;
+    let cut = days.partition_point(|d| d.date < cut_date);
+    let settings = Settings {
+        vetting: false,
+        orb: o.orb.clone(),
+        entry: o.strategy.entry(),
+        trend_filter: o.trend,
+    };
+    backtest::run(&days[..cut], settings, model)
+}
+
+/// The SPY regime of the last session before `date` (the signal day, never the trade's own).
+fn regime_before(reg: &BTreeMap<String, bool>, date: &str) -> Option<bool> {
+    reg.range(..date.to_string()).next_back().map(|(_, u)| *u)
+}
+
+/// `bmv-trader trial-autopsy` (DESIGN §13d, DECISION S27): every finished trial, reproduced from its
+/// own code path and options, then broken down; written to data/lessons.jsonl.
+fn trial_autopsy() -> Result<(), String> {
+    use bmv_trader::autopsy::{self, Row};
+    use bmv_trader::momentum as mo;
+    use bmv_trader::scan::ADJUSTED_SIP;
+    use bmv_trader::swing as sw;
+    let (home, dir) = (config::home()?, data_dir()?);
+    let logged: Vec<stats::Trial> = std::fs::read_to_string(dir.join("trials.jsonl"))
+        .map_err(|e| format!("trials.jsonl: {e}"))?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("trials.jsonl: {e}"))?;
+    let curated: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(home.join("docs/lessons.json"))
+            .map_err(|e| format!("docs/lessons.json: {e}"))?,
+    )
+    .map_err(|e| format!("docs/lessons.json: {e}"))?;
+    let cut_date = holdout_from(&dir, &[])?;
+    let spy = bmv_trader::scan::read_daily(&dir, ADJUSTED_SIP, mo::BENCHMARK)?;
+    let reg = autopsy::spy_regime(&spy);
+    let watch: Vec<String> = WATCHLIST.split(',').map(str::to_string).collect();
+    let opts = |strategy, trend, scan, buffer| Opts {
+        fold_days: 21,
+        seeds: 5,
+        holdout: false,
+        holdout_again: false,
+        trend,
+        scan,
+        symbols_given: false,
+        orb: OrbParams {
+            entry_buffer_bps: buffer,
+            ..OrbParams::default()
+        },
+        strategy,
+    };
+    // (trial, log row, units)
+    let mut out = Vec::new();
+    for c in &curated {
+        let trial = c["trial"].as_u64().unwrap_or(0) as usize;
+        let row = c["log_row"].as_u64().unwrap_or(0) as usize;
+        let Some(t) = logged.get(row.wrapping_sub(1)) else {
+            return Err(format!("trial {trial}: no row {row} in trials.jsonl"));
+        };
+        let (from, to) = t.period.split_once("..").ok_or("bad period")?;
+        eprintln!("trial {trial} ({}): rerunning {}", t.strategy, t.period);
+        let (rows, trades, expectancy, gross, units): (Vec<Row>, usize, f64, Option<f64>, &str) =
+            match trial {
+                1..=6 => {
+                    let o = match trial {
+                        1 => opts(Strategy::Orb, false, false, 0),
+                        2 => opts(Strategy::Orb, true, false, 0),
+                        3 => opts(Strategy::Orb, false, false, MARKETABLE_BUFFER_BPS),
+                        4 => opts(Strategy::Gap, false, false, 0),
+                        5 => opts(Strategy::Vwap, false, false, 0),
+                        _ => opts(Strategy::Gap, false, true, 0),
+                    };
+                    let res = intraday_research(from, to, &watch, &o, FillModel::default())?;
+                    let free = FillModel {
+                        slippage_cents: 0,
+                        slippage_bps: 0,
+                        ..FillModel::default()
+                    };
+                    let g = backtest::summarize(&intraday_research(from, to, &watch, &o, free)?)
+                        .expectancy_r;
+                    let s = backtest::summarize(&res);
+                    let rows = res
+                        .iter()
+                        .flat_map(|d| &d.trades)
+                        .map(|tr| Row {
+                            date: tr.date.clone(),
+                            net: tr.r_multiple(),
+                            exit: match tr.reason {
+                                backtest::ExitReason::Stop => "stop",
+                                backtest::ExitReason::Target => "target",
+                                backtest::ExitReason::Flatten => "flatten",
+                            },
+                            hold: None,
+                            up_market: regime_before(&reg, &tr.date),
+                        })
+                        .collect();
+                    (rows, s.trades, s.expectancy_r, Some(g), "R")
+                }
+                7 => {
+                    let (cal, by_symbol) = trial7_months(&dir, &cut_date)?;
+                    let st = mo::study(&by_symbol, &cal, &cut_date)?;
+                    let rows = st
+                        .dates
+                        .iter()
+                        .zip(&st.strategy)
+                        .map(|(d, r)| Row {
+                            date: d.clone(),
+                            net: *r,
+                            exit: "month",
+                            hold: None,
+                            up_market: regime_before(&reg, d),
+                        })
+                        .collect();
+                    (
+                        rows,
+                        st.strategy.len() * mo::HOLD,
+                        mo::mean(&st.strategy),
+                        None,
+                        "monthly return",
+                    )
+                }
+                8 | 9 => {
+                    let rules = if trial == 8 { sw::TRIAL_8 } else { sw::TRIAL_9 };
+                    let (cal, names, days, start, cut) = swing_days(&dir, &rules, &cut_date)?;
+                    let (taken, _) = sw::portfolio(&days, &names, start, cut);
+                    let cost_r =
+                        |o: &sw::Outcome| 2.0 * sw::COST_PER_SIDE / o.stop_fraction.max(1e-9);
+                    let rows: Vec<Row> = taken
+                        .iter()
+                        .map(|tk| {
+                            let o = &tk.out;
+                            let g = o.r + cost_r(o);
+                            let date = cal.sessions[o.entry].clone();
+                            Row {
+                                up_market: regime_before(&reg, &date),
+                                date,
+                                net: o.r,
+                                // shortcut: exit kind from the gross R (stop -1R, target +1.5R), approximate on gaps
+                                exit: if o.at_data_end {
+                                    "data end"
+                                } else if g >= sw::TARGET_ATR / sw::STOP_ATR - 0.01 {
+                                    "target"
+                                } else if g <= -0.99 {
+                                    "stop"
+                                } else {
+                                    "time"
+                                },
+                                hold: Some((o.exit - o.entry) as u32),
+                            }
+                        })
+                        .collect();
+                    let gross = mo::mean(
+                        &taken
+                            .iter()
+                            .map(|tk| tk.out.r + cost_r(&tk.out))
+                            .collect::<Vec<_>>(),
+                    );
+                    let e = mo::mean(&taken.iter().map(|tk| tk.out.r).collect::<Vec<_>>());
+                    (rows, taken.len(), e, Some(gross), "R")
+                }
+                11 => {
+                    use bmv_trader::lab;
+                    let frozen: Vec<lab::Candidate> =
+                        std::fs::read_to_string(dir.join("lab/frozen.jsonl"))
+                            .map_err(|e| format!("lab/frozen.jsonl: {e}"))?
+                            .lines()
+                            .map(serde_json::from_str)
+                            .collect::<Result<_, _>>()
+                            .map_err(|e| format!("lab/frozen.jsonl: {e}"))?;
+                    let (cal, panel) = lab_panel(&dir, lab::VALIDATION_END)?;
+                    let months = panel.range(&cal, lab::SEARCH_END, lab::VALIDATION_END);
+                    // the pick the trial logged: the best IC bound
+                    let best = frozen
+                        .iter()
+                        .filter_map(|c| {
+                            let s = lab::evaluate(&c.expr, &panel, &months)?;
+                            Some((c, lab::ic_bound(&s.ics, lab::TRIAL_11_NUMBER), s))
+                        })
+                        .max_by(|a, b| a.1.unwrap_or(f64::MIN).total_cmp(&b.1.unwrap_or(f64::MIN)))
+                        .ok_or("no frozen picks")?;
+                    let mut prev = Vec::new();
+                    let mut rows = Vec::new();
+                    for &k in &months {
+                        if let Some(m) = lab::score_month(&best.0.expr, &panel.months[k], &prev) {
+                            if let Some(ic) = m.ic {
+                                rows.push(Row {
+                                    date: panel.dates[k].clone(),
+                                    net: ic,
+                                    exit: "month",
+                                    hold: None,
+                                    up_market: regime_before(&reg, &panel.dates[k]),
+                                });
+                            }
+                            prev = m.top;
+                        }
+                    }
+                    (
+                        rows,
+                        months.len() * lab::HOLD,
+                        best.2.ic_mean,
+                        None,
+                        "monthly IC",
+                    )
+                }
+                other => {
+                    return Err(format!(
+                        "trial {other} has no autopsy (10 and 12 wait for their verdicts)"
+                    ));
+                }
+            };
+        let reproduces = trades == t.trades && (expectancy - t.expectancy_r).abs() < 1e-9;
+        let a = autopsy::autopsy(&rows, gross);
+        println!(
+            "trial {trial:>2} {:<30} {} trades, {:+.3} {units}: {}",
+            t.strategy,
+            trades,
+            expectancy,
+            if reproduces {
+                "reproduces ✓".to_string()
+            } else {
+                format!(
+                    "DOES NOT REPRODUCE (logged {} trades, {:+.3})",
+                    t.trades, t.expectancy_r
+                )
+            }
+        );
+        if reproduces {
+            for f in &a.flags {
+                println!("      flag: {f}");
+            }
+        }
+        out.push(serde_json::json!({
+            "trial": trial,
+            "log_row": row,
+            "name": t.strategy,
+            "period": t.period,
+            "units": units,
+            "reproduces": reproduces,
+            "logged_trades": t.trades,
+            "logged_expectancy": t.expectancy_r,
+            "autopsy": if reproduces { serde_json::to_value(&a).map_err(|e| e.to_string())? } else { serde_json::Value::Null },
+            "lesson": c["lesson"],
+            "next": c["next"],
+            "acted_on_by": c["acted_on_by"],
+        }));
+    }
+    let path = dir.join("lessons.jsonl");
+    let tmp = dir.join("lessons.jsonl.tmp");
+    let text: String = out.iter().map(|v| format!("{v}\n")).collect();
+    std::fs::write(&tmp, text)
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    println!("wrote {} trials to {}", out.len(), path.display());
     Ok(())
 }
 

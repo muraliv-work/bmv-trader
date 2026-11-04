@@ -40,7 +40,7 @@ const RESEARCH_SECS: u64 = 60;
 pub const RUNNABLE: [&str; 3] = ["desk", "notes", "llm"];
 
 /// Every route there is. A test pins it, so a new control can't slip in unreviewed.
-pub const ROUTES: [(&str, &str); 14] = [
+pub const ROUTES: [(&str, &str); 15] = [
     ("GET", "/"),
     ("GET", "/help"),
     ("GET", "/services"),
@@ -52,6 +52,7 @@ pub const ROUTES: [(&str, &str); 14] = [
     ("GET", "/api/services"),
     ("GET", "/api/desk"),
     ("GET", "/api/equity"),
+    ("GET", "/api/lessons"),
     ("POST", "/api/stop"),
     ("POST", "/api/flatten"),
     ("POST", "/api/run"),
@@ -116,6 +117,8 @@ pub struct Ctx<'a> {
     pub desk: &'a (dyn Fn() -> Result<String, String> + Sync),
     /// Account equity and SPY, both scaled to 100, as JSON.
     pub equity: &'a (dyn Fn() -> Result<String, String> + Sync),
+    /// `data/lessons.jsonl` as a JSON array (DESIGN §13d).
+    pub lessons: &'a (dyn Fn() -> Result<String, String> + Sync),
     /// Start one of `RUNNABLE` through launchd; Ok is what to tell the user.
     pub kickstart: &'a (dyn Fn(&str) -> Result<String, String> + Sync),
 }
@@ -261,11 +264,12 @@ pub fn route(req: &Request, ctx: &Ctx) -> Response {
         );
     }
     match req.path.as_str() {
-        "/api/state" | "/api/services" | "/api/desk" | "/api/equity" => {
+        "/api/state" | "/api/services" | "/api/desk" | "/api/equity" | "/api/lessons" => {
             let read = match req.path.as_str() {
                 "/api/state" => ctx.state,
                 "/api/services" => ctx.services,
                 "/api/desk" => ctx.desk,
+                "/api/lessons" => ctx.lessons,
                 _ => ctx.equity,
             };
             match read() {
@@ -360,6 +364,20 @@ fn desk_json(home: &Path) -> Result<String, String> {
     let today = watch::today_et(chrono::Utc::now().timestamp());
     let p = desk::progress(home, &cal, &today)?;
     serde_json::to_string(&p).map_err(|e| format!("desk: {e}"))
+}
+
+/// The lessons file as one JSON array; small, so it's read per request.
+fn lessons_json(home: &Path) -> Result<String, String> {
+    let path = home.join("data").join("lessons.jsonl");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|_| "no lessons yet: run `bmv-trader trial-autopsy`".to_string())?;
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("lessons.jsonl: {e}"))?;
+    serde_json::to_string(&rows).map_err(|e| e.to_string())
 }
 
 #[derive(serde::Deserialize)]
@@ -569,6 +587,7 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
             .unwrap_or_else(|| Err("first reading not ready yet".to_string()))
     };
     let desk = || read(&desk_latest);
+    let lessons = || lessons_json(home);
     let equity = || read(&equity_latest);
     let refresh = || dirty.store(true, Ordering::SeqCst);
     let flatten = || {
@@ -587,6 +606,7 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
         flatten: &flatten,
         desk: &desk,
         equity: &equity,
+        lessons: &lessons,
         kickstart: &kickstart,
     };
     println!(
@@ -720,6 +740,10 @@ mod tests {
             log("equity".into());
             Ok("{}".to_string())
         };
+        let lessons = || {
+            log("lessons".into());
+            Ok("[]".to_string())
+        };
         let kickstart = |job: &str| {
             log(format!("kickstart {job}"));
             Ok(format!("{job} started"))
@@ -734,6 +758,7 @@ mod tests {
             flatten: &flatten,
             desk: &desk,
             equity: &equity,
+            lessons: &lessons,
             kickstart: &kickstart,
         };
         let resp = route(r, &ctx);
@@ -763,6 +788,7 @@ mod tests {
                 "GET /api/services",
                 "GET /api/desk",
                 "GET /api/equity",
+                "GET /api/lessons",
                 "POST /api/stop",
                 "POST /api/flatten",
                 "POST /api/run"
@@ -947,6 +973,7 @@ mod tests {
             flatten: &flatten,
             desk: &state,
             equity: &state,
+            lessons: &state,
             kickstart: &|_| Err("not in this test".into()),
         };
         let resp = route(r, &ctx);
@@ -968,9 +995,16 @@ mod tests {
             flatten: &flatten,
             desk: &state,
             equity: &state,
+            lessons: &state,
             kickstart: &|_| Err("not in this test".into()),
         };
-        for path in ["/api/state", "/api/services", "/api/desk", "/api/equity"] {
+        for path in [
+            "/api/state",
+            "/api/services",
+            "/api/desk",
+            "/api/equity",
+            "/api/lessons",
+        ] {
             assert_eq!(route(&req("GET", path, &[AUTH], ""), &ctx).status, 503);
         }
     }
@@ -1116,7 +1150,7 @@ mod tests {
 
     #[test]
     fn research_reads_need_the_token() {
-        for path in ["/api/desk", "/api/equity"] {
+        for path in ["/api/desk", "/api/equity", "/api/lessons"] {
             assert_eq!(call(&req("GET", path, &[], "")).0.status, 401);
             let (resp, _, calls) = call(&req("GET", path, &[AUTH], ""));
             assert_eq!((resp.status, calls), (200, vec![path[5..].to_string()]));
