@@ -5,4 +5,5 @@
 graphify-out/
 /data
 /agent-trading-desk/
-REFERENCE-REPOS/sidecars/*/.venv/
+REFERENCE-REPOS/
+sidecars/*/.venv/
