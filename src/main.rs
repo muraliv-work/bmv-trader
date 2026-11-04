@@ -657,7 +657,8 @@ fn lab_validate() -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", done.display()))?;
     let sd = bmv_trader::momentum::mean(&rows.iter().map(|r| r.0.stats.ic_sd).collect::<Vec<_>>());
     println!(
-        "trial {n} logged as \"{}\". Search luck line from {tries} tries: {:.3}",
+        "trial {} logged as \"{}\" (row {n} of the log; trial 10's verdict comes later). Search luck line from {tries} tries: {:.3}",
+        lab::TRIAL_11_NUMBER,
         lab::TRIAL_11,
         lab::luck_line(sd, search.len(), tries)
     );

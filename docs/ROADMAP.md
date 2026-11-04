@@ -55,10 +55,10 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 - [x] Power check (`bmv-trader power`, DESIGN §7g): both trials as first planned are badly underpowered (trial 11 needs about +26%/yr excess, trial 12 an IC of about 0.05); their designs change before pre-registration
 - [ ] ~~Earnings data probe, trial 11 PEAD, trial 12 ridge~~ replaced by the lab (DECISION R10)
 - [x] Lab pre-registration (DESIGN §7h, DECISION R10, S25)
-- [ ] Lab panel, formula type, parser, evaluation, canary tests; tier-2 review
-- [ ] Lab search loop (`lab-search`) and local-LLM ideas (`lab-ideas`); smoke runs on search months only
-- [ ] ⛔ Owner OK, then the real search, `lab-validate` once (trial 11), `lab-final` once
-- [ ] Forward gate pre-registered (DESIGN §7i), then `lab-forward` monthly in the desk job (trial 12)
+- [x] Lab panel, formula type, parser, evaluation, canary tests (tier-2 review still owed: blocked by a plugin hook)
+- [x] Lab search loop (`lab-search`, all cores) and local-LLM ideas (`lab-ideas`)
+- [x] Real search (814,735 tries), `lab-validate` once: **trial 11 failed, 0 of 20 advanced** (DECISION R10)
+- [ ] ~~Forward gate, `lab-forward` (trial 12)~~: no candidates. **Stop rule R9 triggered: daily-bar research stops, default SPY**
 
 ## P5 — Live pilot
 - [ ] ⛔ Mac mini, phone approvals, live limits, 30 live days
