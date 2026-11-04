@@ -465,6 +465,47 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
   - At a monthly IC standard deviation of about 0.10, a 12-month forward test can confirm only an IC around 0.08. A forward pass is evidence, not proof; live money stays an owner decision (P5).
   - The validation period is 33 months. A realistic IC of 0.02–0.04 may not clear its bound.
 
+## 7i. Trial 12: the AI veto replayed on the untouched year with a local model (pre-registered 2026-11-04, before any code or untouched-year analysis)
+
+**Question:** can an LLM analyst's veto improve trial 9's signals? It asks trial 10's question, in days rather than months, on data no model or trial has seen. Trial 10 runs on unchanged.
+
+- **Why the replay is clean:**
+  - **The period:** the untouched year, 2025-10-02 → 2026-10-30. No trial or search has used it (the lab produced no picks, so `lab-final` never ran).
+  - **The model:** Qwen3 was released in April 2025, before that year, so it can't recall outcomes.
+  - **The tools:** TradingAgents' tools work as of the analysis date (`dataflows/date_window.py`):
+    - requested dates are clamped to it
+    - dated news after it is dropped
+    - live company profiles are withheld from historical runs
+    - SEC filings are served only if filed by then
+- **Signals:** trial 9's rules exactly (§7d, §7e), on the adjusted SIP bars (the whole universe, delisted names included).
+  - Every session from 2025-10-02 whose 10-session hold ends by 2026-10-30.
+  - **Sample:** each session's **top-ranked signal** (volume ratio, then symbol). Sessions with none are skipped.
+  - The sample is frozen to `data/retro/sample.json`, with its hash logged, before any analysis.
+  - If the speed check shows the full sample is too slow, the sample becomes every k-th session. k is committed before any untouched-year analysis.
+- **Analyst:** TradingAgents at trial 10's pinned commit, with the same analysts (market, news, fundamentals) and the same single debate and risk rounds.
+  - Models: **`qwen3:30b-a3b` for both tiers**, through the sidecar's `ollama` provider on 127.0.0.1:11434, at $0.
+  - The same sandbox, plus a fresh HOME, memory and cache per run.
+  - The first answer counts; nothing is re-run.
+- **Mapping, outcome and metric:** trial 10's (§7f).
+  - Weights: Buy and Overweight 1, Hold 0.5, Underweight and Sell 0. REVIEW or an error counts as a failure and is left out.
+  - Outcome: trial 9's fill model in R, from bars after the signal date only.
+  - Metric: **D** = weighted mean R − plain mean R.
+- **Passes only if all of these hold, at 1 − 0.05/12:**
+  - D's one-sided day-block bootstrap lower bound is above 0
+  - vetoed signals average below approved ones
+  - the weighted mean R is above 0
+
+  Logged once as trial 12, "ai-veto retro local".
+- **Power gate (DECISION R9), run before any code:**
+  - **Spread guide:** trial 9's research-period trade R spread, plus trial 10's first-night rating mix. Never untouched-year data.
+  - **Rule:** the trial is built only if **the smallest D it detects with 80% power is at most 0.20R**. Otherwise it stops there and is recorded.
+- **Known limits:**
+  - The free Yahoo news feed often can't reach back, so some analyses run without news. That biases toward no effect; it doesn't leak.
+  - Qwen3 30B is not Claude: a pass shows an LLM veto can help, and a fail doesn't settle trial 10.
+  - The 30B's reasoning can't be turned off, so analyses are slow.
+  - Adjusted prices carry later splits, which changes scale only.
+  - This uses up the untouched year.
+
 ## 8. Decision pipeline (one candidate)
 
 1. **Strategy** emits a `Candidate`, which is journaled.
