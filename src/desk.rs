@@ -746,6 +746,107 @@ pub fn sample(cards: &[Scorecard], first: Option<&str>, today: &str) -> Option<V
     })
 }
 
+/// Where trial 10 stands, for `desk-report` and the console. Counts and ratings only: outcomes by
+/// rating stay hidden until the verdict, so nobody reads the result early (DESIGN §7f).
+#[derive(Debug, Serialize)]
+pub struct Progress {
+    pub signals: usize,
+    pub rated: usize,
+    pub failed: usize,
+    pub unanalysed: usize,
+    pub queued: usize,
+    /// Rated trades: finished, still open, skipped (no entry).
+    pub done: usize,
+    pub open: usize,
+    pub skipped: usize,
+    pub spent_today: f64,
+    pub spent_month: f64,
+    pub cap_day: f64,
+    pub cap_month: f64,
+    pub next_run_cost: Option<f64>,
+    pub target: usize,
+    /// The first analysed signal's date, from which the 6 months run.
+    pub first: Option<String>,
+    /// The last day the 6-month window can run to, once the first analysis exists.
+    pub due_by: Option<String>,
+    /// "not due", "waiting" (sample fixed, trades still open) or "ready".
+    pub verdict: &'static str,
+    /// Sessions since the first signal with no signals logged (the Mac was off).
+    pub missed: Vec<String>,
+    /// The latest night: (symbol, rating or state), by rank.
+    pub night: Option<(String, Vec<(String, String)>)>,
+    #[serde(skip)]
+    pub cards: Vec<Scorecard>,
+}
+
+pub fn progress(home: &Path, cal: &Calendar, today: &str) -> Result<Progress, String> {
+    let analyses = read_analyses(home)?;
+    let cards = score_all(home, cal, &analyses)?;
+    let t = tally(&cards);
+    let count = |f: &dyn Fn(&Status) -> bool| analyses.iter().filter(|a| f(&a.status)).count();
+    let runs = all_runs(home)?;
+    let (day, month) = spent(&runs, today);
+    let first = first_analysis(&analyses);
+    let start = analyses.iter().map(|a| a.signal.date.clone()).min();
+    let missed = cal
+        .sessions
+        .iter()
+        .filter(|d| start.as_ref().is_some_and(|s| *d >= s))
+        .filter(|d| !signals_path(home, d).exists())
+        .cloned()
+        .collect();
+    let verdict = match sample(&cards, first.as_deref(), today) {
+        None => "not due",
+        Some(s) if s.iter().any(|c| c.scored == Scored::Pending) => "waiting",
+        Some(_) => "ready",
+    };
+    let due_by = first
+        .as_deref()
+        .and_then(|f| crate::history::canonical_date(f).ok())
+        .map(|f| (f + chrono::Duration::days(MAX_DAYS)).to_string());
+    let night = analyses
+        .iter()
+        .map(|a| a.signal.date.clone())
+        .max()
+        .map(|d| {
+            let mut rows: Vec<&Analysis> = analyses.iter().filter(|a| a.signal.date == d).collect();
+            rows.sort_by_key(|a| a.rank);
+            let label = |s: &Status| match s {
+                Status::Rated { rating, .. } => format!("{rating:?}"),
+                Status::Failed { .. } => "failed".into(),
+                Status::Unanalysed { .. } => "not analysed".into(),
+                Status::Queued => "queued".into(),
+            };
+            let rows = rows
+                .iter()
+                .map(|a| (a.signal.symbol.clone(), label(&a.status)))
+                .collect();
+            (d, rows)
+        });
+    Ok(Progress {
+        signals: analyses.len(),
+        rated: count(&|s| matches!(s, Status::Rated { .. })),
+        failed: count(&|s| matches!(s, Status::Failed { .. })),
+        unanalysed: count(&|s| matches!(s, Status::Unanalysed { .. })),
+        queued: count(&|s| *s == Status::Queued),
+        done: t.done,
+        open: t.pending,
+        skipped: t.skipped,
+        spent_today: day,
+        spent_month: month,
+        cap_day: DAILY_BUDGET_USD,
+        cap_month: MONTHLY_BUDGET_USD,
+        next_run_cost: expected_cost(&runs),
+        target: TARGET_SIGNALS,
+        first,
+        due_by,
+        verdict,
+        missed,
+        night,
+        cards,
+    })
+}
+
 /// Means over finished trades: all, approved (weight 1), vetoed (weight 0), AI-weighted, and D.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Tally {
@@ -1230,5 +1331,59 @@ mod tests {
         );
         assert!(!project.join("evil").exists());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn progress_shows_counts_and_ratings_never_outcomes() {
+        let p = Progress {
+            signals: 0,
+            rated: 0,
+            failed: 0,
+            unanalysed: 0,
+            queued: 0,
+            done: 0,
+            open: 0,
+            skipped: 0,
+            spent_today: 0.0,
+            spent_month: 0.0,
+            cap_day: DAILY_BUDGET_USD,
+            cap_month: MONTHLY_BUDGET_USD,
+            next_run_cost: None,
+            target: TARGET_SIGNALS,
+            first: None,
+            due_by: None,
+            verdict: "not due",
+            missed: vec![],
+            night: None,
+            cards: vec![],
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        // the console shows this before the verdict: a new key must not carry R or win rates
+        assert_eq!(
+            keys,
+            [
+                "cap_day",
+                "cap_month",
+                "done",
+                "due_by",
+                "failed",
+                "first",
+                "missed",
+                "next_run_cost",
+                "night",
+                "open",
+                "queued",
+                "rated",
+                "signals",
+                "skipped",
+                "spent_month",
+                "spent_today",
+                "target",
+                "unanalysed",
+                "verdict"
+            ]
+        );
     }
 }

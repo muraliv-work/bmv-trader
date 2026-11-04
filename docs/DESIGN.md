@@ -15,7 +15,7 @@ Deterministic rules find setups, Claude vets them, hard-coded risk limits have t
 **Monitoring:**
 - Alpaca's dashboard for positions, orders and P&L (from day one)
 - the terminal log plus `status` and `report` commands (P3)
-- `watch` (terminal) and the `ui` web console on 127.0.0.1 (P3, DECISION S16): session state, account, positions, orders, journal and trials, with STOP and flatten as the only controls
+- `watch` (terminal) and the `ui` web console on 127.0.0.1 (P3, DECISION S16): session state, account, equity against SPY, trial 10 progress, positions, orders, journal and trials, with STOP and flatten as the only safety controls; the Services page adds Run now for the `desk`, `notes` and `llm` launchd jobs (DECISION S24)
 - in P4 the console adds candidates, Claude's verdicts and Claude vs shadow; Tailscale access would be a new decision
 - phone alerts (P5)
 

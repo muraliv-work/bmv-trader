@@ -1,4 +1,5 @@
-// Renders /api/services. Read-only: no controls (DECISION S16). Text goes in with textContent only (a test checks).
+// Renders /api/services, plus Run-now for the launchd jobs that place no orders (DECISION S24).
+// Text goes in with textContent only (a test checks).
 "use strict";
 
 const POLL_MS = 10000;
@@ -35,6 +36,24 @@ function setSignal(state, aspect, meta) {
   $("signal").dataset.aspect = aspect;
 }
 
+const NAMES = { desk: "Desk (trial 10 analysis)", notes: "Notes (local digests)", llm: "LLM key rotation" };
+
+// Only jobs that are installed, loaded and not running now can be chosen.
+function renderJobs(components) {
+  const select = document.querySelector("#run select");
+  const keep = select.value;
+  const jobs = components.map((c) => c.run).filter(Boolean);
+  select.replaceChildren(el("option", jobs.length ? "Choose" : "None can start now"));
+  select.firstChild.value = "";
+  for (const j of jobs) {
+    const o = el("option", NAMES[j] ?? j);
+    o.value = j;
+    select.append(o);
+  }
+  select.value = jobs.includes(keep) ? keep : "";
+  checkRun();
+}
+
 function render(r) {
   const tbody = $("components");
   tbody.replaceChildren();
@@ -49,6 +68,7 @@ function render(r) {
     tr.append(status, el("td", c.name), el("td", c.detail), fix);
     tbody.append(tr);
   }
+  renderJobs(r.components);
   const when = new Date(r.now * 1000).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false });
   const age = Math.round(Date.now() / 1000 - r.now);
   const meta = `${count.ok} up, ${count.warn} to check, ${count.down} down. Checked ${when} ET`;
@@ -85,6 +105,40 @@ async function poll() {
     polling = false;
   }
 }
+
+const form = $("run");
+const runButton = form.querySelector("button");
+function checkRun() {
+  runButton.disabled = !(form.job.value && form.confirm.value === "RUN");
+}
+form.addEventListener("input", checkRun);
+form.addEventListener("change", checkRun);
+form.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if (runButton.disabled) return;
+  runButton.disabled = true;
+  const result = $("run-result");
+  result.className = "result";
+  result.textContent = "Starting…";
+  try {
+    const res = await fetch("/api/run", {
+      method: "POST",
+      signal: AbortSignal.timeout(10000),
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ job: form.job.value, confirm: form.confirm.value }),
+      cache: "no-store",
+    });
+    const body = await res.json().catch(() => ({ message: `HTTP ${res.status}` }));
+    result.textContent = body.message;
+    if (!res.ok) result.classList.add("bad");
+  } catch (_) {
+    result.textContent = "Couldn't reach the console; check its terminal.";
+    result.classList.add("bad");
+  }
+  form.confirm.value = "";
+  checkRun();
+  setTimeout(poll, 2000);
+});
 
 poll();
 setInterval(poll, POLL_MS);

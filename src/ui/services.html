@@ -9,22 +9,41 @@
 <script src="/services.js" defer></script>
 </head>
 <body class="services">
-<header class="signal" id="signal" data-aspect="unknown">
-  <div class="lamp" aria-hidden="true"></div>
-  <div class="aspect">
-    <h1 id="state">Checking</h1>
-    <p id="meta">Waiting for the first check</p>
+<header class="topbar">
+  <div class="inner">
+    <span class="brand">bmv-trader</span>
+    <nav aria-label="Pages"><a href="/">Console</a><a href="/services" class="is-active" aria-current="page">Services</a><a href="/help">How to</a></nav>
   </div>
-  <nav class="howto" aria-label="Pages"><a href="/">Console</a><a href="/help">How to</a></nav>
 </header>
 
 <main>
-  <section aria-labelledby="h-services">
+  <section class="signal card" id="signal" data-aspect="unknown" aria-live="polite">
+    <div class="lamp" aria-hidden="true"></div>
+    <div class="aspect">
+      <h1 id="state">Checking</h1>
+      <p id="meta">Waiting for the first check</p>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="h-services">
     <h2 id="h-services">Every moving part</h2>
-    <p class="note">Read-only. Each fix is a command to run in Terminal from the project folder
+    <p class="note">Each fix is a command to run in Terminal from the project folder
       (<code>cd ~/Documents/projects/bmv/bmv-trader</code>). Checked at most every 30 seconds.</p>
     <div class="scroll"><table><thead><tr><th>Status</th><th>Part</th><th>Detail</th><th>Fix</th></tr></thead>
     <tbody id="components"></tbody></table></div>
+  </section>
+
+  <section class="card" aria-labelledby="h-run">
+    <h2 id="h-run">Run a job now</h2>
+    <p class="note">For a night the Mac was shut down. After sleep, launchd runs a missed job by itself on wake.
+      A job that is already running is left alone. None of these places an order. Desk calls Claude
+      (about $0.10–0.80 a night, within its budget) and does nothing before 20 minutes after the close.</p>
+    <form id="run" class="run">
+      <label>Job <select name="job"><option value="">Choose</option></select></label>
+      <label>Type RUN to confirm <input name="confirm" autocomplete="off" spellcheck="false"></label>
+      <button type="submit" disabled>Run now</button>
+    </form>
+    <p id="run-result" class="result" role="status" aria-live="assertive"></p>
   </section>
 </main>
 </body>

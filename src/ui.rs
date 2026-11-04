@@ -1,10 +1,11 @@
-//! Local web console (DECISION S16): the same view as `watch`, plus STOP and flatten. It can only
-//! make things safer or show them; there is no route to clear STOP, start a run or place an order.
-//! Listens on 127.0.0.1 only, behind a token minted per launch.
+//! Local web console (DECISION S16, S24): the same view as `watch`, plus STOP and flatten, and
+//! Run-now for the launchd jobs that place no orders. There is no route to clear STOP, start the
+//! trading engine or place an order. Listens on 127.0.0.1 only, behind a token minted per launch.
 
 use crate::broker::Alpaca;
+use crate::broker::Api;
 use crate::safety::{self, Engaged};
-use crate::{live, services, watch};
+use crate::{desk, live, momentum, scan, services, watch};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -28,21 +29,32 @@ const APP_JS: &str = include_str!("ui/app.js");
 const APP_CSS: &str = include_str!("ui/app.css");
 const SERVICES: &str = include_str!("ui/services.html");
 const SERVICES_JS: &str = include_str!("ui/services.js");
+/// lightweight-charts 5.1.0, standalone production build (Apache-2.0; src/ui/vendor/LICENSE).
+const CHART_JS: &str = include_str!("ui/vendor/lightweight-charts.js");
 /// The Services checks (Keychain, launchctl, loopback HTTP) run at most once per this.
 const SERVICES_SECS: u64 = 30;
+/// Trial 10 progress and the equity history are read at most once per this.
+const RESEARCH_SECS: u64 = 60;
+
+/// The launchd jobs Run-now may start (DECISION S24): none of them can place an order.
+pub const RUNNABLE: [&str; 3] = ["desk", "notes", "llm"];
 
 /// Every route there is. A test pins it, so a new control can't slip in unreviewed.
-pub const ROUTES: [(&str, &str); 10] = [
+pub const ROUTES: [(&str, &str); 14] = [
     ("GET", "/"),
     ("GET", "/help"),
     ("GET", "/services"),
     ("GET", "/app.js"),
     ("GET", "/services.js"),
     ("GET", "/app.css"),
+    ("GET", "/chart.js"),
     ("GET", "/api/state"),
     ("GET", "/api/services"),
+    ("GET", "/api/desk"),
+    ("GET", "/api/equity"),
     ("POST", "/api/stop"),
     ("POST", "/api/flatten"),
+    ("POST", "/api/run"),
 ];
 
 #[derive(Debug)]
@@ -100,6 +112,12 @@ pub struct Ctx<'a> {
     pub refresh: &'a (dyn Fn() + Sync),
     /// Close everything and confirm flat.
     pub flatten: &'a (dyn Fn() -> Result<(), String> + Sync),
+    /// Trial 10 progress as JSON (`desk::Progress`).
+    pub desk: &'a (dyn Fn() -> Result<String, String> + Sync),
+    /// Account equity and SPY, both scaled to 100, as JSON.
+    pub equity: &'a (dyn Fn() -> Result<String, String> + Sync),
+    /// Start one of `RUNNABLE` through launchd; Ok is what to tell the user.
+    pub kickstart: &'a (dyn Fn(&str) -> Result<String, String> + Sync),
 }
 
 /// Fails reads past `until`, so a client dribbling bytes can't hold a thread for long.
@@ -229,6 +247,7 @@ pub fn route(req: &Request, ctx: &Ctx) -> Response {
         "/app.js" => return Response::ok("text/javascript; charset=utf-8", APP_JS),
         "/services.js" => return Response::ok("text/javascript; charset=utf-8", SERVICES_JS),
         "/app.css" => return Response::ok("text/css; charset=utf-8", APP_CSS),
+        "/chart.js" => return Response::ok("text/javascript; charset=utf-8", CHART_JS),
         _ => {}
     }
     let bearer = req
@@ -242,11 +261,12 @@ pub fn route(req: &Request, ctx: &Ctx) -> Response {
         );
     }
     match req.path.as_str() {
-        "/api/state" | "/api/services" => {
-            let read = if req.path == "/api/state" {
-                ctx.state
-            } else {
-                ctx.services
+        "/api/state" | "/api/services" | "/api/desk" | "/api/equity" => {
+            let read = match req.path.as_str() {
+                "/api/state" => ctx.state,
+                "/api/services" => ctx.services,
+                "/api/desk" => ctx.desk,
+                _ => ctx.equity,
             };
             match read() {
                 Ok(json) => Response::ok("application/json", &json),
@@ -254,8 +274,146 @@ pub fn route(req: &Request, ctx: &Ctx) -> Response {
             }
         }
         "/api/stop" => control(req, ctx, host, "STOP"),
+        "/api/run" => run_job(req, ctx, host),
         _ => control(req, ctx, host, "FLATTEN"),
     }
+}
+
+/// What every POST must carry: a JSON body and, when the browser sends one, our own Origin.
+fn post_checks(req: &Request, host: &str) -> Option<Response> {
+    let json = req
+        .header("content-type")
+        .is_some_and(|c| c.starts_with("application/json"));
+    if !json {
+        return Some(Response::json(415, false, "send application/json"));
+    }
+    if req
+        .header("origin")
+        .is_some_and(|o| o != format!("http://{host}"))
+    {
+        return Some(Response::json(403, false, "wrong Origin"));
+    }
+    None
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunJob {
+    job: String,
+    confirm: String,
+}
+
+fn run_job(req: &Request, ctx: &Ctx, host: &str) -> Response {
+    if let Some(r) = post_checks(req, host) {
+        return r;
+    }
+    let Ok(r) = serde_json::from_slice::<RunJob>(&req.body) else {
+        return Response::json(400, false, "send {\"job\": ..., \"confirm\": \"RUN\"}");
+    };
+    // the label is built from our own list, never from the request's text
+    let Some(job) = RUNNABLE.iter().find(|j| **j == r.job) else {
+        return Response::json(400, false, "unknown job");
+    };
+    if r.confirm != "RUN" {
+        return Response::json(400, false, "type RUN to confirm");
+    }
+    let now = chrono::Utc::now().timestamp();
+    eprintln!(
+        "{} ET  Run now: {job}, from the web console",
+        watch::et(now)
+    );
+    let result = match (ctx.kickstart)(job) {
+        Ok(m) => Response::json(200, true, &m),
+        Err(e) => Response::json(502, false, &e),
+    };
+    eprintln!("  -> {}", result.body);
+    result
+}
+
+/// `launchctl kickstart` without -k: a job that is already running is left alone.
+fn kickstart(job: &str) -> Result<String, String> {
+    let label = format!("com.bmv-trader.{job}");
+    let uid = services::uid().ok_or("couldn't read the user id")?;
+    let (code, _) = services::run(
+        "/bin/launchctl",
+        &["kickstart", &format!("gui/{uid}/{label}")],
+        &[],
+        false,
+    )
+    .ok_or("launchctl didn't answer")?;
+    if code == 0 {
+        Ok(format!(
+            "{job} started (or was already running). Its row shows the result within 30 s."
+        ))
+    } else {
+        Err(format!(
+            "launchctl kickstart {label} failed (exit {code}); is the job installed?"
+        ))
+    }
+}
+
+/// Trial 10's progress; the calendar comes from the live SPY bars, as for `desk-report`.
+fn desk_json(home: &Path) -> Result<String, String> {
+    let dir = home.join("data");
+    let spy = scan::read_daily(&dir, scan::ADJUSTED_SIP_LIVE, "SPY")?;
+    let cal = momentum::Calendar::new(&spy)?;
+    let today = watch::today_et(chrono::Utc::now().timestamp());
+    let p = desk::progress(home, &cal, &today)?;
+    serde_json::to_string(&p).map_err(|e| format!("desk: {e}"))
+}
+
+#[derive(serde::Deserialize)]
+struct History {
+    timestamp: Vec<i64>,
+    equity: Vec<Option<f64>>,
+}
+
+#[derive(serde::Serialize, Debug, PartialEq)]
+struct Point {
+    time: String,
+    value: f64,
+}
+
+/// Both series from the first date they share, each scaled to 100 there.
+fn scaled(equity: &[(String, f64)], spy: &[(String, f64)]) -> (Vec<Point>, Vec<Point>) {
+    let spy_on = |d: &str| spy.iter().find(|(s, _)| s == d).map(|(_, c)| *c);
+    let Some((start, e0, s0)) = equity
+        .iter()
+        .find_map(|(d, e)| spy_on(d).map(|s| (d.clone(), *e, s)))
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    let from = |xs: &[(String, f64)], base: f64| {
+        xs.iter()
+            .filter(|(d, _)| *d >= start)
+            .map(|(d, v)| Point {
+                time: d.clone(),
+                value: v / base * 100.0,
+            })
+            .collect()
+    };
+    (from(equity, e0), from(spy, s0))
+}
+
+fn equity_json(a: &Alpaca, home: &Path) -> Result<String, String> {
+    let h: History = a.get(
+        Api::Trading,
+        "/v2/account/portfolio/history?period=1A&timeframe=1D",
+    )?;
+    // days before the account was funded come back as 0 or null
+    let equity: Vec<(String, f64)> = h
+        .timestamp
+        .iter()
+        .zip(&h.equity)
+        .filter_map(|(t, e)| e.filter(|e| *e > 0.0).map(|e| (watch::today_et(*t), e)))
+        .collect();
+    let spy: Vec<(String, f64)> =
+        scan::read_daily(&home.join("data"), scan::ADJUSTED_SIP_LIVE, "SPY")?
+            .into_iter()
+            .map(|b| (b.date, b.close))
+            .collect();
+    let (equity, spy) = scaled(&equity, &spy);
+    Ok(serde_json::json!({ "equity": equity, "spy": spy }).to_string())
 }
 
 #[derive(serde::Deserialize)]
@@ -265,17 +423,8 @@ struct Confirm {
 }
 
 fn control(req: &Request, ctx: &Ctx, host: &str, word: &str) -> Response {
-    let json = req
-        .header("content-type")
-        .is_some_and(|c| c.starts_with("application/json"));
-    if !json {
-        return Response::json(415, false, "send application/json");
-    }
-    if req
-        .header("origin")
-        .is_some_and(|o| o != format!("http://{host}"))
-    {
-        return Response::json(403, false, "wrong Origin");
+    if let Some(r) = post_checks(req, host) {
+        return r;
     }
     match serde_json::from_slice::<Confirm>(&req.body) {
         Ok(c) if c.confirm == word => {}
@@ -412,6 +561,15 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
         l.clone()
             .unwrap_or_else(|| Err("first check still running".to_string()))
     };
+    let desk_latest: Mutex<Option<Result<String, String>>> = Mutex::new(None);
+    let equity_latest: Mutex<Option<Result<String, String>>> = Mutex::new(None);
+    let read = |m: &Mutex<Option<Result<String, String>>>| {
+        let l = m.lock().unwrap_or_else(|p| p.into_inner());
+        l.clone()
+            .unwrap_or_else(|| Err("first reading not ready yet".to_string()))
+    };
+    let desk = || read(&desk_latest);
+    let equity = || read(&equity_latest);
     let refresh = || dirty.store(true, Ordering::SeqCst);
     let flatten = || {
         let _one = flattening
@@ -427,6 +585,9 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
         services: &services,
         refresh: &refresh,
         flatten: &flatten,
+        desk: &desk,
+        equity: &equity,
+        kickstart: &kickstart,
     };
     println!(
         "web console ({mode}), this Mac only. Open:\n\n  http://{ADDR}:{port}/#{}\n",
@@ -456,6 +617,15 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
                     .map_err(|e| format!("services: {e}"));
                 *checked.lock().unwrap_or_else(|p| p.into_inner()) = Some(json);
                 std::thread::sleep(Duration::from_secs(SERVICES_SECS));
+            }
+        });
+        // reads every rated signal's bars and Alpaca's history: slow, and needed rarely
+        s.spawn(|| {
+            loop {
+                *desk_latest.lock().unwrap_or_else(|p| p.into_inner()) = Some(desk_json(home));
+                *equity_latest.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(equity_json(a, home));
+                std::thread::sleep(Duration::from_secs(RESEARCH_SECS));
             }
         });
         for stream in listener.incoming() {
@@ -542,6 +712,18 @@ mod tests {
             log(format!("flatten stop={}", stop.exists()));
             flat.clone()
         };
+        let desk = || {
+            log("desk".into());
+            Ok("{}".to_string())
+        };
+        let equity = || {
+            log("equity".into());
+            Ok("{}".to_string())
+        };
+        let kickstart = |job: &str| {
+            log(format!("kickstart {job}"));
+            Ok(format!("{job} started"))
+        };
         let ctx = Ctx {
             port: 8765,
             token: TOKEN.into(),
@@ -550,6 +732,9 @@ mod tests {
             services: &services,
             refresh: &refresh,
             flatten: &flatten,
+            desk: &desk,
+            equity: &equity,
+            kickstart: &kickstart,
         };
         let resp = route(r, &ctx);
         let engaged = stop.exists();
@@ -562,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn the_route_table_is_exactly_monitor_stop_flatten() {
+    fn the_route_table_is_exactly_monitor_stop_flatten_run() {
         let paths: Vec<_> = ROUTES.iter().map(|(m, p)| format!("{m} {p}")).collect();
         assert_eq!(
             paths,
@@ -573,23 +758,33 @@ mod tests {
                 "GET /app.js",
                 "GET /services.js",
                 "GET /app.css",
+                "GET /chart.js",
                 "GET /api/state",
                 "GET /api/services",
+                "GET /api/desk",
+                "GET /api/equity",
                 "POST /api/stop",
-                "POST /api/flatten"
+                "POST /api/flatten",
+                "POST /api/run"
             ]
         );
     }
 
     #[test]
-    fn the_services_page_is_read_only_and_its_data_needs_the_token() {
+    fn the_services_page_has_one_control_and_its_data_needs_the_token() {
         let page = call(&req("GET", "/services", &[], "")).0;
         assert_eq!(page.status, 200);
-        assert!(!page.body.contains("<button") && !page.body.contains("<form"));
+        assert_eq!(page.body.matches("<form").count(), 1, "only Run now");
         assert!(!page.body.contains("style=") && !page.body.contains("<script>"));
         let js = call(&req("GET", "/services.js", &[], "")).0;
         assert_eq!(js.status, 200);
-        assert!(!js.body.contains("innerHTML") && !js.body.contains("method:"));
+        assert!(!js.body.contains("innerHTML"));
+        let posts: Vec<_> = js
+            .body
+            .match_indices("fetch(\"")
+            .map(|(i, _)| &js.body[i..i + 18])
+            .collect();
+        assert_eq!(posts, ["fetch(\"/api/servic", "fetch(\"/api/run\", "]);
         assert_eq!(call(&req("GET", "/api/services", &[], "")).0.status, 401);
         let bad = ("authorization", "Bearer nope");
         assert_eq!(call(&req("GET", "/api/services", &[bad], "")).0.status, 401);
@@ -750,6 +945,9 @@ mod tests {
             services: &state,
             refresh: &refresh,
             flatten: &flatten,
+            desk: &state,
+            equity: &state,
+            kickstart: &|_| Err("not in this test".into()),
         };
         let resp = route(r, &ctx);
         std::fs::remove_file(&dir).unwrap();
@@ -768,8 +966,11 @@ mod tests {
             services: &state,
             refresh: &refresh,
             flatten: &flatten,
+            desk: &state,
+            equity: &state,
+            kickstart: &|_| Err("not in this test".into()),
         };
-        for path in ["/api/state", "/api/services"] {
+        for path in ["/api/state", "/api/services", "/api/desk", "/api/equity"] {
             assert_eq!(route(&req("GET", path, &[AUTH], ""), &ctx).status, 503);
         }
     }
@@ -881,5 +1082,85 @@ mod tests {
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
         assert!(same("abc", "abc") && !same("abc", "abd") && !same("abc", "abcd"));
+    }
+
+    #[test]
+    fn run_now_starts_only_listed_jobs_with_the_word() {
+        let ok = r#"{"job":"notes","confirm":"RUN"}"#;
+        let (resp, engaged, calls) = call(&req("POST", "/api/run", &[AUTH, JSON], ok));
+        assert_eq!((resp.status, engaged), (200, false), "{}", resp.body);
+        assert_eq!(calls, ["kickstart notes"]);
+        for bad in [
+            r#"{"job":"notes","confirm":"run"}"#,
+            r#"{"job":"backstop","confirm":"RUN"}"#,
+            r#"{"job":"run","confirm":"RUN"}"#,
+            r#"{"job":"notes; rm -rf /","confirm":"RUN"}"#,
+            r#"{"job":"notes","confirm":"RUN","extra":1}"#,
+            r#"{"confirm":"RUN"}"#,
+        ] {
+            let (resp, _, calls) = call(&req("POST", "/api/run", &[AUTH, JSON], bad));
+            assert_eq!((resp.status, calls.len()), (400, 0), "{bad}");
+        }
+        assert_eq!(call(&req("POST", "/api/run", &[JSON], ok)).0.status, 401);
+        assert_eq!(call(&req("POST", "/api/run", &[AUTH], ok)).0.status, 415);
+        let evil = ("origin", "http://evil.example");
+        let (resp, _, calls) = call(&req("POST", "/api/run", &[AUTH, JSON, evil], ok));
+        assert_eq!((resp.status, calls.len()), (403, 0));
+        assert_eq!(call(&req("GET", "/api/run", &[AUTH], "")).0.status, 405);
+        assert_eq!(
+            RUNNABLE,
+            ["desk", "notes", "llm"],
+            "none of these places an order"
+        );
+    }
+
+    #[test]
+    fn research_reads_need_the_token() {
+        for path in ["/api/desk", "/api/equity"] {
+            assert_eq!(call(&req("GET", path, &[], "")).0.status, 401);
+            let (resp, _, calls) = call(&req("GET", path, &[AUTH], ""));
+            assert_eq!((resp.status, calls), (200, vec![path[5..].to_string()]));
+        }
+    }
+
+    #[test]
+    fn the_chart_library_is_the_pinned_file() {
+        // macOS's shasum: no hashing crate just for a test
+        let out = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256", "src/ui/vendor/lightweight-charts.js"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(CHART_JS.len(), 189_472);
+        assert_eq!(
+            text.split_whitespace().next().unwrap_or(""),
+            "756b0ba9f58930226d6b8b9d47ad310448ab85d799ea1f7c2c02304777c10b52",
+            "lightweight-charts 5.1.0 standalone; a change must be a reviewed upgrade"
+        );
+        let r = call(&req("GET", "/chart.js", &[], "")).0;
+        assert_eq!(
+            (r.status, r.content_type),
+            (200, "text/javascript; charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn equity_and_spy_start_at_100_on_their_first_shared_day() {
+        let e = |d: &str, v: f64| (d.to_string(), v);
+        let equity = [e("2026-10-01", 200.0), e("2026-10-02", 210.0)];
+        let spy = [
+            e("2026-09-30", 1.0),
+            e("2026-10-01", 50.0),
+            e("2026-10-02", 45.0),
+        ];
+        let (eq, sp) = scaled(&equity, &spy);
+        let vals = |xs: &[Point]| {
+            xs.iter()
+                .map(|p| (p.time.clone(), p.value))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(vals(&eq), [e("2026-10-01", 100.0), e("2026-10-02", 105.0)]);
+        assert_eq!(vals(&sp), [e("2026-10-01", 100.0), e("2026-10-02", 90.0)]);
+        assert_eq!(scaled(&equity, &[]), (vec![], vec![]));
     }
 }

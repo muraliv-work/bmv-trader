@@ -228,5 +228,118 @@ for (const form of document.querySelectorAll(".control")) {
   });
 }
 
+// Trial 10 and the equity chart change once a night; the server reads them every 60 s.
+const SLOW_POLL_MS = 60000;
+const RATING = { Buy: "up", Overweight: "up", Underweight: "down", Sell: "down" };
+
+function stat(dl, label, value, fill) {
+  const d = el("div");
+  d.append(el("dt", label), el("dd", value));
+  if (fill !== undefined) {
+    const m = el("div", undefined, "meter");
+    const bar = el("span");
+    bar.style.width = `${Math.min(100, Math.max(0, fill * 100)).toFixed(1)}%`; // CSSOM, allowed by the CSP
+    m.append(bar);
+    d.append(m);
+  }
+  dl.append(d);
+}
+
+function renderDesk(p) {
+  const dl = $("desk");
+  dl.replaceChildren();
+  stat(dl, "Rated signals", `${p.rated} of ${p.target}`, p.rated / p.target);
+  stat(dl, "Spend this month", `$${p.spent_month.toFixed(2)} of $${p.cap_month.toFixed(0)}`, p.spent_month / p.cap_month);
+  stat(dl, "Trades", `${p.open} open, ${p.done} finished`);
+  stat(dl, p.verdict === "not due" ? "Verdict due by" : "Verdict",
+    p.verdict === "ready" ? "Ready to judge" : p.verdict === "waiting" ? "Trades still open" : p.due_by ?? "–");
+  const extra = [];
+  if (p.failed) extra.push(`${p.failed} failed`);
+  if (p.unanalysed) extra.push(`${p.unanalysed} not analysed`);
+  if (p.queued) extra.push(`${p.queued} queued`);
+  if (p.missed.length) extra.push(`missed nights: ${p.missed.join(", ")}`);
+  $("desk-note").textContent = [
+    "Counts only. Results by rating stay hidden until the verdict.",
+    extra.length ? `Also: ${extra.join("; ")}.` : "",
+  ].join(" ");
+
+  const ul = $("night");
+  ul.replaceChildren();
+  if (!p.night) {
+    $("night-date").textContent = "No night analysed yet.";
+    return;
+  }
+  const [date, rows] = p.night;
+  $("night-date").textContent = `Signals from the ${date} close`;
+  for (const [symbol, rating] of rows) {
+    const li = el("li");
+    li.append(el("span", symbol), el("span", rating, `badge ${RATING[rating] ?? ""}`));
+    ul.append(li);
+  }
+}
+
+let chart = null;
+let series = null;
+let hist = { equity: [], spy: [] };
+let rangeDays = 366;
+
+function drawChart() {
+  if (!window.LightweightCharts) {
+    $("chart-note").textContent = "The chart library didn't load.";
+    return;
+  }
+  if (!chart) {
+    const LC = window.LightweightCharts;
+    chart = LC.createChart($("chart"), {
+      autoSize: true,
+      layout: { background: { type: "solid", color: "#1a2027" }, textColor: "#a3aed0", fontFamily: "system-ui, sans-serif" },
+      grid: { vertLines: { color: "#232c37" }, horzLines: { color: "#232c37" } },
+      rightPriceScale: { borderColor: "#26303b" },
+      timeScale: { borderColor: "#26303b" },
+    });
+    series = {
+      spy: chart.addSeries(LC.LineSeries, { color: "#a3aed0", lineWidth: 2 }),
+      equity: chart.addSeries(LC.LineSeries, { color: "#76da44", lineWidth: 2 }),
+    };
+  }
+  const from = new Date(Date.now() - rangeDays * 864e5).toISOString().slice(0, 10);
+  const cut = (xs) => xs.filter((x) => x.time >= from);
+  series.equity.setData(cut(hist.equity));
+  series.spy.setData(cut(hist.spy));
+  chart.timeScale().fitContent();
+  $("chart-note").textContent = hist.equity.length
+    ? "Both lines start at 100 on the first day they share."
+    : "No account history yet.";
+}
+
+for (const b of document.querySelectorAll(".ranges button")) {
+  b.addEventListener("click", () => {
+    for (const o of document.querySelectorAll(".ranges button")) {
+      o.classList.toggle("is-active", o === b);
+      o.setAttribute("aria-pressed", String(o === b));
+    }
+    rangeDays = Number(b.dataset.days);
+    drawChart();
+  });
+}
+
+async function slowPoll() {
+  try {
+    const [d, e] = await Promise.all([api("/api/desk"), api("/api/equity")]);
+    if (d.ok) renderDesk(d.body);
+    else $("desk-note").textContent = `Couldn't read trial 10: ${d.body.message}`;
+    if (e.ok) {
+      hist = e.body;
+      drawChart();
+    } else {
+      $("chart-note").textContent = `Couldn't read the history: ${e.body.message}`;
+    }
+  } catch (_) {
+    $("desk-note").textContent = "Can't reach the console.";
+  }
+}
+
 poll();
 setInterval(poll, POLL_MS);
+slowPoll();
+setInterval(slowPoll, SLOW_POLL_MS);

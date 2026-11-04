@@ -1007,68 +1007,45 @@ fn desk_report(
     home: &Path,
     cal: &bmv_trader::momentum::Calendar,
 ) -> Result<Vec<bmv_trader::desk::Scorecard>, String> {
-    use bmv_trader::desk::{self, Status};
-    let today = et_now().date_naive().to_string();
-    let analyses = desk::read_analyses(home)?;
-    let cards = desk::score_all(home, cal, &analyses)?;
-    let t = desk::tally(&cards);
-    let count = |f: &dyn Fn(&Status) -> bool| analyses.iter().filter(|a| f(&a.status)).count();
-    let runs = desk::all_runs(home)?;
-    let (day, month) = desk::spent(&runs, &today);
-    let first = desk::first_analysis(&analyses);
-    let start = analyses.iter().map(|a| a.signal.date.clone()).min();
-    let missed: Vec<&String> = cal
-        .sessions
-        .iter()
-        .filter(|d| start.as_ref().is_some_and(|s| *d >= s))
-        .filter(|d| !desk::signals_path(home, d).exists())
-        .collect();
+    use bmv_trader::desk;
+    let p = desk::progress(home, cal, &et_now().date_naive().to_string())?;
     println!(
         "trial 10: {} signals, {} rated, {} failed, {} not analysed, {} queued",
-        analyses.len(),
-        count(&|s| matches!(s, Status::Rated { .. })),
-        count(&|s| matches!(s, Status::Failed { .. })),
-        count(&|s| matches!(s, Status::Unanalysed { .. })),
-        count(&|s| *s == Status::Queued)
+        p.signals, p.rated, p.failed, p.unanalysed, p.queued
     );
     println!(
         "  rated trades: {} finished, {} still open, {} skipped (no entry)",
-        t.done, t.pending, t.skipped
+        p.done, p.open, p.skipped
     );
     println!(
-        "  spend: ${day:.2} today, ${month:.2} this month (caps ${:.2} / ${:.0}); next run ~{}",
-        desk::DAILY_BUDGET_USD,
-        desk::MONTHLY_BUDGET_USD,
-        desk::expected_cost(&runs).map_or("unmeasured".into(), |c| format!("${c:.2}"))
+        "  spend: ${:.2} today, ${:.2} this month (caps ${:.2} / ${:.0}); next run ~{}",
+        p.spent_today,
+        p.spent_month,
+        p.cap_day,
+        p.cap_month,
+        p.next_run_cost
+            .map_or("unmeasured".into(), |c| format!("${c:.2}"))
     );
-    if !missed.is_empty() {
+    if !p.missed.is_empty() {
         println!(
             "  MISSED sessions (no signals logged): {}",
-            missed
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            p.missed.join(", ")
         );
     }
-    let due = desk::sample(&cards, first.as_deref(), &today);
     println!(
         "  verdict: {}",
-        match &due {
-            None => format!(
+        match p.verdict {
+            "not due" => format!(
                 "not due (at {} rated signals, or {} days after {})",
                 desk::TARGET_SIGNALS,
                 desk::MAX_DAYS,
-                first.as_deref().unwrap_or("the first analysis")
+                p.first.as_deref().unwrap_or("the first analysis")
             ),
-            Some(s)
-                if s.iter()
-                    .any(|c| c.scored == bmv_trader::swing::Scored::Pending) =>
-                "sample fixed; waiting for its trades to finish".into(),
-            Some(_) => "READY: run `bmv-trader desk-verdict`".into(),
+            "waiting" => "sample fixed; waiting for its trades to finish".into(),
+            _ => "READY: run `bmv-trader desk-verdict`".into(),
         }
     );
-    Ok(cards)
+    Ok(p.cards)
 }
 
 /// The trials logged so far, by name; a log that can't be read is an error, not "none".

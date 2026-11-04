@@ -8,12 +8,17 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The launchd jobs in deploy/, each with its log.
-const JOBS: [(&str, &str); 4] = [
-    ("com.bmv-trader.backstop", "data/backstop.log"),
-    ("com.bmv-trader.desk", "data/desk/run.log"),
-    ("com.bmv-trader.llm", "data/llm.log"),
-    ("com.bmv-trader.notes", "data/notes/run.log"),
+/// The launchd jobs in deploy/: label, log, schedule (Mac local time, as in the plist), and
+/// whether the console may start it (`ui::RUNNABLE`).
+const JOBS: [(&str, &str, &str); 4] = [
+    (
+        "com.bmv-trader.backstop",
+        "data/backstop.log",
+        "every 2 min",
+    ),
+    ("com.bmv-trader.desk", "data/desk/run.log", "weekdays 16:30"),
+    ("com.bmv-trader.llm", "data/llm.log", "daily 05:30"),
+    ("com.bmv-trader.notes", "data/notes/run.log", "daily 18:15"),
 ];
 /// Keychain items by name; the bool is whether the item is required.
 const KEYS: [(&str, bool); 4] = [
@@ -37,6 +42,9 @@ pub struct Component {
     pub detail: String,
     /// A command to run in Terminal from the project folder; empty when nothing is needed.
     pub fix: String,
+    /// The job the console's Run-now button starts (`ui::RUNNABLE`); empty when there is none or
+    /// it is running now.
+    pub run: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,6 +64,7 @@ fn c(name: &str, status: &'static str, detail: String, fix: &str) -> Component {
             .take(200)
             .collect(),
         fix: fix.into(),
+        run: String::new(),
     }
 }
 
@@ -64,7 +73,7 @@ pub fn check(home: &Path, console_port: u16) -> Report {
     let now = chrono::Utc::now().timestamp();
     let today = watch::today_et(now);
     let mut out = vec![
-        engine(watch::heartbeat_age(home, now)),
+        engine(watch::heartbeat_age(home, now), in_session(now)),
         c(
             "Web console",
             "ok",
@@ -72,21 +81,21 @@ pub fn check(home: &Path, console_port: u16) -> Report {
             "",
         ),
     ];
-    let uid = run("/usr/bin/id", &["-u"], &[], true).filter(|(code, _)| *code == 0);
+    let uid = uid();
     let agents = std::env::var_os("HOME").map(|h| Path::new(&h).join("Library/LaunchAgents"));
-    for (label, log) in JOBS {
+    for (label, log, schedule) in JOBS {
         let installed = agents
             .as_ref()
             .map(|a| a.join(format!("{label}.plist")).is_file());
-        let print = uid.as_ref().and_then(|(_, u)| {
+        let print = uid.as_ref().and_then(|u| {
             run(
                 "/bin/launchctl",
-                &["print", &format!("gui/{}/{label}", u.trim())],
+                &["print", &format!("gui/{u}/{label}")],
                 &[],
                 true,
             )
         });
-        out.push(job(label, log, installed, print));
+        out.push(job(label, log, schedule, installed, print));
     }
     out.push(ollama());
     out.push(omniroute(llm::omniroute_port(home)));
@@ -111,12 +120,24 @@ pub fn check(home: &Path, console_port: u16) -> Report {
     }
 }
 
-fn engine(age: Option<i64>) -> Component {
+/// Weekday 09:30–16:00 New York time; holidays count as in session (a false "check" at worst).
+fn in_session(ts: i64) -> bool {
+    use chrono::{Datelike, Timelike};
+    let Some(t) = chrono::DateTime::from_timestamp(ts, 0) else {
+        return true;
+    };
+    let t = t.with_timezone(&chrono_tz::America::New_York);
+    let minute = t.hour() * 60 + t.minute();
+    t.weekday().num_days_from_monday() < 5 && (9 * 60 + 30..16 * 60).contains(&minute)
+}
+
+fn engine(age: Option<i64>, in_session: bool) -> Component {
     const FIX: &str = "caffeinate -i cargo run --release -- run";
     match age {
         Some(a) if (0..watch::HEARTBEAT_STALE_SECS).contains(&a) => {
             c("Engine (run)", "ok", format!("heartbeat {a} s ago"), "")
         }
+        _ if !in_session => c("Engine (run)", "ok", "off (market closed)".into(), ""),
         Some(a) => c(
             "Engine (run)",
             "warn",
@@ -132,8 +153,15 @@ fn engine(age: Option<i64>) -> Component {
 
 /// `installed`: the plist is in ~/Library/LaunchAgents (None: no HOME). `print`: launchctl's
 /// exit code and output (None: it couldn't run).
-fn job(label: &str, log: &str, installed: Option<bool>, print: Option<(i32, String)>) -> Component {
-    let name = format!("launchd {}", label.trim_start_matches("com.bmv-trader."));
+fn job(
+    label: &str,
+    log: &str,
+    schedule: &str,
+    installed: Option<bool>,
+    print: Option<(i32, String)>,
+) -> Component {
+    let short = label.trim_start_matches("com.bmv-trader.");
+    let name = format!("launchd {short}");
     let plist = format!("~/Library/LaunchAgents/{label}.plist");
     let bootstrap = format!("launchctl bootstrap gui/$(id -u) {plist}");
     let Some((code, text)) = print else {
@@ -155,14 +183,16 @@ fn job(label: &str, log: &str, installed: Option<bool>, print: Option<(i32, Stri
         (_, false) => c(&name, "down", "installed but not loaded".into(), &bootstrap),
         (_, true) => {
             let state = field("state = ").unwrap_or_else(|| "state unknown".into());
-            let exit = field("last exit code = ").unwrap_or_else(|| "(never exited)".into());
+            let exit = field("last exit code = ")
+                .filter(|e| e != "(never exited)")
+                .unwrap_or_else(|| "none yet".into());
             let failed = exit
                 .split(':')
                 .next()
                 .and_then(|n| n.trim().parse::<i32>().ok())
                 .is_some_and(|n| n != 0);
-            let detail = format!("loaded, {state}, last exit {exit}");
-            if failed {
+            let detail = format!("loaded, {state}, last exit {exit}; runs {schedule}");
+            let mut out = if failed {
                 c(&name, "warn", detail, &format!("tail -n 30 {log}"))
             } else if installed == Some(false) {
                 c(
@@ -173,7 +203,11 @@ fn job(label: &str, log: &str, installed: Option<bool>, print: Option<(i32, Stri
                 )
             } else {
                 c(&name, "ok", detail, "")
+            };
+            if state != "running" && crate::ui::RUNNABLE.contains(&short) {
+                out.run = short.into();
             }
+            out
         }
     }
 }
@@ -394,9 +428,16 @@ fn data(home: &Path, today: &str) -> Vec<Component> {
     ]
 }
 
+/// This user's numeric id, for launchd's `gui/<uid>` domain.
+pub(crate) fn uid() -> Option<String> {
+    run("/usr/bin/id", &["-u"], &[], true)
+        .filter(|(code, u)| *code == 0 && !u.trim().is_empty())
+        .map(|(_, u)| u.trim().to_string())
+}
+
 /// Runs a fixed system tool by absolute path, with a cleared environment (plus `env`) and a time
 /// limit. Returns the exit code and stdout when `keep_stdout`, else stdout goes to /dev/null.
-fn run(
+pub(crate) fn run(
     program: &str,
     args: &[&str],
     env: &[(&str, String)],
@@ -458,35 +499,48 @@ mod tests {
 
     #[test]
     fn launchd_jobs_read_from_launchctl_print() {
-        let (l, log) = JOBS[0];
+        let (l, log, every) = JOBS[0];
         let loaded = "gui/501/x = {\n\tstate = not running\n\truns = 1\n\tlast exit code = 0\n\
                       \tendpoints = {\n\t\tstate = active\n\t}\n}";
-        let ok = job(l, log, Some(true), Some((0, loaded.into())));
+        let ok = job(l, log, every, Some(true), Some((0, loaded.into())));
         assert_eq!(ok.status, "ok");
-        assert_eq!(ok.detail, "loaded, not running, last exit 0");
+        assert_eq!(
+            ok.detail,
+            "loaded, not running, last exit 0; runs every 2 min"
+        );
+        assert_eq!(ok.run, "", "the backstop has no Run-now button");
         let failed = loaded.replace("code = 0", "code = 78: Function not implemented");
-        let bad = job(l, log, Some(true), Some((0, failed)));
+        let bad = job(l, log, every, Some(true), Some((0, failed)));
         assert_eq!(
             (bad.status, bad.fix.as_str()),
             ("warn", "tail -n 30 data/backstop.log")
         );
         let never = loaded.replace("last exit code = 0", "last exit code = (never exited)");
-        assert_eq!(job(l, log, Some(true), Some((0, never))).status, "ok");
-        let missing = job(l, log, Some(false), Some((113, String::new())));
+        let never = job(l, log, every, Some(true), Some((0, never)));
+        assert_eq!(never.status, "ok");
+        assert!(never.detail.contains("last exit none yet"));
+        let (d, dlog, dev) = JOBS[1];
+        assert_eq!(
+            job(d, dlog, dev, Some(true), Some((0, loaded.into()))).run,
+            "desk"
+        );
+        let running = loaded.replace("state = not running", "state = running");
+        assert_eq!(job(d, dlog, dev, Some(true), Some((0, running))).run, "");
+        let missing = job(l, log, every, Some(false), Some((113, String::new())));
         assert_eq!(missing.status, "down");
         assert!(
             missing
                 .fix
                 .starts_with("cp deploy/com.bmv-trader.backstop.plist")
         );
-        let unloaded = job(l, log, Some(true), Some((113, String::new())));
+        let unloaded = job(l, log, every, Some(true), Some((113, String::new())));
         assert_eq!(unloaded.detail, "installed but not loaded");
         assert!(
             unloaded
                 .fix
                 .starts_with("launchctl bootstrap gui/$(id -u) ")
         );
-        assert_eq!(job(l, log, Some(true), None).status, "unknown");
+        assert_eq!(job(l, log, every, Some(true), None).status, "unknown");
     }
 
     #[test]
@@ -551,10 +605,48 @@ mod tests {
             let o = comp.as_object().unwrap();
             let mut keys: Vec<&str> = o.keys().map(String::as_str).collect();
             keys.sort();
-            assert_eq!(keys, ["detail", "fix", "name", "status"]);
+            assert_eq!(keys, ["detail", "fix", "name", "run", "status"]);
             assert!(["ok", "warn", "down", "unknown"].contains(&o["status"].as_str().unwrap()));
         }
         assert_eq!(comps[1]["status"], "ok", "the console reports itself up");
-        assert_eq!(comps[0]["status"], "warn", "no heartbeat in an empty home");
+        assert_eq!(
+            comps[0]["status"],
+            engine(None, in_session(v["now"].as_i64().unwrap())).status
+        );
+    }
+
+    #[test]
+    fn the_engine_is_only_missed_in_session() {
+        // 2026-11-03 is a Tuesday; 15:00Z is 10:00 ET, 22:00Z is 17:00 ET
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        assert!(in_session(at("2026-11-03T15:00:00Z")));
+        assert!(!in_session(at("2026-11-03T22:00:00Z")));
+        assert!(!in_session(at("2026-11-07T15:00:00Z")), "Saturday");
+        assert_eq!(engine(None, true).status, "warn");
+        assert_eq!(engine(Some(9999), false).detail, "off (market closed)");
+    }
+
+    #[test]
+    fn schedules_match_the_plists() {
+        for (label, _, schedule) in JOBS {
+            let plist = std::fs::read_to_string(format!("deploy/{label}.plist")).unwrap();
+            let int = |key: &str, n: &str| {
+                plist.contains(&format!("<key>{key}</key><integer>{n}</integer>"))
+            };
+            let ok = match schedule.split_once(' ') {
+                Some(("every", "2 min")) => {
+                    plist.contains("<key>StartInterval</key>\n  <integer>120</integer>")
+                }
+                Some((days, hm)) => {
+                    let (h, m) = hm.split_once(':').unwrap();
+                    let h = h.trim_start_matches('0');
+                    int("Hour", h)
+                        && int("Minute", m)
+                        && (days == "daily") == !plist.contains("<key>Weekday</key>")
+                }
+                None => false,
+            };
+            assert!(ok, "{label}: {schedule} doesn't match its plist");
+        }
     }
 }
