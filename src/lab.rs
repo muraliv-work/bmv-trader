@@ -462,6 +462,83 @@ pub fn evaluate(e: &Expr, panel: &Panel, months: &[usize]) -> Option<Stats> {
     })
 }
 
+/// Trial 11's name in `data/trials.jsonl` (DESIGN §7h).
+pub const TRIAL_11: &str = "lab ranking search";
+/// Trial 11 is judged at 1 − 0.05/11 whatever else is logged.
+pub const TRIAL_11_NUMBER: usize = 11;
+/// How many search candidates go to validation, how distinct they must be, and how many advance.
+pub const VALIDATE: usize = 20;
+pub const MAX_SCORE_CORR: f64 = 0.9;
+pub const ADVANCE: usize = 3;
+
+/// The lower bound of the mean IC: two-sided at 1 − 0.05/`trials`, resampling 3-month blocks.
+pub fn ic_bound(ics: &[f64], trials: usize) -> Option<f64> {
+    let alpha = crate::stats::FAMILY_ALPHA / trials.max(1) as f64;
+    let blocks: Vec<Vec<f64>> = ics
+        .chunks(momentum::BLOCK_MONTHS)
+        .map(<[f64]>::to_vec)
+        .collect();
+    crate::stats::bootstrap_expectancy(&blocks, crate::stats::resamples_for(alpha), alpha, 42)
+        .map(|(lo, _)| lo)
+}
+
+/// The mean monthly rank correlation of two formulas' scores over `months`.
+pub fn score_corr(a: &Expr, b: &Expr, panel: &Panel, months: &[usize]) -> f64 {
+    let cs: Vec<f64> = months
+        .iter()
+        .filter_map(|&k| {
+            let rows = &panel.months[k];
+            let (x, y) = (a.eval(rows), b.eval(rows));
+            let both: Vec<usize> = (0..rows.len())
+                .filter(|&i| x[i].is_finite() && y[i].is_finite())
+                .collect();
+            power::spearman(
+                &both.iter().map(|&i| x[i]).collect::<Vec<_>>(),
+                &both.iter().map(|&i| y[i]).collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    if cs.is_empty() {
+        1.0
+    } else {
+        momentum::mean(&cs)
+    }
+}
+
+/// The best `want` candidates by search fitness whose top 20 beat random, each scoring stocks
+/// differently from every one kept before it (|correlation| at most `MAX_SCORE_CORR` on `months`).
+pub fn distinct(
+    cands: &[Candidate],
+    panel: &Panel,
+    months: &[usize],
+    want: usize,
+) -> Vec<Candidate> {
+    let mut sorted: Vec<&Candidate> = cands.iter().filter(|c| c.stats.excess_mean > 0.0).collect();
+    sorted.sort_by(|a, b| {
+        b.stats
+            .fitness
+            .total_cmp(&a.stats.fitness)
+            .then(a.key.cmp(&b.key))
+    });
+    let mut keys: HashSet<&str> = HashSet::new();
+    let mut kept: Vec<Candidate> = Vec::new();
+    for c in sorted {
+        if kept.len() >= want {
+            break;
+        }
+        if !keys.insert(c.key.as_str()) {
+            continue;
+        }
+        if kept
+            .iter()
+            .all(|k| score_corr(&k.expr, &c.expr, panel, months).abs() <= MAX_SCORE_CORR)
+        {
+            kept.push(c.clone());
+        }
+    }
+    kept
+}
+
 /// The best mean IC expected by luck from `tries` formulas with no edge (DESIGN §7h).
 pub fn luck_line(ic_sd: f64, months: usize, tries: usize) -> f64 {
     ic_sd / (months.max(1) as f64).sqrt() * (2.0 * (tries.max(2) as f64).ln()).sqrt()
@@ -839,6 +916,38 @@ mod tests {
             (pop.iter().map(|c| c.key.clone()).collect::<Vec<_>>(), tries)
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn distinct_picks_drop_near_copies_and_the_bound_is_strict() {
+        let p = panel(24, 100, 6, &|label, _| label as f32);
+        let months: Vec<usize> = (0..24).collect();
+        let c = |e: Expr, fitness: f64| {
+            let mut stats = evaluate(&e, &p, &months).unwrap();
+            stats.fitness = fitness;
+            Candidate {
+                key: e.key(),
+                expr: e,
+                source: "t".into(),
+                seed: 0,
+                stats,
+            }
+        };
+        let a = Expr::Feat(Feature::Ret1);
+        let copy = Expr::Rank(Box::new(Expr::Feat(Feature::Ret1)));
+        let other = Expr::Feat(Feature::Ret5);
+        let mut other_c = c(other, 0.1);
+        other_c.stats.excess_mean = 0.01;
+        let picks = distinct(&[c(a, 0.3), c(copy, 0.2), other_c], &p, &months, 20);
+        assert_eq!(
+            picks.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(),
+            ["ret1", "ret5"]
+        );
+        assert!(ic_bound(&[0.5; 30], 11).unwrap() > 0.4);
+        let noise: Vec<f64> = (0..30)
+            .map(|i| if i % 2 == 0 { 0.1 } else { -0.1 })
+            .collect();
+        assert!(ic_bound(&noise, 11).unwrap() < 0.0);
     }
 
     #[test]

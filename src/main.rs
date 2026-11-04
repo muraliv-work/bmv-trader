@@ -21,6 +21,7 @@ const USAGE: &str = "usage:
   bmv-trader momentum                     trial 7: 12-1 month momentum on the adjusted daily bars (DESIGN §13c)
   bmv-trader power                        the smallest effect trials 11 and 12 could detect (spreads from trial 7)
   bmv-trader lab-search [--minutes 5] [--seed 1]  evolve ranking formulas on the search months only (DESIGN §7h)
+  bmv-trader lab-validate                 ONCE: freeze the top 20 distinct formulas, score them on 2023-01..2025-09, log trial 11
   bmv-trader lab-ideas [--count 10]       ask the local model (Tier 2) for new formulas; the next lab-search starts from them
   bmv-trader desk-run                     trial 10 nightly (20 min after the close): live bars, signals, analyst ratings, scores
   bmv-trader desk-report                  trial 10 so far: signals, ratings, spend, outcomes
@@ -180,6 +181,7 @@ fn main() {
             }
             Some("momentum") => momentum(),
             Some("power") => power(),
+            Some("lab-validate") => lab_validate(),
             Some("lab-ideas") => lab_ideas(args.num("--count", 10, 1..=100)?),
             Some("lab-search") => lab_search(
                 args.num("--minutes", 5, 1..=600)?,
@@ -563,6 +565,125 @@ fn lab_ideas(count: usize) -> Result<(), String> {
         "{} new formulas from {calls} local-model calls ({duplicate} already known, {rejected} lines rejected); \
          the next lab-search starts from them",
         new.len()
+    );
+    Ok(())
+}
+
+/// Trial 11's validation stage (DESIGN §7h): run once. The picks are frozen and written before any
+/// validation month is scored, and the lab's search closes for good.
+fn lab_validate() -> Result<(), String> {
+    use bmv_trader::lab::{self, Candidate};
+    let dir = data_dir()?;
+    let lab_dir = dir.join("lab");
+    let done = lab_dir.join("validated");
+    if done.exists() {
+        return Err(format!(
+            "{} exists: validation runs once (DESIGN §7h)",
+            done.display()
+        ));
+    }
+    let log = dir.join("trials.jsonl");
+    if logged_trials(&log)?.iter().any(|t| t == lab::TRIAL_11) {
+        return Err("trial 11 is already logged".into());
+    }
+    let read = |name: &str| std::fs::read_to_string(lab_dir.join(name)).unwrap_or_default();
+    let cands: Vec<Candidate> = read("candidates.jsonl")
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("candidates.jsonl: {e}"))?;
+    let tries: usize = read("runs.jsonl")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["tries"].as_u64())
+        .sum::<u64>() as usize;
+    if cands.is_empty() {
+        return Err("no candidates: run lab-search first".into());
+    }
+    let (cal, panel) = lab_panel(&dir, lab::VALIDATION_END)?;
+    let search = panel.range(&cal, lab::SEARCH_START, lab::SEARCH_END);
+    let validation = panel.range(&cal, lab::SEARCH_END, lab::VALIDATION_END);
+    // distinctness from search months only (every 6th, for speed)
+    let sample: Vec<usize> = search.iter().copied().step_by(6).collect();
+    let picks = lab::distinct(&cands, &panel, &sample, lab::VALIDATE);
+    append_jsonl(&lab_dir.join("frozen.jsonl"), &picks)?;
+    eprintln!(
+        "{} picks frozen from {} candidates ({tries} tries); scoring {} validation months ({}..{})",
+        picks.len(),
+        cands.len(),
+        validation.len(),
+        validation.first().map_or("", |&k| panel.dates[k].as_str()),
+        validation.last().map_or("", |&k| panel.dates[k].as_str()),
+    );
+    let mut rows = Vec::new();
+    for c in &picks {
+        let v = lab::evaluate(&c.expr, &panel, &validation)
+            .ok_or_else(|| format!("{}: too few validation months", c.key))?;
+        let bound = lab::ic_bound(&v.ics, lab::TRIAL_11_NUMBER);
+        rows.push((c, v, bound));
+    }
+    let advanced: Vec<&Candidate> = rows
+        .iter()
+        .filter(|(_, v, b)| b.is_some_and(|b| b > 0.0) && v.excess_mean > 0.0)
+        .map(|(c, _, _)| *c)
+        .take(lab::ADVANCE)
+        .collect();
+    append_jsonl(&lab_dir.join("advanced.jsonl"), &advanced)?;
+    let best = rows
+        .iter()
+        .max_by(|a, b| a.2.unwrap_or(f64::MIN).total_cmp(&b.2.unwrap_or(f64::MIN)))
+        .ok_or("no picks")?;
+    let trial = stats::Trial {
+        when: chrono::Utc::now().to_rfc3339(),
+        strategy: lab::TRIAL_11.into(),
+        params: format!(
+            "{tries} search tries, {} validation picks, {} advanced; units: expectancy_r is the best pick's mean monthly IC and ci_low its 3-month-block bound at 1 - 0.05/11, not R; max_drawdown_r unused",
+            picks.len(),
+            advanced.len()
+        ),
+        period: format!(
+            "{}..{}",
+            validation.first().map_or("", |&k| panel.dates[k].as_str()),
+            validation.last().map_or("", |&k| panel.dates[k].as_str())
+        ),
+        trades: validation.len() * lab::HOLD,
+        expectancy_r: best.1.ic_mean,
+        profit_factor: None,
+        max_drawdown_r: 0.0,
+        ci_low: best.2,
+    };
+    let n = stats::record_trial(&log, &trial)?;
+    std::fs::write(&done, format!("{}\n", trial.when))
+        .map_err(|e| format!("{}: {e}", done.display()))?;
+    let sd = bmv_trader::momentum::mean(&rows.iter().map(|r| r.0.stats.ic_sd).collect::<Vec<_>>());
+    println!(
+        "trial {n} logged as \"{}\". Search luck line from {tries} tries: {:.3}",
+        lab::TRIAL_11,
+        lab::luck_line(sd, search.len(), tries)
+    );
+    println!(
+        "{:>9} {:>8} {:>9} {:>10}  formula",
+        "search IC", "val IC", "IC bound", "excess/mo"
+    );
+    for (c, v, b) in &rows {
+        println!(
+            "{:>9.3} {:>8.3} {:>9} {:>9.2}%  {}{}",
+            c.stats.ic_mean,
+            v.ic_mean,
+            b.map_or("none".into(), |b| format!("{b:.3}")),
+            v.excess_mean * 100.0,
+            c.key,
+            if advanced.iter().any(|a| a.key == c.key) {
+                "  ADVANCES"
+            } else {
+                ""
+            }
+        );
+    }
+    println!(
+        "{} of {} advance to the untouched-year check (lab-final). The search is closed.",
+        advanced.len(),
+        picks.len()
     );
     Ok(())
 }
@@ -1386,10 +1507,14 @@ fn desk_verdict() -> Result<(), String> {
     if trials.iter().any(|t| t == desk::TRIAL_NAME) {
         return Err("trial 10 is already logged".into());
     }
-    if trials.len() + 1 != desk::TRIAL_NUMBER {
+    // the lab logs trial 11 before trial 10's verdict is due (DESIGN §7h); it doesn't count here
+    let before = trials
+        .iter()
+        .filter(|t| t.as_str() != bmv_trader::lab::TRIAL_11)
+        .count();
+    if before + 1 != desk::TRIAL_NUMBER {
         return Err(format!(
-            "trials.jsonl holds {} trials; trial 10 must be the 10th (DESIGN §7f)",
-            trials.len()
+            "trials.jsonl holds {before} trials before trial 10 (lab excluded); trial 10 must be the 10th (DESIGN §7f)"
         ));
     }
     let (_, to) = bmv_trader::scan::daily_range(&dir, bmv_trader::scan::ADJUSTED_SIP_LIVE)?;
