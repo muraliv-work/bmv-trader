@@ -48,7 +48,7 @@ const MAX_SEEDS: usize = 50;
 
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
-const VALUE_FLAGS: [&str; 9] = [
+const VALUE_FLAGS: [&str; 11] = [
     "--date",
     "--trial",
     "--strategy",
@@ -58,6 +58,8 @@ const VALUE_FLAGS: [&str; 9] = [
     "--fold-days",
     "--seeds",
     "--port",
+    "--minutes",
+    "--seed",
 ];
 const SWITCHES: [&str; 7] = [
     "--adjusted",
