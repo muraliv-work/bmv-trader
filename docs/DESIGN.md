@@ -10,7 +10,7 @@ An AI-assisted intraday trading system for US stocks/ETFs (crypto later), runnin
 Deterministic rules find setups, Claude vets them, hard-coded risk limits have the final say. Paper trading by default.
 **The real goal is to find and prove an edge cheaply.** Every phase is gated, and failing a gate means stopping or going back.
 
-**Non-goals (v1):** options, futures, overnight holds, 24/7 crypto, high-frequency trading, any UI that can place orders, cloud deployment.
+**Non-goals (v1):** options, futures, overnight holds in the intraday book (the swing book, §7d, holds 2–10 days by design), 24/7 crypto, high-frequency trading, any UI that can place orders, cloud deployment.
 
 **Monitoring:**
 - Alpaca's dashboard for positions, orders and P&L (from day one)
@@ -198,7 +198,23 @@ Three local services sit **above** the Rust engine. They can only propose; the e
 2. Analyst: a TradingAgents sidecar, run Claude-only with JSON output and per-ticker cost measured first, then the forward test.
 3. Agents: paperclip routines for the pre-market run, end-of-day review and research proposals, with board approval for any strategy change.
 
-**Agent roles:** to be mapped from the owner's reference setup (a Grok trading-bot post) once its text is available. Every role still obeys the AI authority ladder (§10).
+**Desk roles** (after the owner's reference "Grok Bot trading team" post). Its process is kept: one job per role, every idea through every step, a journal, paper first, and approval for live orders. Its authority model is replaced, so that rules live in code and no LLM holds broker keys:
+
+| Post role | bmv-trader | LLM or code | Authority |
+|---|---|---|---|
+| You | Console, briefs, live-order approval (P5) | — | Approves live orders and strategy changes; only you clear STOP |
+| Chief of Staff | paperclip agent | LLM (routing per §10) | Routes work. Writes the 07:30 brief, 16:30 close report and Sunday review. Can't trade or change rules |
+| Scout | Rust `scout` scan (movers, volume, earnings, Alpaca news), then a Claude "why", with a source and time | Code finds, LLM explains | Proposals only. "No signal" is a valid answer |
+| Chart Analyst | Rust indicators on daily bars: the Desk Signal (§7d), giving a 1–10 score | Code | A score of 7 or more passes |
+| Strategist | Backtester and P1 gate. An LLM may suggest a variant; code tests it once, as a logged trial | Code decides | Only a gate-passing strategy trades |
+| Analyst desk | TradingAgents debate, giving a rating mapped to approve, reduce or reject | LLM (Claude direct) | Can only shrink or veto a code candidate |
+| Risk Officer | `risk::gate` plus the event filter (earnings, FOMC, CPI inside the hold), with swing limits (§9). An LLM reviewer gives advisory notes only | Code is final | Veto in code, naming the rule |
+| Trader | Rust swing executor: limit entry, GTC stop, no chasing (§8 step 5) | Code | Executes gated intents only |
+| Journal | `data/journal.jsonl` plus `data/desk.jsonl` (handoffs and proposals) | Code | Audit trail |
+| Kill switch | STOP, flatten, backstop (now scoped to the intraday book), plus Alpaca account settings | Code and broker | "A prompt is a request; a broker setting is a wall" |
+
+- **Desk Rules for agents** are a read-only file, `data/desk_rules.md`, generated from the Rust `Limits`. Prompts can't drift from the code.
+- **Sidecars install from pinned public releases** (PyPI, npm or a git commit), never from `REFERENCE-REPOS/`, which is reading material only and may be deleted.
 
 ## 5. Components → files
 
@@ -274,6 +290,49 @@ On a half-day (close at 13:00), all of this shifts automatically.
 
 **Both trials count toward the gate.** With trials 1–3, that makes 5 trials, and the Bonferroni correction applies to all of them. Neither gets a `--trend` or `--marketable` variant unless that is pre-registered as a further trial.
 
+## 7d. Swing book and trial 8: Desk Signal (pre-registered 2026-11-03, before any code)
+
+**The book:**
+- Long-only, holding 2–10 sessions. It runs beside the intraday book (§7) with **disjoint symbols**.
+- Entry ids are `bmv-s-{date}-{SYM}-{seq}`.
+- The protective stop sits at Alpaca as **GTC**, so a position stays protected with the Mac off.
+- The intraday end-of-day flatten and the backstop close **only the intraday book**. Operator STOP and flatten still close everything.
+- Swing state is rebuilt from Alpaca (positions plus `bmv-s-` orders). `data/swing.json` keeps only what Alpaca doesn't: entry date, target and source proposal.
+- `bmv-trader swing` runs once a day at about 09:35 ET.
+- **No swing order is placed until trial 8 (or a later swing trial) passes the gate.** Until then the desk runs as research and paper shadow.
+
+**Trial 8: the post's "Desk Signal", tested as a strategy:**
+- **Data and universe:** trial 7's (§13c): adjusted SIP daily bars, all US stocks including delisted, a $20M 63-session average dollar volume with bars on at least 60 of those sessions. At least 250 bars of history, for EMA 200.
+- **Signal at the close of session s** (all of these):
+  - EMA 8 > EMA 21 > EMA 50 > EMA 200, using closes
+  - close(s) > the highest high of the 20 sessions before s
+  - volume(s) ≥ 1.5 × the mean volume of the 20 sessions before s
+  - RSI(14, Wilder) > 50
+  - ATR(14, Wilder) below the 90th percentile of its last 100 values (the volatility filter)
+- **Entry:** long at the open of s+1.
+  - Skipped if that open is more than 0.5% above close(s): no chasing.
+  - Skipped if the symbol is already held.
+  - At most 5 positions open at once. When more fire on a day, rank by volume ratio, then by symbol.
+- **Exits:**
+  - Stop: entry − 2 × ATR(s). Target: entry + 3 × ATR(s). Time: the open of the 11th session after entry, so at most 10 sessions held.
+  - A day that touches both the stop and the target counts as a stop.
+  - A gap through the stop fills at the open.
+  - The target fills only when the high is strictly above it, or at the open if the day gaps above it.
+  - A delisted position exits at its last close.
+- **Costs:** 0.2% of notional per side, converted to R. One R is entry − stop.
+- **Baseline:** random entries, pooled over 5 seeds. On each day with entries, the same number of symbols is drawn at random from that day's eligible set, with the same exits and costs.
+- **Benchmark:** SPY buy-and-hold. Strategy returns convert R to equity at **1% risk per trade**.
+- **Research period:** entries from 2017-01-03; every trade exits before the holdout (2025-10-02).
+- **Gate:** the §13 P1 gate, using a 99.375% interval (Bonferroni over 8 trials):
+  - the expectancy's lower bound > 0 and above the baseline (day-block bootstrap)
+  - at least 60% of 63-session walk-forward windows profitable
+  - profit factor > 1.2
+  - max drawdown < 10R
+  - at least 100 trades
+  - **plus** CAGR and Sharpe above SPY, on point estimates
+- **No event filter in trial 8.** Point-in-time earnings dates aren't loaded yet. An earnings and macro filter would be its own trial.
+- **One run, logged once.** Any changed number is a new trial.
+
 ## 8. Decision pipeline (one candidate)
 
 1. **Strategy** emits a `Candidate`, which is journaled.
@@ -315,6 +374,14 @@ On a half-day (close at 13:00), all of this shifts automatically.
 | Minimum R | 0.15% of price, 5¢ | same |
 | Account restrictions | Read Alpaca's account flags (`trading_blocked`, buying power) and block on any restriction | same |
 
+**Swing book (paper):**
+- At most 5 positions and $2,500 notional per position.
+- 1% of book equity risked per trade, sized on the stop **plus 1 ATR** for overnight gaps.
+- A weekly loss halt at −4% of book equity.
+- Symbols disjoint from the intraday book.
+- Correlation clusters and buying power count both books.
+- The intraday daily halt uses the intraday book's own P&L, not `equity − last_equity`, which would mix in overnight swing P&L.
+
 - **PDT note:** FINRA has replaced the $25k pattern-day-trader rule with an intraday margin rule, and brokers are in a 12-month transition (Alpaca docs: *the-intraday-margin-rule*). So there is **no hard-coded PDT logic**: the system reads the account's restriction fields and buying power and obeys them **[verify fields]**.
 - **Halts persist without the journal.** The daily loss and the trade count are re-derived from Alpaca. The consecutive-loss count is re-derived from today's closed orders. So a restart can't forget a halt.
 - **Kill switch:** the file `$BMV_HOME/data/STOP` (absolute path). Any read error other than "not found" counts as **halted**. It's self-tested at startup. `bmv-trader flatten` closes everything now.
@@ -330,6 +397,19 @@ On a half-day (close at 13:00), all of this shifts automatically.
 
 - **The Anthropic host is hard-coded,** never read from `ANTHROPIC_BASE_URL`. The response's `model` field must match the model requested. Claude never goes through OmniRoute.
 - **Free-model output never reaches the decision path.**
+- **Route per task, fixed in code (`src/llm.rs`):**
+  - **Tier 1, Claude direct:** anything that can change a trade or a strategy. That is the analyst (both TradingAgents tiers), the risk reviewer, any text parsed into a verdict, strategist ideas and the Sunday review. It counts toward the **$100/month** cap.
+  - **Tier 2, OmniRoute** (Ollama first): chores that only describe facts the code computed. That is paperclip heartbeats, the wording of briefs and reports, journal narratives, and your news digest.
+  - **No fallback across tiers.** If Tier 1 is down, the analyst is off and candidates go ahead rules-only in shadow.
+  - Proposals are accepted only with a `claude-direct` provenance that matches the Tier-1 call ledger.
+- **`bmv-trader llm-health`** runs from launchd at 06:00 ET. It checks:
+  - OmniRoute OAuth connections, alerting 48 hours before expiry (re-consent is manual)
+  - breakers and cooldowns (reported, never reset)
+  - a probe per route
+  - a Tier-1 probe with the budget left
+
+  It writes `data/llm_health.json`.
+- **OmniRoute's CLI loads `.env` from its working directory.** Our code reaches OmniRoute only over HTTP, and runs the CLI only from `~/.omniroute` with `env -i`.
 - **Cost control:** cached system prompt; Claude called only for candidates that passed the pre-check, capped per day; tokens and cost journaled per call.
 
 ### AI controls (P4)

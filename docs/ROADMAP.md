@@ -38,5 +38,14 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 - [ ] `llm.rs`, `vetting.rs` parsing, prompt versioning, regression set, drift alarm; second paper account shadow; candidates and verdicts in the `ui` console (tier 1/2)
 - [ ] ⛔ 20+ paper days; pre-registered Claude-vs-shadow gate
 
+## Desk: swing book and three layers (DESIGN §4b, §7d; plan approved 2026-11-03)
+- [x] Phase 0: design records (DESIGN §1, §4b roles, §7d, §9, §10; DECISION S19–S21, A10–A11, R2i)
+- [ ] Phase 1: trial 8, Desk Signal swing (pre-registered). No swing order until a swing trial passes
+- [ ] Phase 2: engine swing book (`bmv-s-` ids, scoped flatten and backstop, GTC stops, risk split, per-book console); tier-1 review
+- [ ] Phase 3: data layer, OpenBB sidecar from pinned PyPI (the HEAD checkout crashes on start) plus `src/openbb.rs`
+- [ ] Phase 4: `src/llm.rs` tiers, cost ledger and `llm-health`, then the TradingAgents sidecar (Claude-only, social off)
+- [ ] Phase 5: agents layer, paperclip (loopback, telemetry off, no broker keys)
+- [ ] Phase 6: pre-registered forward paper test, rules-only vs rules + AI vs random vs SPY
+
 ## P5 — Live pilot
 - [ ] ⛔ Mac mini, phone approvals, live limits, 30 live days
