@@ -23,6 +23,10 @@ const USAGE: &str = "usage:
   bmv-trader desk-report                  trial 10 so far: signals, ratings, spend, outcomes
   bmv-trader desk-analyse --symbols X --date YYYY-MM-DD  one analyst run outside the trial (measures cost)
   bmv-trader desk-verdict                 trial 10's pre-registered verdict, once it is due (logged once)
+  bmv-trader notes                        Tier 2: write any due notes (desk brief, analyst digest, session, Sunday digest)
+  bmv-trader llm-health                   check Ollama, OmniRoute, a Tier-2 probe, key age and Claude spend
+  bmv-trader llm-rotate                   regenerate the OmniRoute key, store it, re-apply its policy
+  bmv-trader llm-daily                    for launchd: llm-rotate, then llm-health
   bmv-trader asset-names                  Alpaca's name for each universe symbol (for trial 9's fund filter)
   bmv-trader backtest-swing --trial 8|9   the Desk Signal swing strategy on the adjusted daily bars (DESIGN §7d, §7e)
   bmv-trader scan     --from YYYY-MM-DD --to YYYY-MM-DD   each day's gappers, and their minute bars
@@ -180,6 +184,22 @@ fn main() {
                 match (symbol.as_slice(), args.get("--date")) {
                     ([s], Some(d)) if args.get("--symbols").is_some() => desk_analyse(s, d),
                     _ => Err("desk-analyse needs --symbols X (one) and --date YYYY-MM-DD".into()),
+                }
+            }
+            Some("notes") => notes(),
+            Some("llm-health") => llm_health().map(|_| ()),
+            Some("llm-rotate") => llm_rotate(),
+            Some("llm-daily") => {
+                let rotated = llm_rotate();
+                if let Err(e) = &rotated {
+                    eprintln!("rotation failed: {e}");
+                }
+                let healthy = llm_health()?;
+                rotated?;
+                if healthy {
+                    Ok(())
+                } else {
+                    Err("Tier 2 health check failed (data/llm_health.json)".into())
                 }
             }
             Some("asset-names") => {
@@ -728,7 +748,7 @@ fn live_calendar(dir: &Path) -> Result<bmv_trader::momentum::Calendar, String> {
 fn desk_run() -> Result<(), String> {
     use bmv_trader::desk::{self, Analysis, Status};
     let (home, dir) = (config::home()?, data_dir()?);
-    let _lock = desk::lock(&home)?;
+    let lock = desk::lock(&home)?;
     let et = et_now();
     let today = et.date_naive().to_string();
     let alpaca = connect()?;
@@ -829,7 +849,144 @@ fn desk_run() -> Result<(), String> {
     }
     let cards = desk::score_all(&home, &cal, &desk::read_analyses(&home)?)?;
     history::write_json(&desk::desk_dir(&home).join("outcomes.json"), &cards)?;
-    desk_report(&home, &cal).map(|_| ())
+    desk_report(&home, &cal)?;
+    // Tier 2 notes are best-effort: they never fail the night, and run without the desk lock
+    drop(lock);
+    if let Err(e) = notes() {
+        eprintln!("notes: {e}");
+    }
+    Ok(())
+}
+
+/// Tier 2: writes the notes that are due (DESIGN §10). Each is written once.
+fn notes() -> Result<(), String> {
+    use bmv_trader::notes::{self, Outcome};
+    use chrono::Datelike;
+    let home = config::home()?;
+    // the desk lock keeps a still-running desk-run's night from being written up half done
+    let _desk = bmv_trader::desk::lock(&home)?;
+    let _lock = notes::lock(&home)?;
+    let et = et_now();
+    let sunday = et.weekday() == chrono::Weekday::Sun;
+    let mut failed = 0;
+    for (name, out) in notes::run_due(&home, &et.date_naive().to_string(), sunday) {
+        match out {
+            Outcome::Written(p) => println!("  note {name}: {}", p.display()),
+            Outcome::Fallback(p, e) => {
+                println!(
+                    "  note {name}: facts only, Tier 2 down ({e}): {}",
+                    p.display()
+                )
+            }
+            Outcome::Skipped(why) => println!("  note {name}: skipped ({why})"),
+            Outcome::Failed(e) => {
+                failed += 1;
+                println!("  note {name}: FAILED ({e})")
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(format!("{failed} note job(s) failed"));
+    }
+    Ok(())
+}
+
+fn rotated_path(home: &Path) -> std::path::PathBuf {
+    home.join("data").join("llm_rotated.json")
+}
+
+/// The last rotation's error, kept until a rotation succeeds, so health reports it.
+fn rotate_error_path(home: &Path) -> std::path::PathBuf {
+    home.join("data").join("llm_rotate_error.json")
+}
+
+/// Daily OmniRoute key rotation (DECISION S22). No Tier-2 call can be in flight: it holds the
+/// desk and notes locks.
+fn llm_rotate() -> Result<(), String> {
+    let home = config::home()?;
+    let _desk = bmv_trader::desk::lock(&home)?;
+    let _notes = bmv_trader::notes::lock(&home)?;
+    let user_home = std::path::PathBuf::from(std::env::var("HOME").map_err(|_| "HOME is not set")?);
+    match bmv_trader::llm::rotate(&user_home) {
+        Ok(done) => {
+            let _ = std::fs::remove_file(rotate_error_path(&home));
+            history::write_json(&rotated_path(&home), &chrono::Utc::now().to_rfc3339())?;
+            println!("{done}");
+            Ok(())
+        }
+        Err(e) => {
+            let when = chrono::Utc::now().to_rfc3339();
+            if let Err(w) = history::write_json(&rotate_error_path(&home), &(when, e.clone())) {
+                eprintln!("cannot record the rotation error: {w}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Tier 1 and Tier 2 health, always written to data/llm_health.json (a check that can't run
+/// is a failing check). Returns whether all checks pass.
+fn llm_health() -> Result<bool, String> {
+    use bmv_trader::llm::{self, Check, Health};
+    let home = config::home()?;
+    // don't probe in the middle of a rotation or a notes run
+    let mut checks = match bmv_trader::notes::lock(&home) {
+        Ok(_lock) => llm::probe_checks(),
+        Err(e) => vec![Check::of("Tier-2 probe", Err(format!("not run: {e}")))],
+    };
+    let age = match history::read_json::<String>(&rotated_path(&home)) {
+        Ok(t) => chrono::DateTime::parse_from_rfc3339(&t)
+            .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_hours())
+            .map_err(|e| format!("llm_rotated.json: {e}")),
+        Err(_) => Err("never rotated".into()),
+    };
+    checks.push(Check::of(
+        "OmniRoute key rotated within 2 days",
+        age.and_then(|h| {
+            if (0..48).contains(&h) {
+                Ok(format!("{h} h ago"))
+            } else {
+                Err(format!("{h} h ago"))
+            }
+        }),
+    ));
+    checks.push(Check::of(
+        "last rotation succeeded",
+        match history::read_json::<(String, String)>(&rotate_error_path(&home)) {
+            Ok((when, e)) => Err(format!("{when}: {e}")),
+            Err(_) => Ok("no recorded failure".into()),
+        },
+    ));
+    let today = et_now().date_naive().to_string();
+    checks.push(Check::of(
+        "Claude (Tier 1) spend under the monthly cap",
+        bmv_trader::desk::all_runs(&home).and_then(|runs| {
+            let (_, month) = bmv_trader::desk::spent(&runs, &today);
+            let line = format!(
+                "${month:.2} of ${:.0} this month",
+                bmv_trader::desk::MONTHLY_BUDGET_USD
+            );
+            if month < bmv_trader::desk::MONTHLY_BUDGET_USD {
+                Ok(line)
+            } else {
+                Err(line)
+            }
+        }),
+    ));
+    let h = Health {
+        when: chrono::Utc::now().to_rfc3339(),
+        checks,
+    };
+    history::write_json(&llm::health_path(&home), &h)?;
+    for c in &h.checks {
+        println!(
+            "  [{}] {}: {}",
+            if c.ok { "ok" } else { "FAIL" },
+            c.name,
+            c.detail
+        );
+    }
+    Ok(h.ok())
 }
 
 fn describe(s: &bmv_trader::desk::Status) -> String {

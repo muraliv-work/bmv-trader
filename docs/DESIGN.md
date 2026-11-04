@@ -493,7 +493,16 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
 - **Key rotation (DECISION S22):**
   - `llm-rotate` regenerates the OmniRoute key **daily**, using the OmniRoute CLI from `~/.omniroute` with a cleared environment.
   - It stores the key in the Keychain over stdin, so the secret never appears in a process list, then re-applies the key's policy: only `bmv-local`, $0 a day, rate-limited.
-  - `llm-health` then checks Ollama, OmniRoute, a probe call, the key's age and the Tier-1 month-to-date spend, and writes `data/llm_health.json`.
+  - The policy is applied **before** the test call, so a failed test can't leave a broad key.
+  - **Schedule:** daily at 05:30 Mac time.
+  - `llm-health` then checks:
+    - Ollama, OmniRoute and a probe call
+    - the key's age
+    - the last rotation's result
+    - the Tier-1 month-to-date spend
+
+    It always writes `data/llm_health.json`; a check that can't run counts as a failure.
+  - Notes written while Tier 2 is down are saved as `*.facts.md` and retried later.
 - **Cost control:** cached system prompt; Claude called only for candidates that passed the pre-check, capped per day; tokens and cost journaled per call.
 
 ### AI controls (P4)

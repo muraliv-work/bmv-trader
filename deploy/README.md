@@ -65,3 +65,52 @@ target/release/bmv-trader desk-analyse --symbols AAPL --date 2026-11-03
 
 Install, check and remove work like the backstop above, with `com.bmv-trader.desk.plist`. The log is
 `data/desk/run.log`; `bmv-trader desk-report` shows progress at any time.
+
+# Tier 2: local Ollama through OmniRoute (DECISION A13, S22)
+
+Low-risk notes for you (desk brief, analyst digest, session summary, Sunday digest) come from a
+local model. Nothing leaves the Mac, and no trading code reads `data/notes/`.
+
+One-time setup (you run these):
+
+```sh
+# 0. the OmniRoute password pasted into chat earlier is exposed: change it in the dashboard first
+# 1. local model, bound to 127.0.0.1 (Ollama's default)
+brew install ollama
+brew services start ollama
+ollama pull qwen3:8b
+# 2. in the OmniRoute dashboard (omniroute dashboard):
+#    - add provider "Ollama" at http://127.0.0.1:11434
+#    - create a combo named  bmv-local  with only the qwen3:8b model
+#    - create an API key named bmv-tier2, and note its ID
+# 3. hand bmv-trader the key and its ID (each prompts for the value)
+security add-generic-password -s bmv-trader -a OMNIROUTE_API_KEY -w
+security add-generic-password -s bmv-trader -a OMNIROUTE_KEY_ID -w
+# 4. check, then rotate once by hand
+target/release/bmv-trader llm-health
+target/release/bmv-trader llm-rotate
+```
+
+Install the two jobs (times are Mac local time; this Mac is on US Central, one hour behind ET):
+
+```sh
+cargo build --release          # the jobs run target/release/bmv-trader
+mkdir -p data/notes            # the notes job logs here
+cp deploy/com.bmv-trader.llm.plist deploy/com.bmv-trader.notes.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.llm.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.notes.plist
+```
+
+- `llm` runs daily at 05:30: it rotates the key, then checks health (`data/llm_health.json`, log
+  `data/llm.log`).
+- `notes` runs daily at 18:15 and writes any due notes. `desk-run` also tries right after it
+  finishes.
+- The rotation regenerates the key and stores it in the Keychain over stdin, so it never appears in a
+  process list. It then applies the key's policy (only `bmv-local`, $0 a day, 30 requests a minute)
+  before a test call.
+- If a step fails, the error and the exact manual fix are kept in `data/llm_rotate_error.json`, and
+  health shows FAIL until a rotation succeeds.
+- **On the first manual `llm-rotate`, watch the output.** The regenerate output format and the policy
+  flags are checked for real only then.
+- Notes written while Tier 2 is down are saved as `*.facts.md`, and a later run replaces them with the
+  worded note.
