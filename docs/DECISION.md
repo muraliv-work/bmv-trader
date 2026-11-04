@@ -85,6 +85,7 @@ Status: **Active** · **Pending** (needs the owner or data) · **Superseded**
 | R6 | **Every backtest run is a logged trial; the significance bar rises with each trial** (Bonferroni) | Stops "try 50 variants until one looks lucky" | Never | Active |
 | R7 | **Final holdout (last 63 sessions) is pinned and evaluated once** | A holdout used twice is no longer a test | Never | Active |
 | R8 | **P1 gate** must pass before P2 work goes live: ≥ 100 trades, CI > 0, beats random, ≥ 60% profitable windows, PF > 1.2, DD < 10R, holdout > 0 | Only build on an edge that survives honest testing | — | **Not passed** by trials 1–9 (ORB ×3, gap-and-go ×2, VWAP pullback, monthly momentum, Desk Signal swing ×2); owner decides next |
+| R9 | **Stop rule for daily-bar research** (pre-registered 2026-11-03, before trials 11 and 12 exist): if trial 11 (post-earnings drift) and trial 12 (ML ranking) both fail, research on daily bars stops. **The default allocation is then SPY**, and bmv-trader stays a paper and forward-test tool. Any later trial needs a new kind of data **and** a power check showing, before any run, that it could detect the edge it hopes for. Trial 10 is judged on its own and doesn't change this rule | Nine failures so far. Without a written stop, a long run of tries ends in a false winner (R6), and the test bar keeps rising | Keep trying variants on the same data | Active |
 
 ## Development
 

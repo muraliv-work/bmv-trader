@@ -401,6 +401,10 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
     - Only the answer line marked `BMV_RESULT` is read.
   - **Cost:** usage is written call by call. A crashed run is charged what it reported, or a full day's budget ($3.30) if it reported nothing. A rating with no usage from the rating model is a failure.
   - **Residual risk, accepted:** the sidecar's ~85 Python packages are pinned by version (`requirements.lock`) and TradingAgents by commit, but not by hash. The sandbox is the containment.
+- **Secondary scorecard (pre-registered 2026-11-03, before any trial 10 trade has finished):** printed only by `desk-verdict`, after the D gate, and never gating.
+  - **By rating (Buy, Overweight, Hold, Underweight, Sell):** the count, the mean R, and the hit rate against SPY. A trade "beats SPY" when its % return from entry to exit is above SPY's % return over the same sessions (open to open, or to the last close on a delisting exit).
+  - **No monthly correlations.** Ties in the ratings and small months make them noise.
+  - **What it can and can't do:** any change to the veto that the scorecard inspires, such as dropping Hold or trusting only Buy, is **a new trial**. It is judged only on signals dated after trial 10's verdict, never on this sample.
 - **Known limits:**
   - 150 signals can show clear harm or a large benefit; a small edge would stay unproven.
   - LLM answers vary from run to run.
