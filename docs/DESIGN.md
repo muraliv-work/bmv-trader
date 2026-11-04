@@ -358,6 +358,40 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
 - **Unchanged:** the period, holdout, costs, exits, portfolio limits, baseline and gate (§7d). The gate is Bonferroni over **9 trials** (99.444%).
 - **One run, logged once** as `swing desk-signal vol-stocks`.
 
+## 7f. Trial 10: AI veto, forward paper shadow (pre-registered 2026-11-03, before any code)
+
+**Question:** can an LLM analyst veto the bad trades in a break-even rule stream and leave an edge?
+- It can't be backtested, because the model already knows how past days turned out (§13).
+- So it is tested **forward, in shadow**: no orders, only verdicts recorded each night and scored against later prices.
+
+- **Candidate stream:** trial 9's rules exactly (§7d, §7e), evaluated on each day's close using freshly downloaded adjusted SIP daily bars (`data/daily/sip-live/`).
+- **Daily pick:**
+  - Signals are ranked by volume ratio, then symbol.
+  - The top ones are analysed while the day's budget allows, at most **6 a day**.
+  - Every signal is logged, analysed or not, with the reason.
+- **Analyst:** TradingAgents at pinned commit `c4544913` (v0.7.1), installed from GitHub (never `REFERENCE-REPOS/`).
+  - Analysts: market, news and fundamentals. The social analyst is off.
+  - Models: Claude only, called directly. The quick tier is `claude-haiku-5-5`; the deep tier, which gives the rating, is `claude-sonnet-5-5`.
+  - It runs in a scrubbed environment: only the Anthropic key, no broker keys and no `.env`.
+  - **The first answer counts;** nothing is re-run.
+- **Verdict mapping:** Buy and Overweight approve (weight 1). Hold gets weight 0.5. Underweight and Sell veto (weight 0). REVIEW or any error is a failure: logged and counted, but left out of the comparison.
+- **Outcome:**
+  - Trial 9's fill model: entry at the next open, skipped if it chases more than 0.5%; a 2×ATR stop, a 3×ATR target, a 10-session time stop; 0.2% per side; in R.
+  - It is scored only from bars dated after the analysis day.
+- **Primary metric:** D = the weighted mean R of analysed signals minus the plain mean R of the same signals.
+- **When to judge:** at **150 scored, analysed signals or 6 months from the first analysis**, whichever comes first. It is logged once as trial 10.
+- **Passes only if all of these hold:**
+  - D's one-sided day-block bootstrap lower bound, at 1 − 0.05/10, is above 0
+  - vetoed signals average below approved ones
+  - the weighted mean R is above 0
+
+  Otherwise the AI adds nothing measurable and stays out of the decision path.
+- **Budget, enforced in code:** $100 a month, $3.30 a day. The cost per run is computed from token usage. Over the cap, signals are logged as "unanalysed: budget".
+- **Known limits:**
+  - 150 signals can show clear harm or a large benefit; a small edge would stay unproven.
+  - LLM answers vary from run to run.
+  - The data sources of TradingAgents' tools (yfinance, SEC EDGAR) are free and unofficial.
+
 ## 8. Decision pipeline (one candidate)
 
 1. **Strategy** emits a `Candidate`, which is journaled.
