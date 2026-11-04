@@ -5,13 +5,12 @@
 
 use crate::lifecycle::State;
 use crate::permissions::{HumanProof, Role};
-use crate::store::{Signer, Store};
+use crate::store::{Signer, Store, plain};
 use crate::{DeskError, Result};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use std::str::FromStr;
 
 /// How long a request waits for the owner's signature.
@@ -26,6 +25,10 @@ pub enum OwnerAction {
     AddAgent {
         id: String,
         role: Role,
+    },
+    /// A new API token for an agent, returned once to the owner who approved it.
+    IssueToken {
+        agent: String,
     },
     SetBudget {
         agent: String,
@@ -49,6 +52,7 @@ impl OwnerAction {
     pub fn describe(&self) -> String {
         match self {
             OwnerAction::AddAgent { id, role } => format!("Add agent {id} as {}", role.as_str()),
+            OwnerAction::IssueToken { agent } => format!("Issue a new API token for {agent}"),
             OwnerAction::SetBudget { agent, limit_usd } => {
                 format!("Set {agent}'s monthly budget to ${limit_usd}")
             }
@@ -74,7 +78,7 @@ impl OwnerAction {
 }
 
 /// A request waiting for the owner.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pending {
     pub id: String,
     pub action: OwnerAction,
@@ -84,7 +88,8 @@ pub struct Pending {
     pub text: String,
 }
 
-fn signed_text(id: &str, action: &OwnerAction, expires: &str) -> String {
+/// The text the owner signs for a request; the `desk` command rebuilds it to check what it shows.
+pub fn signed_text(id: &str, action: &OwnerAction, expires: &str) -> String {
     format!(
         "bmv-desk owner approval\nrequest: {id}\naction: {}\ndetail: {}\nexpires: {expires}",
         action.describe(),
@@ -126,17 +131,14 @@ pub fn verify(public_hex: &str, text: &str, signature_hex: &str) -> Result<()> {
 }
 
 fn nonce() -> Result<String> {
-    let mut b = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut b))
-        .map_err(|e| DeskError::Denied(format!("no randomness: {e}")))?;
-    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+    crate::store::random_hex(16)
 }
 
 impl Store {
     /// Registers the owner: their Secure Enclave public key and the Board agent `board`. Only on an
     /// empty desk, and only with a signature from that key over `INIT_TEXT` (so it needed Touch ID).
-    pub async fn init_owner(&self, public_hex: &str, signature_hex: &str) -> Result<()> {
+    /// Returns the Board's API token, shown once.
+    pub async fn init_owner(&self, public_hex: &str, signature_hex: &str) -> Result<String> {
         verify(public_hex, INIT_TEXT, signature_hex)?;
         self.bootstrap_owner(public_hex).await
     }
@@ -144,6 +146,26 @@ impl Store {
     /// Anyone registered may ask the owner for a human-only action; it waits for their signature.
     pub async fn request_owner_action(&self, by: &str, action: OwnerAction) -> Result<Pending> {
         self.role(by).await?;
+        // checked now, so the text the owner reads is plain and names things that exist
+        match &action {
+            OwnerAction::AddAgent { id, .. } => plain("agent id", id)?,
+            OwnerAction::IssueToken { agent } | OwnerAction::SetBudget { agent, .. } => {
+                plain("agent id", agent)?;
+                self.role(agent).await?;
+            }
+            OwnerAction::SetLimit { strategy, name, .. } => {
+                plain("limit name", name)?;
+                self.state(*strategy).await?;
+            }
+            OwnerAction::Transition { strategy, .. } => {
+                self.state(*strategy).await?;
+            }
+        }
+        if let OwnerAction::SetBudget { limit_usd: v, .. }
+        | OwnerAction::SetLimit { value: v, .. } = &action
+        {
+            Decimal::from_str(v).map_err(|_| DeskError::Denied(format!("not an amount: {v:?}")))?;
+        }
         let id = nonce()?;
         let expires =
             (chrono::Utc::now() + chrono::Duration::minutes(REQUEST_MINUTES)).to_rfc3339();
@@ -181,8 +203,13 @@ impl Store {
     }
 
     /// The owner's signature over a pending request: checked, the request closed (so it can't be
-    /// used twice), then the action run with a proof that exists only for it.
-    pub async fn approve_owner_action(&self, id: &str, signature_hex: &str) -> Result<()> {
+    /// used twice), then the action run with a proof that exists only for it. Returns the new
+    /// token when the action issued one.
+    pub async fn approve_owner_action(
+        &self,
+        id: &str,
+        signature_hex: &str,
+    ) -> Result<Option<String>> {
         let payload = self
             .redeem_owner_request(id, |payload, expires, public| {
                 let action: OwnerAction = serde_json::from_str(payload)
@@ -197,14 +224,24 @@ impl Store {
             .await?;
         let action: OwnerAction = serde_json::from_str(&payload)
             .map_err(|e| DeskError::Corrupt(format!("owner request {id}: {e}")))?;
+        let done = self.run_owner_action(action).await;
+        if done.is_err() {
+            self.reopen_owner_request(id).await?;
+        }
+        done
+    }
+
+    /// The approved action, with a proof that exists only for it.
+    async fn run_owner_action(&self, action: OwnerAction) -> Result<Option<String>> {
         let proof = HumanProof::signed();
         let dec = |s: &str| {
             Decimal::from_str(s).map_err(|_| DeskError::Denied(format!("not an amount: {s:?}")))
         };
-        match action {
+        let done = match action {
             OwnerAction::AddAgent { id, role } => {
                 self.add_agent("board", &id, role, Some(proof)).await
             }
+            OwnerAction::IssueToken { agent } => return self.issue_token(&agent).await.map(Some),
             OwnerAction::SetBudget { agent, limit_usd } => {
                 self.set_budget("board", &agent, dec(&limit_usd)?, proof)
                     .await
@@ -237,7 +274,8 @@ impl Store {
                 )
                 .await
             }
-        }
+        };
+        done.map(|()| None)
     }
 }
 
@@ -278,6 +316,87 @@ mod tests {
             "once"
         );
         (s, sk)
+    }
+
+    #[tokio::test]
+    async fn tokens_rotate_requests_are_checked_and_a_failed_action_reopens() {
+        let s = Store::open("sqlite::memory:").await.unwrap();
+        let (sk, public) = key();
+        let board = s.init_owner(&public, &sign(&sk, INIT_TEXT)).await.unwrap();
+        assert_eq!(s.agent_for_token(&board).await.unwrap(), "board");
+        let ask = |a| s.request_owner_action("board", a);
+
+        // the text the owner reads is plain and names a real agent
+        let hidden = OwnerAction::SetBudget {
+            agent: "board\naction: nothing".into(),
+            limit_usd: "1".into(),
+        };
+        assert!(ask(hidden).await.is_err());
+        let ghost = OwnerAction::IssueToken {
+            agent: "nobody".into(),
+        };
+        assert!(ask(ghost).await.is_err());
+        let bad = OwnerAction::SetBudget {
+            agent: "board".into(),
+            limit_usd: "lots".into(),
+        };
+        assert!(ask(bad).await.is_err());
+
+        // a reissued token replaces the old one
+        let p = ask(OwnerAction::IssueToken {
+            agent: "board".into(),
+        })
+        .await
+        .unwrap();
+        let fresh = s
+            .approve_owner_action(&p.id, &sign(&sk, &p.text))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            s.agent_for_token(&board).await.is_err(),
+            "the old token is revoked"
+        );
+        assert_eq!(s.agent_for_token(&fresh).await.unwrap(), "board");
+
+        // an action that fails leaves the request open, so the owner's approval isn't spent
+        let p = ask(OwnerAction::AddAgent {
+            id: "board".into(),
+            role: Role::Ops,
+        })
+        .await
+        .unwrap();
+        assert!(
+            s.approve_owner_action(&p.id, &sign(&sk, &p.text))
+                .await
+                .is_err()
+        );
+        assert!(
+            s.pending_owner_actions()
+                .await
+                .unwrap()
+                .iter()
+                .any(|q| q.id == p.id)
+        );
+
+        // one agent can't flood the owner's queue
+        for i in 0..4 {
+            ask(OwnerAction::AddAgent {
+                id: format!("a{i}"),
+                role: Role::Ops,
+            })
+            .await
+            .unwrap();
+        }
+        assert!(
+            ask(OwnerAction::AddAgent {
+                id: "a9".into(),
+                role: Role::Ops
+            })
+            .await
+            .is_err()
+        );
+        s.verify_audit().await.unwrap();
     }
 
     #[tokio::test]

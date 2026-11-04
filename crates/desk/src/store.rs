@@ -20,7 +20,8 @@ use sqlx::{Sqlite, Transaction};
 use std::str::FromStr;
 
 /// Tables whose rows are history: never updated, never deleted.
-const APPEND_ONLY: [&str; 9] = [
+const APPEND_ONLY: [&str; 10] = [
+    "signatures",
     "owner_key",
     "audit_log",
     "strategy_versions",
@@ -71,6 +72,12 @@ CREATE TABLE IF NOT EXISTS owner_key (
 CREATE TABLE IF NOT EXISTS owner_requests (
   id TEXT PRIMARY KEY, payload TEXT NOT NULL, requested_by TEXT NOT NULL REFERENCES agents(id),
   expires TEXT NOT NULL, status TEXT NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS agent_tokens (
+  token_sha256 TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS signatures (
+  strategy_id INTEGER NOT NULL REFERENCES strategies(id), version INTEGER NOT NULL, to_state TEXT NOT NULL,
+  agent_id TEXT NOT NULL REFERENCES agents(id), at TEXT NOT NULL,
+  UNIQUE (strategy_id, version, to_state, agent_id));
 CREATE TABLE IF NOT EXISTS audit_log (
   seq INTEGER PRIMARY KEY, at TEXT NOT NULL, agent_id TEXT NOT NULL, action TEXT NOT NULL,
   detail TEXT NOT NULL, prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
@@ -109,8 +116,21 @@ fn sha256(text: &str) -> String {
         })
 }
 
+/// How many owner requests one agent may have waiting at once.
+const MAX_OPEN_REQUESTS: i64 = 5;
+
+/// `n` random bytes as hex, from the system's randomness.
+pub(crate) fn random_hex(n: usize) -> Result<String> {
+    use std::io::Read;
+    let mut b = vec![0u8; n];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .map_err(|e| DeskError::Internal(format!("no randomness: {e}")))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
 /// Names, ids and hashes are short and plain, so they can't carry anything else.
-fn plain(what: &str, s: &str) -> Result<()> {
+pub(crate) fn plain(what: &str, s: &str) -> Result<()> {
     let ok = !s.is_empty()
         && s.len() <= 100
         && s.chars()
@@ -205,7 +225,7 @@ impl Store {
 
     /// Creates the Board agent `board` with the owner's public key, on an empty desk only. The
     /// caller (`init_owner`) has already checked the key signs with Touch ID.
-    pub(crate) async fn bootstrap_owner(&self, public_hex: &str) -> Result<()> {
+    pub(crate) async fn bootstrap_owner(&self, public_hex: &str) -> Result<String> {
         let mut tx = self.pool.begin().await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents")
             .fetch_one(&mut *tx)
@@ -229,8 +249,9 @@ impl Store {
             json!({"public_key": public_hex}),
         )
         .await?;
+        let token = issue_token_in(&mut tx, "board").await?;
         tx.commit().await?;
-        Ok(())
+        Ok(token)
     }
 
     pub(crate) async fn insert_owner_request(
@@ -241,6 +262,18 @@ impl Store {
         expires: &str,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        let open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM owner_requests WHERE requested_by = ? AND status = 'pending' AND expires > ?",
+        )
+        .bind(by)
+        .bind(now())
+        .fetch_one(&mut *tx)
+        .await?;
+        if open >= MAX_OPEN_REQUESTS {
+            return Err(DeskError::Denied(format!(
+                "{by} already has {MAX_OPEN_REQUESTS} requests waiting for the owner"
+            )));
+        }
         sqlx::query(
             "INSERT INTO owner_requests (id, payload, requested_by, expires, status, at) VALUES (?, ?, ?, ?, 'pending', ?)",
         )
@@ -310,6 +343,122 @@ impl Store {
         append(&mut tx, "board", "approve_owner", json!({"request": id})).await?;
         tx.commit().await?;
         Ok(payload)
+    }
+
+    /// Puts an approved request back to pending when its action failed, so the owner's signature
+    /// isn't spent on nothing (each action is one transaction, so nothing of it was applied).
+    pub(crate) async fn reopen_owner_request(&self, id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE owner_requests SET status = 'pending' WHERE id = ? AND status = 'approved'",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        append(&mut tx, "board", "reopen_owner", json!({"request": id})).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// A new bearer token for an agent, shown once; only its SHA-256 is kept, and it replaces the
+    /// agent's earlier tokens (so issuing again is also how a leaked token is revoked). Issued
+    /// through an owner action, or to the Board at `init_owner`.
+    pub(crate) async fn issue_token(&self, agent_id: &str) -> Result<String> {
+        let mut tx = self.pool.begin().await?;
+        let token = issue_token_in(&mut tx, agent_id).await?;
+        tx.commit().await?;
+        Ok(token)
+    }
+
+    /// The agent a bearer token belongs to.
+    pub async fn agent_for_token(&self, token: &str) -> Result<String> {
+        let id: Option<String> =
+            sqlx::query_scalar("SELECT agent_id FROM agent_tokens WHERE token_sha256 = ?")
+                .bind(sha256(token))
+                .fetch_optional(&self.pool)
+                .await?;
+        id.ok_or_else(|| DeskError::Denied("unknown token".into()))
+    }
+
+    /// An agent signs a lifecycle step for the strategy's current version. The step happens once
+    /// the signatures collected so far cover its required roles; until then the signature waits.
+    /// Returns true if the strategy moved.
+    pub async fn sign(&self, agent_id: &str, strategy: i64, to: State) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let role = role_in(&mut tx, agent_id).await?;
+        if role == Role::Board {
+            return Err(DeskError::Denied(
+                "the owner signs through an owner request (Touch ID)".into(),
+            ));
+        }
+        // one transaction: the version read here is the one every collected signature is for
+        let version: i64 = sqlx::query_scalar("SELECT version FROM strategies WHERE id = ?")
+            .bind(strategy)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| DeskError::NotFound(format!("strategy {strategy}")))?;
+        let mut signers: Vec<String> = sqlx::query_scalar(
+            "SELECT agent_id FROM signatures WHERE strategy_id = ? AND version = ? AND to_state = ? ORDER BY at",
+        )
+        .bind(strategy)
+        .bind(version)
+        .bind(to.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        if !signers.iter().any(|a| a == agent_id) {
+            signers.push(agent_id.into());
+        }
+        let all = signers
+            .into_iter()
+            .map(|agent_id| Signer {
+                agent_id,
+                proof: None,
+            })
+            .collect();
+        // the step is tried first, so a signature the gate would refuse is never kept
+        let needs = match transition_in(&mut tx, strategy, to, all).await {
+            Ok(()) => {
+                tx.commit().await?;
+                return Ok(true);
+            }
+            Err(DeskError::Unsigned(needs)) => needs,
+            Err(e) => return Err(e),
+        };
+        if !needs.contains(&role) {
+            return Err(DeskError::Denied(format!(
+                "{} doesn't sign {}",
+                role.as_str(),
+                to.as_str()
+            )));
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO signatures (strategy_id, version, to_state, agent_id, at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(strategy)
+        .bind(version)
+        .bind(to.as_str())
+        .bind(agent_id)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+        append(
+            &mut tx,
+            agent_id,
+            "sign",
+            json!({"strategy": strategy, "version": version, "to": to.as_str()}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(false)
+    }
+
+    /// Every strategy: (id, name, state, version).
+    pub async fn strategies(&self) -> Result<Vec<(i64, String, String, i64)>> {
+        Ok(
+            sqlx::query_as("SELECT id, name, state, version FROM strategies ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     /// An agent's role, from the store (never from the agent's own claim).
@@ -644,151 +793,7 @@ impl Store {
     /// gate needs, read from the store. Each proof is used up by this one move.
     pub async fn transition(&self, strategy: i64, to: State, signers: Vec<Signer>) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        let mut sigs = Vec::new();
-        for s in signers {
-            let role = role_in(&mut tx, &s.agent_id).await?;
-            // a proof only counts for the Board's own identity
-            sigs.push(Signature {
-                human: role == Role::Board && s.proof.is_some(),
-                agent_id: s.agent_id,
-                role,
-            });
-        }
-        let (state, version, hyp_author, spec_author, criteria, current_halt): (
-            String,
-            i64,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-        ) = sqlx::query_as(
-            "SELECT state, version, hypothesis_author, spec_author, criteria, current_halt FROM strategies WHERE id = ?",
-        )
-        .bind(strategy)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| DeskError::NotFound(format!("strategy {strategy}")))?;
-        let from = State::parse(&state)
-            .ok_or_else(|| DeskError::Corrupt(format!("stored state {state:?}")))?;
-        let halted = match current_halt {
-            Some(h) if from == State::Halted => {
-                let (prev, reason): (String, String) = sqlx::query_as(
-                    "SELECT previous_state, reason FROM halts WHERE id = ? AND strategy_id = ?",
-                )
-                .bind(h)
-                .bind(strategy)
-                .fetch_one(&mut *tx)
-                .await?;
-                Some((
-                    State::parse(&prev)
-                        .ok_or_else(|| DeskError::Corrupt(format!("halt state {prev:?}")))?,
-                    HaltReason::parse(&reason)
-                        .ok_or_else(|| DeskError::Corrupt(format!("halt reason {reason:?}")))?,
-                ))
-            }
-            _ => None,
-        };
-        let code_author: Option<String> = sqlx::query_scalar(
-            "SELECT author FROM strategy_versions WHERE strategy_id = ? AND version = ?",
-        )
-        .bind(strategy)
-        .bind(version)
-        .fetch_optional(&mut *tx)
-        .await?;
-        // the artifact being judged: the hypothesis, then the spec, then the code
-        let author_id = match to {
-            State::HypothesisApproved => hyp_author.clone(),
-            State::SpecFrozen => spec_author.clone().unwrap_or_else(|| hyp_author.clone()),
-            _ => code_author
-                .clone()
-                .or(spec_author.clone())
-                .unwrap_or_else(|| hyp_author.clone()),
-        };
-        let author_role = role_in(&mut tx, &author_id).await?;
-        // the evidence each forward gate needs
-        let missing = match to {
-            State::SpecFrozen if criteria.is_none() => Some("pre-registered criteria"),
-            State::Implemented if code_author.is_none() => Some("submitted code for this version"),
-            State::Validated if !official_run(&mut tx, strategy, version).await? => {
-                Some("an official backtest of this version")
-            }
-            State::LimitsSet => {
-                let n: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM risk_limits WHERE strategy_id = ?")
-                        .bind(strategy)
-                        .fetch_one(&mut *tx)
-                        .await?;
-                (n == 0).then_some("approved risk limits")
-            }
-            _ => None,
-        };
-        let paper: Option<PaperEvidence> = sqlx::query_as::<_, (i64, i64)>(
-            "SELECT days, trades FROM paper_stats WHERE strategy_id = ? AND version = ? ORDER BY rowid DESC LIMIT 1",
-        )
-        .bind(strategy)
-        .bind(version)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(|(d, t)| PaperEvidence { days: d.max(0) as u32, trades: t.max(0) as u32 });
-        // missing evidence is the real reason a forward gate can't pass, so it is reported first
-        if let Some(what) = missing
-            && lifecycle::rule(from, to, halted).is_some_and(|r| r.kind == Kind::Forward)
-        {
-            return Err(DeskError::Denied(format!("{} needs {what}", to.as_str())));
-        }
-        let rule = lifecycle::check(from, to, halted, (&author_id, author_role), &sigs, paper)?;
-        // a failed gate starts a new version, which the Developer must fill before it moves on
-        let new_version = if rule.kind == Kind::Back {
-            version + 1
-        } else {
-            version
-        };
-        let halt = if rule.kind == Kind::Resume {
-            None
-        } else {
-            current_halt.filter(|_| from == State::Halted)
-        };
-        sqlx::query("UPDATE strategies SET state = ?, version = ?, current_halt = ? WHERE id = ? AND state = ?")
-            .bind(to.as_str())
-            .bind(new_version)
-            .bind(halt)
-            .bind(strategy)
-            .bind(from.as_str())
-            .execute(&mut *tx)
-            .await?;
-        let t = sqlx::query(
-            "INSERT INTO state_transitions (strategy_id, from_state, to_state, version, at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(strategy)
-        .bind(from.as_str())
-        .bind(to.as_str())
-        .bind(new_version)
-        .bind(now())
-        .execute(&mut *tx)
-        .await?
-        .last_insert_rowid();
-        for s in &sigs {
-            sqlx::query(
-                "INSERT INTO approvals (transition_id, agent_id, role, human) VALUES (?, ?, ?, ?)",
-            )
-            .bind(t)
-            .bind(&s.agent_id)
-            .bind(s.role.as_str())
-            .bind(s.human)
-            .execute(&mut *tx)
-            .await?;
-        }
-        let signed: Vec<_> = sigs
-            .iter()
-            .map(|s| json!({"agent": s.agent_id, "role": s.role.as_str(), "human": s.human}))
-            .collect();
-        append(
-            &mut tx,
-            &sigs[0].agent_id,
-            "transition",
-            json!({"strategy": strategy, "from": from.as_str(), "to": to.as_str(), "version": new_version, "signers": signed}),
-        )
-        .await?;
+        transition_in(&mut tx, strategy, to, signers).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -962,6 +967,187 @@ fn entry(
 
 fn dec(s: &str) -> Result<Decimal> {
     Decimal::from_str(s).map_err(|e| DeskError::Corrupt(format!("stored amount {s:?}: {e}")))
+}
+
+/// A lifecycle move inside the caller's transaction; nothing is written unless every check passes.
+async fn transition_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    strategy: i64,
+    to: State,
+    signers: Vec<Signer>,
+) -> Result<()> {
+    let mut sigs = Vec::new();
+    for s in signers {
+        let role = role_in(&mut *tx, &s.agent_id).await?;
+        // a proof only counts for the Board's own identity
+        sigs.push(Signature {
+            human: role == Role::Board && s.proof.is_some(),
+            agent_id: s.agent_id,
+            role,
+        });
+    }
+    let (state, version, hyp_author, spec_author, criteria, current_halt): (
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT state, version, hypothesis_author, spec_author, criteria, current_halt FROM strategies WHERE id = ?",
+    )
+    .bind(strategy)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| DeskError::NotFound(format!("strategy {strategy}")))?;
+    let from = State::parse(&state)
+        .ok_or_else(|| DeskError::Corrupt(format!("stored state {state:?}")))?;
+    let halted = match current_halt {
+        Some(h) if from == State::Halted => {
+            let (prev, reason): (String, String) = sqlx::query_as(
+                "SELECT previous_state, reason FROM halts WHERE id = ? AND strategy_id = ?",
+            )
+            .bind(h)
+            .bind(strategy)
+            .fetch_one(&mut **tx)
+            .await?;
+            Some((
+                State::parse(&prev)
+                    .ok_or_else(|| DeskError::Corrupt(format!("halt state {prev:?}")))?,
+                HaltReason::parse(&reason)
+                    .ok_or_else(|| DeskError::Corrupt(format!("halt reason {reason:?}")))?,
+            ))
+        }
+        _ => None,
+    };
+    let code_author: Option<String> = sqlx::query_scalar(
+        "SELECT author FROM strategy_versions WHERE strategy_id = ? AND version = ?",
+    )
+    .bind(strategy)
+    .bind(version)
+    .fetch_optional(&mut **tx)
+    .await?;
+    // the artifact being judged: the hypothesis, then the spec, then the code
+    let author_id = match to {
+        State::HypothesisApproved => hyp_author.clone(),
+        State::SpecFrozen => spec_author.clone().unwrap_or_else(|| hyp_author.clone()),
+        _ => code_author
+            .clone()
+            .or(spec_author.clone())
+            .unwrap_or_else(|| hyp_author.clone()),
+    };
+    let author_role = role_in(&mut *tx, &author_id).await?;
+    // the evidence each forward gate needs
+    let missing = match to {
+        State::SpecFrozen if criteria.is_none() => Some("pre-registered criteria"),
+        State::Implemented if code_author.is_none() => Some("submitted code for this version"),
+        State::Validated if !official_run(&mut *tx, strategy, version).await? => {
+            Some("an official backtest of this version")
+        }
+        State::LimitsSet => {
+            let n: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM risk_limits WHERE strategy_id = ?")
+                    .bind(strategy)
+                    .fetch_one(&mut **tx)
+                    .await?;
+            (n == 0).then_some("approved risk limits")
+        }
+        _ => None,
+    };
+    let paper: Option<PaperEvidence> = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT days, trades FROM paper_stats WHERE strategy_id = ? AND version = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(strategy)
+    .bind(version)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|(d, t)| PaperEvidence { days: d.max(0) as u32, trades: t.max(0) as u32 });
+    // missing evidence is the real reason a forward gate can't pass, so it is reported first
+    if let Some(what) = missing
+        && lifecycle::rule(from, to, halted).is_some_and(|r| r.kind == Kind::Forward)
+    {
+        return Err(DeskError::Denied(format!("{} needs {what}", to.as_str())));
+    }
+    let rule = lifecycle::check(from, to, halted, (&author_id, author_role), &sigs, paper)?;
+    // a failed gate starts a new version, which the Developer must fill before it moves on
+    let new_version = if rule.kind == Kind::Back {
+        version + 1
+    } else {
+        version
+    };
+    let halt = if rule.kind == Kind::Resume {
+        None
+    } else {
+        current_halt.filter(|_| from == State::Halted)
+    };
+    sqlx::query(
+        "UPDATE strategies SET state = ?, version = ?, current_halt = ? WHERE id = ? AND state = ?",
+    )
+    .bind(to.as_str())
+    .bind(new_version)
+    .bind(halt)
+    .bind(strategy)
+    .bind(from.as_str())
+    .execute(&mut **tx)
+    .await?;
+    let t = sqlx::query(
+        "INSERT INTO state_transitions (strategy_id, from_state, to_state, version, at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(strategy)
+    .bind(from.as_str())
+    .bind(to.as_str())
+    .bind(new_version)
+    .bind(now())
+    .execute(&mut **tx)
+    .await?
+    .last_insert_rowid();
+    for s in &sigs {
+        sqlx::query(
+            "INSERT INTO approvals (transition_id, agent_id, role, human) VALUES (?, ?, ?, ?)",
+        )
+        .bind(t)
+        .bind(&s.agent_id)
+        .bind(s.role.as_str())
+        .bind(s.human)
+        .execute(&mut **tx)
+        .await?;
+    }
+    let signed: Vec<_> = sigs
+        .iter()
+        .map(|s| json!({"agent": s.agent_id, "role": s.role.as_str(), "human": s.human}))
+        .collect();
+    append(
+        &mut *tx,
+        &sigs[0].agent_id,
+        "transition",
+        json!({"strategy": strategy, "from": from.as_str(), "to": to.as_str(), "version": new_version, "signers": signed}),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn issue_token_in(tx: &mut Transaction<'_, Sqlite>, agent_id: &str) -> Result<String> {
+    role_in(&mut *tx, agent_id).await?;
+    let token = format!("desk_{}", random_hex(32)?);
+    let hash = sha256(&token);
+    sqlx::query("DELETE FROM agent_tokens WHERE agent_id = ?")
+        .bind(agent_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("INSERT INTO agent_tokens (token_sha256, agent_id, created) VALUES (?, ?, ?)")
+        .bind(&hash)
+        .bind(agent_id)
+        .bind(now())
+        .execute(&mut **tx)
+        .await?;
+    append(
+        &mut *tx,
+        "board",
+        "issue_token",
+        json!({"agent": agent_id, "token_sha256": hash}),
+    )
+    .await?;
+    Ok(token)
 }
 
 async fn role_in(tx: &mut Transaction<'_, Sqlite>, agent_id: &str) -> Result<Role> {
@@ -1456,6 +1642,36 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn tokens_map_to_agents_and_cosigners_collect() {
+        let s = desk().await;
+        let t = s.issue_token("val-1").await.unwrap();
+        assert_eq!(s.agent_for_token(&t).await.unwrap(), "val-1");
+        assert!(s.agent_for_token("desk_nope").await.is_err());
+        let stored: String = sqlx::query_scalar("SELECT token_sha256 FROM agent_tokens")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_ne!(stored, t, "only the hash is kept");
+
+        let id = paper(&s).await;
+        s.record_paper("ops-1", id, 21, 33).await.unwrap();
+        assert!(s.sign("board", id, State::LiveApproved).await.is_err());
+        assert!(
+            denied(
+                s.sign("comp-1", id, State::PaperReviewed).await,
+                "doesn't sign"
+            ),
+            "a role the step doesn't need isn't kept"
+        );
+        assert!(!s.sign("po-1", id, State::PaperReviewed).await.unwrap());
+        assert!(!s.sign("po-1", id, State::PaperReviewed).await.unwrap());
+        assert_eq!(s.state(id).await.unwrap(), State::PaperTrading);
+        assert!(s.sign("risk-1", id, State::PaperReviewed).await.unwrap());
+        assert_eq!(s.state(id).await.unwrap(), State::PaperReviewed);
+        s.verify_audit().await.unwrap();
     }
 
     #[tokio::test]

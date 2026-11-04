@@ -283,8 +283,7 @@ pub fn check(
         _ => signatures.iter().any(|s| rule.roles.contains(&s.role)),
     };
     if !covered {
-        let names: Vec<&str> = rule.roles.iter().map(|r| r.as_str()).collect();
-        return Err(DeskError::Denied(format!("needs {}", names.join(" + "))));
+        return Err(DeskError::Unsigned(rule.roles.to_vec()));
     }
     if rule.human && !signatures.iter().any(|s| s.human && s.role == Role::Board) {
         return Err(DeskError::Denied(format!(
@@ -319,7 +318,7 @@ mod tests {
     const DEV: (&str, Role) = ("dev-1", Role::Developer);
 
     fn denied_with(r: Result<Rule>, text: &str) -> bool {
-        matches!(r, Err(DeskError::Denied(ref m)) if m.contains(text))
+        matches!(r, Err(ref e @ (DeskError::Denied(_) | DeskError::Unsigned(_))) if e.to_string().contains(text))
     }
 
     #[test]
