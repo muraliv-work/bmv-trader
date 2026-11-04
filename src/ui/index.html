@@ -9,16 +9,28 @@
 <script src="/chart.js" defer></script>
 <script src="/app.js" defer></script>
 </head>
-<body>
-<header class="topbar">
+<body class="console">
+<header class="appbar">
   <div class="inner">
-    <span class="brand">bmv-trader</span>
-    <nav aria-label="Pages"><a href="/" class="is-active" aria-current="page">Console</a><a href="/services">Services</a><a href="/help">How to</a></nav>
+    <a class="brand" href="/"><span class="mark" aria-hidden="true"></span>bmv-trader</a>
+    <nav class="tabs" aria-label="Pages">
+      <div role="tablist" aria-label="Console views">
+        <button type="button" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true">Overview</button>
+        <button type="button" role="tab" id="tab-research" aria-controls="panel-research" aria-selected="false" tabindex="-1">Research</button>
+      </div>
+      <a href="/services">Services</a>
+      <a href="/help">Help</a>
+    </nav>
+    <div class="pills">
+      <span id="mode-pill" class="pill">PAPER</span>
+      <span id="state-pill" class="pill state" data-aspect="unknown"><span class="dot" aria-hidden="true"></span><span id="state-word">Connecting</span></span>
+      <time id="clock" class="clock"></time>
+    </div>
   </div>
 </header>
 
 <main>
-  <section class="signal card" id="signal" data-aspect="unknown" aria-live="polite">
+  <section class="status" id="signal" data-aspect="unknown" aria-live="polite">
     <div class="lamp" aria-hidden="true"></div>
     <div class="aspect">
       <h1 id="state">Connecting</h1>
@@ -28,94 +40,102 @@
 
   <div id="banners" role="status" aria-live="polite"></div>
 
-  <section aria-labelledby="h-account" class="account">
-    <h2 id="h-account" class="visually-hidden">Account</h2>
-    <dl class="figures">
-      <div class="card"><dt>Equity</dt><dd id="equity">–</dd></div>
-      <div class="card"><dt>Today</dt><dd id="pnl">–</dd></div>
-      <div class="card"><dt>Buying power</dt><dd id="bp">–</dd></div>
-    </dl>
-    <p id="counts" class="counts"></p>
-  </section>
+  <div id="panel-overview" role="tabpanel" aria-labelledby="tab-overview">
+    <section aria-labelledby="h-account">
+      <h2 id="h-account" class="visually-hidden">Account</h2>
+      <dl class="stats-row">
+        <div class="card stat"><dt>Equity</dt><dd id="equity">–</dd></div>
+        <div class="card stat"><dt>Today's P&amp;L</dt><dd><span id="pnl">–</span> <span id="pnl-pct" class="badge"></span></dd></div>
+        <div class="card stat"><dt>Buying power</dt><dd id="bp">–</dd></div>
+        <div class="card stat"><dt>Today's activity</dt><dd class="small" id="counts">–</dd></div>
+      </dl>
+    </section>
 
-  <section class="card chart-card" aria-labelledby="h-chart">
-    <div class="chart-header">
-      <h2 id="h-chart">Equity vs SPY</h2>
-      <div class="legend"><span class="key equity">Account</span><span class="key spy">SPY</span></div>
-      <div class="ranges" role="group" aria-label="Range">
-        <button type="button" data-days="31">1M</button>
-        <button type="button" data-days="92">3M</button>
-        <button type="button" data-days="366" class="is-active" aria-pressed="true">1Y</button>
+    <section class="card" aria-labelledby="h-chart">
+      <div class="card-head">
+        <h2 id="h-chart">Equity vs SPY</h2>
+        <div class="legend"><span class="key equity">Account</span><span class="key spy">SPY</span></div>
+        <div class="ranges" role="group" aria-label="Range">
+          <button type="button" data-days="31">1M</button>
+          <button type="button" data-days="92">3M</button>
+          <button type="button" data-days="366" class="is-active" aria-pressed="true">1Y</button>
+        </div>
       </div>
+      <div id="chart" class="chart"></div>
+      <p id="chart-note" class="note">Both lines start at 100 on the first day they share.</p>
+    </section>
+
+    <div class="pair">
+      <section class="card" aria-labelledby="h-pos">
+        <div class="card-head"><h2 id="h-pos">Positions</h2></div>
+        <div class="scroll"><table><thead><tr><th>Symbol</th><th class="n">Shares</th><th class="n">Entry</th></tr></thead>
+        <tbody id="positions"></tbody></table></div>
+      </section>
+      <section class="card" aria-labelledby="h-ord">
+        <div class="card-head"><h2 id="h-ord">Open orders</h2></div>
+        <div class="scroll"><table><thead><tr><th>Order</th><th>Side</th><th>Status</th><th class="n">Filled</th></tr></thead>
+        <tbody id="orders"></tbody></table></div>
+      </section>
     </div>
-    <div id="chart" class="chart"></div>
-    <p id="chart-note" class="note">Both lines start at 100 on the first day they share.</p>
-  </section>
 
-  <div class="pair">
-    <section class="card" aria-labelledby="h-desk">
-      <h2 id="h-desk">Trial 10: AI veto, forward test</h2>
-      <dl class="stats" id="desk"></dl>
-      <p id="desk-note" class="note">Counts only. Results by rating stay hidden until the verdict.</p>
+    <section class="card" aria-labelledby="h-journal">
+      <div class="card-head"><h2 id="h-journal">Today's journal</h2></div>
+      <ol id="journal" class="journal" reversed></ol>
     </section>
-    <section class="card" aria-labelledby="h-night">
-      <h2 id="h-night">Latest night</h2>
-      <p id="night-date" class="note"></p>
-      <ul id="night" class="night"></ul>
+
+    <section class="card safety" aria-labelledby="h-controls">
+      <div class="card-head">
+        <h2 id="h-controls">Safety</h2>
+        <p class="note">These only make things safer. Clearing STOP and starting the trading engine stay in the terminal.</p>
+      </div>
+      <div class="pair">
+        <form class="control" data-action="stop" data-word="STOP">
+          <h3>Stop new trades</h3>
+          <p>Creates data/STOP. A running engine sees it on its next tick, takes no new entries and cancels its working ones. Open positions keep their stop and target at Alpaca.</p>
+          <label>Type STOP to confirm <input name="confirm" autocomplete="off" spellcheck="false"></label>
+          <button type="submit" class="danger" disabled>Stop new trades</button>
+        </form>
+        <form class="control" data-action="flatten" data-word="FLATTEN">
+          <h3>Close everything</h3>
+          <p>Engages STOP, then closes every position and cancels every order at Alpaca, and checks the account is flat.</p>
+          <label>Type FLATTEN to confirm <input name="confirm" autocomplete="off" spellcheck="false"></label>
+          <button type="submit" class="danger" disabled>Close everything</button>
+        </form>
+      </div>
+      <p id="result" class="result" role="status" aria-live="assertive"></p>
     </section>
   </div>
 
-  <div class="pair">
-    <section class="card" aria-labelledby="h-pos">
-      <h2 id="h-pos">Positions</h2>
-      <div class="scroll"><table><thead><tr><th>Symbol</th><th class="n">Shares</th><th class="n">Entry</th></tr></thead>
-      <tbody id="positions"></tbody></table></div>
+  <div id="panel-research" role="tabpanel" aria-labelledby="tab-research" hidden>
+    <div class="pair">
+      <section class="card" aria-labelledby="h-desk">
+        <div class="card-head"><h2 id="h-desk">Trial 10: AI veto, forward test</h2></div>
+        <dl class="stats" id="desk"></dl>
+        <p id="desk-note" class="note">Counts only. Results by rating stay hidden until the verdict.</p>
+      </section>
+      <section class="card" aria-labelledby="h-night">
+        <div class="card-head"><h2 id="h-night">Latest night</h2></div>
+        <p id="night-date" class="note"></p>
+        <ul id="night" class="night"></ul>
+      </section>
+    </div>
+
+    <section class="card" aria-labelledby="h-lessons">
+      <div class="card-head">
+        <h2 id="h-lessons">Lessons</h2>
+        <p class="note">Where each finished trial lost, and what it led to. From <code>bmv-trader trial-autopsy</code>, which re-runs each trial and checks it reproduces first.</p>
+      </div>
+      <div class="scroll"><table class="lessons"><thead><tr><th>Trial</th><th class="n">Result</th><th>Where it lost</th><th>Lesson</th><th>Led to</th></tr></thead>
+      <tbody id="lessons"></tbody></table></div>
     </section>
-    <section class="card" aria-labelledby="h-ord">
-      <h2 id="h-ord">Open orders</h2>
-      <div class="scroll"><table><thead><tr><th>Order</th><th>Side</th><th>Status</th><th class="n">Filled</th></tr></thead>
-      <tbody id="orders"></tbody></table></div>
+
+    <section class="card" aria-labelledby="h-trials">
+      <div class="card-head"><h2 id="h-trials">Trial log</h2></div>
+      <div class="scroll"><table><thead><tr><th>Trial</th><th>Period</th><th class="n">Trades</th>
+        <th class="n">Expectancy</th><th class="n">CI low</th><th class="n">Profit factor</th></tr></thead>
+      <tbody id="trials"></tbody></table></div>
     </section>
   </div>
-
-  <section class="card" aria-labelledby="h-journal">
-    <h2 id="h-journal">Today's journal</h2>
-    <ol id="journal" class="journal" reversed></ol>
-  </section>
-
-  <section class="card" aria-labelledby="h-lessons">
-    <h2 id="h-lessons">Lessons</h2>
-    <p class="note">Where each finished trial lost, and what it led to. From <code>bmv-trader trial-autopsy</code>, which re-runs each trial and checks it reproduces before breaking it down.</p>
-    <div class="scroll"><table class="lessons"><thead><tr><th>Trial</th><th class="n">Result</th><th>Where it lost</th><th>Lesson</th><th>Led to</th></tr></thead>
-    <tbody id="lessons"></tbody></table></div>
-  </section>
-
-  <section class="card" aria-labelledby="h-trials">
-    <h2 id="h-trials">Trial log</h2>
-    <div class="scroll"><table><thead><tr><th>Trial</th><th>Period</th><th class="n">Trades</th>
-      <th class="n">Expectancy</th><th class="n">CI low</th><th class="n">Profit factor</th></tr></thead>
-    <tbody id="trials"></tbody></table></div>
-  </section>
 </main>
-
-<section class="controls" aria-labelledby="h-controls">
-  <h2 id="h-controls">Emergency controls</h2>
-  <p class="hint">These only make things safer. Clearing STOP and starting the trading engine stay in the terminal.</p>
-  <div class="pair">
-    <form class="control card" data-action="stop" data-word="STOP">
-      <h3>Stop new trades</h3>
-      <p>Creates data/STOP. A running engine sees it on its next tick, takes no new entries and cancels its working ones. Open positions keep their stop and target at Alpaca.</p>
-      <label>Type STOP to confirm <input name="confirm" autocomplete="off" spellcheck="false"></label>
-      <button type="submit" class="danger" disabled>Stop new trades</button>
-    </form>
-    <form class="control card" data-action="flatten" data-word="FLATTEN">
-      <h3>Close everything</h3>
-      <p>Engages STOP, then closes every position and cancels every order at Alpaca, and checks the account is flat.</p>
-      <label>Type FLATTEN to confirm <input name="confirm" autocomplete="off" spellcheck="false"></label>
-      <button type="submit" class="danger" disabled>Close everything</button>
-    </form>
-  </div>
-  <p id="result" class="result" role="status" aria-live="assertive"></p>
-</section>
 </body>
 </html>

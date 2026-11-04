@@ -8,10 +8,15 @@
 <link rel="stylesheet" href="/app.css">
 </head>
 <body class="help">
-<header class="topbar">
+<header class="appbar">
   <div class="inner">
-    <span class="brand">bmv-trader</span>
-    <nav aria-label="Pages"><a href="/">Console</a><a href="/services">Services</a><a href="/help" class="is-active" aria-current="page">How to</a></nav>
+    <a class="brand" href="/"><span class="mark" aria-hidden="true"></span>bmv-trader</a>
+    <nav class="tabs" aria-label="Pages">
+      <a href="/" data-tab="overview">Overview</a>
+      <a href="/" data-tab="research">Research</a>
+      <a href="/services">Services</a>
+      <a href="/help" class="is-active" aria-current="page">Help</a>
+    </nav>
   </div>
 </header>
 <header class="help-head">

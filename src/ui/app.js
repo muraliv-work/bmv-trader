@@ -55,6 +55,8 @@ function setSignal(state, aspect, meta) {
   $("state").textContent = state;
   $("meta").textContent = meta;
   $("signal").dataset.aspect = aspect;
+  $("state-word").textContent = state;
+  $("state-pill").dataset.aspect = aspect;
   if (state !== lastState) {
     const lamp = document.querySelector(".lamp");
     lamp.classList.remove("changed");
@@ -101,10 +103,28 @@ function banner(text, danger) {
   $("banners").append(el("p", text, danger ? "banner danger" : "banner"));
 }
 
+// "$1,234.50" or "-$12.00" -> number; NaN when absent.
+const dollars = (text) => (text ? Number(text.replace(/[$,]/g, "")) : NaN);
+
+function pnlPercent(account) {
+  const e = $("pnl-pct");
+  const pnl = dollars(account?.today_pnl);
+  const start = dollars(account?.equity) - pnl;
+  e.className = "badge";
+  if (!Number.isFinite(pnl) || !(start > 0)) {
+    e.textContent = "";
+    return;
+  }
+  const pct = (pnl / start) * 100;
+  e.textContent = `${pct > 0 ? "▲" : pct < 0 ? "▼" : ""}${Math.abs(pct).toFixed(2)}%`;
+  if (pct !== 0) e.classList.add(pct > 0 ? "up" : "down");
+}
+
 // Nothing from an old reading stays on screen once a reading fails.
 function clearView() {
   $("banners").replaceChildren();
   for (const id of ["equity", "pnl", "bp"]) money(undefined, id);
+  pnlPercent(undefined);
   $("counts").textContent = "";
   for (const id of ["positions", "orders", "trials", "journal"]) $(id).replaceChildren();
   document.body.classList.remove("stale");
@@ -135,6 +155,14 @@ function render(s) {
   money(s.account?.equity, "equity");
   money(s.account?.today_pnl, "pnl");
   money(s.account?.buying_power, "bp");
+  pnlPercent(s.account);
+  const mode = $("mode-pill");
+  mode.textContent = s.mode === "LIVE" ? "LIVE" : "PAPER";
+  mode.classList.toggle("live", s.mode === "LIVE");
+  if (s.stop) {
+    $("state-word").textContent = "STOPPED";
+    $("state-pill").dataset.aspect = "danger";
+  }
   const c = s.summary;
   $("counts").textContent =
     `Today: ${c.candidates} candidates, ${c.rejections} rejected, ${c.orders} orders, ${c.fills} fills, ${c.exits} exits`;
@@ -144,7 +172,8 @@ function render(s) {
     (o) => [[`${o.symbol} ${o.client_order_id}`], [o.side], [o.status], [`${o.filled_qty}/${o.qty}`, "n"]], "None", 4);
   rows($("trials"), s.trials, (t) => [
     [t.strategy], [t.period], [t.trades, "n"],
-    [`${t.expectancy_r.toFixed(3)}R`, "n"], [`${t.ci_low.toFixed(3)}R`, "n"], [t.profit_factor.toFixed(2), "n"],
+    [`${t.expectancy_r.toFixed(3)}R`, "n"], [t.ci_low === null ? "–" : `${t.ci_low.toFixed(3)}R`, "n"],
+    [t.profit_factor === null ? "–" : t.profit_factor.toFixed(2), "n"],
   ], "No trials yet", 6);
 
   const j = $("journal");
@@ -382,6 +411,41 @@ async function slowPoll() {
     $("desk-note").textContent = "Can't reach the console.";
   }
 }
+
+// Overview and Research tabs (ARIA tablist); the last one is remembered for this tab's session.
+const tabs = [...document.querySelectorAll('[role="tab"]')];
+function showTab(tab, focus) {
+  for (const t of tabs) {
+    const on = t === tab;
+    t.setAttribute("aria-selected", String(on));
+    t.tabIndex = on ? 0 : -1;
+    $(t.getAttribute("aria-controls")).hidden = !on;
+  }
+  if (focus) tab.focus();
+  try {
+    sessionStorage.setItem("bmv-tab", tab.id.replace("tab-", ""));
+  } catch (_) {}
+}
+for (const t of tabs) {
+  t.addEventListener("click", () => showTab(t));
+  t.addEventListener("keydown", (ev) => {
+    const i = tabs.indexOf(t);
+    const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[ev.key];
+    if (next === undefined) return;
+    ev.preventDefault();
+    showTab(tabs[(next + tabs.length) % tabs.length], true);
+  });
+}
+try {
+  const saved = $(`tab-${sessionStorage.getItem("bmv-tab")}`);
+  if (saved) showTab(saved);
+} catch (_) {}
+
+const clock = () => {
+  $("clock").textContent = `${new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false })} ET`;
+};
+clock();
+setInterval(clock, 1000);
 
 poll();
 setInterval(poll, POLL_MS);

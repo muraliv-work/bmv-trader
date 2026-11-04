@@ -34,7 +34,24 @@ function setSignal(state, aspect, meta) {
   $("state").textContent = state;
   $("meta").textContent = meta;
   $("signal").dataset.aspect = aspect;
+  $("state-word").textContent = state;
+  $("state-pill").dataset.aspect = aspect;
 }
+
+// Overview and Research live on "/": remember which one to open there.
+for (const a of document.querySelectorAll("a[data-tab]")) {
+  a.addEventListener("click", () => {
+    try {
+      sessionStorage.setItem("bmv-tab", a.dataset.tab);
+    } catch (_) {}
+  });
+}
+
+const clock = () => {
+  $("clock").textContent = `${new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false })} ET`;
+};
+clock();
+setInterval(clock, 1000);
 
 const NAMES = { desk: "Desk (trial 10 analysis)", notes: "Notes (local digests)", llm: "LLM key rotation" };
 

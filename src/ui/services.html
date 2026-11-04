@@ -9,15 +9,24 @@
 <script src="/services.js" defer></script>
 </head>
 <body class="services">
-<header class="topbar">
+<header class="appbar">
   <div class="inner">
-    <span class="brand">bmv-trader</span>
-    <nav aria-label="Pages"><a href="/">Console</a><a href="/services" class="is-active" aria-current="page">Services</a><a href="/help">How to</a></nav>
+    <a class="brand" href="/"><span class="mark" aria-hidden="true"></span>bmv-trader</a>
+    <nav class="tabs" aria-label="Pages">
+      <a href="/" data-tab="overview">Overview</a>
+      <a href="/" data-tab="research">Research</a>
+      <a href="/services" class="is-active" aria-current="page">Services</a>
+      <a href="/help">Help</a>
+    </nav>
+    <div class="pills">
+      <span id="state-pill" class="pill state" data-aspect="unknown"><span class="dot" aria-hidden="true"></span><span id="state-word">Checking</span></span>
+      <time id="clock" class="clock"></time>
+    </div>
   </div>
 </header>
 
 <main>
-  <section class="signal card" id="signal" data-aspect="unknown" aria-live="polite">
+  <section class="status" id="signal" data-aspect="unknown" aria-live="polite">
     <div class="lamp" aria-hidden="true"></div>
     <div class="aspect">
       <h1 id="state">Checking</h1>

@@ -142,8 +142,9 @@ pub struct Trial {
     pub period: String,
     pub trades: u64,
     pub expectancy_r: f64,
-    pub profit_factor: f64,
-    pub ci_low: f64,
+    /// None when a trial has no losing trade, or isn't measured in trades (the lab).
+    pub profit_factor: Option<f64>,
+    pub ci_low: Option<f64>,
 }
 
 pub fn snapshot(a: &Alpaca, home: &Path, mode: &str, keep: usize) -> Snapshot {
@@ -468,6 +469,14 @@ mod tests {
     #[test]
     fn trials_parse_and_bad_lines_are_reported() {
         let line = r#"{"when":"w","strategy":"orb","params":"p","period":"a..b","trades":3,"expectancy_r":-0.1,"profit_factor":0.9,"max_drawdown_r":5.0,"ci_low":-0.2}"#;
+        let lab = r#"{"when":"w","strategy":"lab","params":"p","period":"a..b","trades":3,"expectancy_r":0.03,"profit_factor":null,"max_drawdown_r":0.0,"ci_low":null}"#;
+        let mut errs = BTreeMap::new();
+        assert_eq!(
+            parse_trials(lab, &mut errs).len(),
+            1,
+            "a null profit factor is not an unreadable line"
+        );
+        assert!(errs.is_empty());
         let mut errors = BTreeMap::new();
         let t = parse_trials(&format!("{line}\nnot json\n"), &mut errors);
         assert_eq!((t.len(), t[0].trades), (1, 3));
