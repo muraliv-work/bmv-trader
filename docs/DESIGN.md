@@ -499,6 +499,10 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
 - **Power gate (DECISION R9), run before any code:**
   - **Spread guide:** trial 9's research-period trade R spread, plus trial 10's first-night rating mix. Never untouched-year data.
   - **Rule:** the trial is built only if **the smallest D it detects with 80% power is at most 0.20R**. Otherwise it stops there and is recorded.
+  - **Result (2026-11-04, `retro-power`):** the gate **passed**.
+    - Research period 2017-01-03 → 2025-10-01: 2,199 sessions, all with a signal. The top signal's R averaged −0.011, with a standard deviation of 1.003.
+    - The untouched year has 262 sessions with a full hold, so about 262 signals.
+    - The 80%-power MDE of D is **0.096R** on the registered mix (5 Hold, 1 Underweight). For context, it's 0.163R on a decisive mix and 0.152R on a half-Hold mix.
 - **Known limits:**
   - The free Yahoo news feed often can't reach back, so some analyses run without news. That biases toward no effect; it doesn't leak.
   - Qwen3 30B is not Claude: a pass shows an LLM veto can help, and a fail doesn't settle trial 10.

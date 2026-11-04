@@ -62,7 +62,7 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 
 ## Trial 12: AI veto replayed on the untouched year, local model (DESIGN §7i, DECISION R11, S26)
 - [x] Pre-register
-- [ ] Power check (`retro-power`): build only if the 80%-power MDE is at most 0.20R
+- [x] Power check (`retro-power`): **passed**, 80%-power MDE 0.096R for about 262 signals (DESIGN §7i)
 - [ ] run.py local mode, `Analyst` enum in desk.rs, `src/retro.rs`, commands, tests; tier-1 review
 - [ ] Speed check on 3 research-period signals (outcomes discarded); fix k if needed
 - [ ] `retro-run` over several days, then `retro-verdict` once

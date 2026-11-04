@@ -21,6 +21,7 @@ const USAGE: &str = "usage:
   bmv-trader momentum                     trial 7: 12-1 month momentum on the adjusted daily bars (DESIGN §13c)
   bmv-trader power                        the smallest effect trials 11 and 12 could detect (spreads from trial 7)
   bmv-trader lab-search [--minutes 5] [--seed 1]  evolve ranking formulas on the search months only (DESIGN §7h)
+  bmv-trader retro-power                  trial 12's power gate: research-period signals only (DESIGN §7i)
   bmv-trader lab-validate                 ONCE: freeze the top 20 distinct formulas, score them on 2023-01..2025-09, log trial 11
   bmv-trader lab-ideas [--count 10]       ask the local model (Tier 2) for new formulas; the next lab-search starts from them
   bmv-trader desk-run                     trial 10 nightly (20 min after the close): live bars, signals, analyst ratings, scores
@@ -182,6 +183,7 @@ fn main() {
             Some("momentum") => momentum(),
             Some("power") => power(),
             Some("lab-validate") => lab_validate(),
+            Some("retro-power") => retro_power(),
             Some("lab-ideas") => lab_ideas(args.num("--count", 10, 1..=100)?),
             Some("lab-search") => lab_search(
                 args.num("--minutes", 5, 1..=600)?,
@@ -984,10 +986,133 @@ fn momentum() -> Result<(), String> {
 }
 
 /// Trial 8 (DESIGN §7d): research sessions only; logs the trial once, then prints the gate.
-fn backtest_swing(rules: bmv_trader::swing::Rules) -> Result<(), String> {
+/// Every session's swing candidates under `rules` (trials 8, 9 and 12): the calendar, the
+/// symbols, candidates by signal session, and the research sessions [start, cut).
+#[allow(clippy::type_complexity)]
+fn swing_days(
+    dir: &Path,
+    rules: &bmv_trader::swing::Rules,
+    cut_date: &str,
+) -> Result<
+    (
+        bmv_trader::momentum::Calendar,
+        Vec<String>,
+        Vec<Vec<bmv_trader::swing::Cand>>,
+        usize,
+        usize,
+    ),
+    String,
+> {
     use bmv_trader::momentum::{self as mo, Calendar};
     use bmv_trader::scan::ADJUSTED_SIP;
     use bmv_trader::swing::{self as sw, Cand};
+    let spy = bmv_trader::scan::read_daily(dir, ADJUSTED_SIP, mo::BENCHMARK)?;
+    let cal = Calendar::new(&spy)?;
+    let asset_names = if rules.stocks_only {
+        bmv_trader::scan::read_asset_names(dir)?
+    } else {
+        BTreeMap::new()
+    };
+    let mut funds = 0;
+    let mut names: Vec<String> = Vec::new();
+    let mut days: Vec<Vec<Cand>> = vec![Vec::new(); cal.sessions.len()];
+    bmv_trader::scan::for_each_daily(dir, ADJUSTED_SIP, &mut |s, bars| {
+        if rules.stocks_only && asset_names.get(s).is_some_and(|n| sw::is_fund(n)) {
+            funds += 1;
+            return Ok(());
+        }
+        for (d, c) in sw::candidates(names.len(), &bars, &cal, rules) {
+            days[d].push(c);
+        }
+        names.push(s.to_string());
+        if names.len().is_multiple_of(2000) {
+            eprintln!("  {} symbols", names.len());
+        }
+        Ok(())
+    })?;
+    let first = |d: &str| cal.sessions.iter().position(|s| s.as_str() >= d);
+    let start = first(sw::RESEARCH_FROM).ok_or("no session after the research start")?;
+    let cut = first(cut_date).ok_or("no session at the holdout start")?;
+    if rules.stocks_only {
+        eprintln!("{funds} funds left out by name");
+    }
+    Ok((cal, names, days, start, cut))
+}
+
+/// Trial 12's power gate (DESIGN §7i): research-period top signals only, never the untouched year.
+fn retro_power() -> Result<(), String> {
+    use bmv_trader::retro;
+    let dir = data_dir()?;
+    let cut_date = holdout_from(&dir, &[])?;
+    if cut_date != retro::FROM {
+        return Err(format!(
+            "the holdout starts {cut_date}, but trial 12 is pre-registered from {}",
+            retro::FROM
+        ));
+    }
+    let (cal, names, days, start, cut) = swing_days(&dir, &bmv_trader::swing::TRIAL_9, &cut_date)?;
+    let top = retro::top_per_session(&days, &names, start..cut);
+    let rs: Vec<f64> = top.iter().map(|(_, c)| c.out.r).collect();
+    let share = top.len() as f64 / (cut - start) as f64;
+    // the untouched year's size from the calendar only: its sessions, less the last 10 (holds)
+    let sessions = cal
+        .sessions
+        .len()
+        .saturating_sub(cut + bmv_trader::swing::MAX_HOLD);
+    let n = (share * sessions as f64).round() as usize;
+    println!(
+        "research {}..{}: {} sessions, {} with a signal ({:.0}%); top-signal R mean {:+.3}, sd {:.3}",
+        cal.sessions[start],
+        cal.sessions[cut - 1],
+        cut - start,
+        top.len(),
+        share * 100.0,
+        bmv_trader::momentum::mean(&rs),
+        bmv_trader::power::sd(&rs)
+    );
+    println!("untouched year: {sessions} sessions with a full hold, so about {n} signals expected");
+    let registered = [(0.5, 5.0), (0.0, 1.0)];
+    let mixes: [(&str, &[(f64, f64)]); 3] = [
+        (
+            "trial 10 night 1: 5 Hold, 1 Underweight (the registered guide)",
+            &registered,
+        ),
+        (
+            "decisive: 40% Buy/Overweight, 30% Hold, 30% veto (for context)",
+            &[(1.0, 0.4), (0.5, 0.3), (0.0, 0.3)],
+        ),
+        (
+            "half Hold, a quarter each way (for context)",
+            &[(1.0, 0.25), (0.5, 0.5), (0.0, 0.25)],
+        ),
+    ];
+    println!("\n  MDE of D at 1 - 0.05/12, one-sided, {n} signals:");
+    let mut gate = None;
+    for (name, mix) in mixes {
+        let sd = retro::d_null_sd(&rs, mix, n.max(10), 4000, 7);
+        let (m50, m80) = (retro::mde(sd, 0.5), retro::mde(sd, 0.8));
+        println!("  {m50:>6.3}R at 50%, {m80:>6.3}R at 80%   {name}");
+        gate.get_or_insert(m80);
+    }
+    let m80 = gate.unwrap_or(f64::INFINITY);
+    if m80 <= retro::MAX_MDE_R {
+        println!(
+            "\nGATE PASSED: {m80:.3}R <= {:.2}R, so trial 12 may be built (DECISION R11)",
+            retro::MAX_MDE_R
+        );
+    } else {
+        println!(
+            "\nGATE FAILED: {m80:.3}R > {:.2}R, so trial 12 stops here (DECISION R9, R11)",
+            retro::MAX_MDE_R
+        );
+    }
+    Ok(())
+}
+
+fn backtest_swing(rules: bmv_trader::swing::Rules) -> Result<(), String> {
+    use bmv_trader::momentum as mo;
+    use bmv_trader::scan::ADJUSTED_SIP;
+    use bmv_trader::swing as sw;
     let dir = data_dir()?;
     let cut_date = holdout_from(&dir, &[])?;
     let log = dir.join("trials.jsonl");
@@ -1014,32 +1139,7 @@ fn backtest_swing(rules: bmv_trader::swing::Rules) -> Result<(), String> {
     }
     eprintln!("adjusted SIP daily bars {from}..{to}; holdout from {cut_date} stays unseen");
     let spy = bmv_trader::scan::read_daily(&dir, ADJUSTED_SIP, mo::BENCHMARK)?;
-    let cal = Calendar::new(&spy)?;
-    let asset_names = if rules.stocks_only {
-        bmv_trader::scan::read_asset_names(&dir)?
-    } else {
-        BTreeMap::new()
-    };
-    let mut funds = 0;
-    let mut names: Vec<String> = Vec::new();
-    let mut days: Vec<Vec<Cand>> = vec![Vec::new(); cal.sessions.len()];
-    bmv_trader::scan::for_each_daily(&dir, ADJUSTED_SIP, &mut |s, bars| {
-        if rules.stocks_only && asset_names.get(s).is_some_and(|n| sw::is_fund(n)) {
-            funds += 1;
-            return Ok(());
-        }
-        for (d, c) in sw::candidates(names.len(), &bars, &cal, &rules) {
-            days[d].push(c);
-        }
-        names.push(s.to_string());
-        if names.len().is_multiple_of(2000) {
-            eprintln!("  {} symbols", names.len());
-        }
-        Ok(())
-    })?;
-    let first = |d: &str| cal.sessions.iter().position(|s| s.as_str() >= d);
-    let start = first(sw::RESEARCH_FROM).ok_or("no session after the research start")?;
-    let cut = first(&cut_date).ok_or("no session at the holdout start")?;
+    let (cal, names, days, start, cut) = swing_days(&dir, &rules, &cut_date)?;
     let (trades, per_day) = sw::portfolio(&days, &names, start, cut);
     let base = sw::baseline(&days, &per_day, cut);
     let st = sw::Study::new(trades, base, start..cut, &cal, &spy)?;
@@ -1069,9 +1169,6 @@ fn backtest_swing(rules: bmv_trader::swing::Rules) -> Result<(), String> {
         max_drawdown_r: st.max_drawdown_r(),
         ci_low,
     };
-    if rules.stocks_only {
-        println!("{funds} funds left out by name");
-    }
     let logged = stats::record_trial(&log, &trial)?;
     let wins = st.trades.iter().filter(|t| t.out.r > 0.0).count();
     println!("trial {logged}: {}, {period}", rules.name);
