@@ -19,6 +19,10 @@ const USAGE: &str = "usage:
   bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD [--adjusted]   daily bars for the universe
                       (raw IEX for the scan; --adjusted: split- and dividend-adjusted SIP, for momentum)
   bmv-trader momentum                     trial 7: 12-1 month momentum on the adjusted daily bars (DESIGN §13c)
+  bmv-trader desk-run                     trial 10 nightly (20 min after the close): live bars, signals, analyst ratings, scores
+  bmv-trader desk-report                  trial 10 so far: signals, ratings, spend, outcomes
+  bmv-trader desk-analyse --symbols X --date YYYY-MM-DD  one analyst run outside the trial (measures cost)
+  bmv-trader desk-verdict                 trial 10's pre-registered verdict, once it is due (logged once)
   bmv-trader asset-names                  Alpaca's name for each universe symbol (for trial 9's fund filter)
   bmv-trader backtest-swing --trial 8|9   the Desk Signal swing strategy on the adjusted daily bars (DESIGN §7d, §7e)
   bmv-trader scan     --from YYYY-MM-DD --to YYYY-MM-DD   each day's gappers, and their minute bars
@@ -38,7 +42,8 @@ const MAX_SEEDS: usize = 50;
 
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
-const VALUE_FLAGS: [&str; 8] = [
+const VALUE_FLAGS: [&str; 9] = [
+    "--date",
     "--trial",
     "--strategy",
     "--from",
@@ -164,6 +169,19 @@ fn main() {
                 fetch_daily(&from, &to, args.has("--adjusted"))
             }
             Some("momentum") => momentum(),
+            Some("desk-run") => desk_run(),
+            Some("desk-report") => {
+                let (home, dir) = (config::home()?, data_dir()?);
+                desk_report(&home, &live_calendar(&dir)?).map(|_| ())
+            }
+            Some("desk-verdict") => desk_verdict(),
+            Some("desk-analyse") => {
+                let symbol = args.symbols()?;
+                match (symbol.as_slice(), args.get("--date")) {
+                    ([s], Some(d)) if args.get("--symbols").is_some() => desk_analyse(s, d),
+                    _ => Err("desk-analyse needs --symbols X (one) and --date YYYY-MM-DD".into()),
+                }
+            }
             Some("asset-names") => {
                 let n = bmv_trader::scan::fetch_asset_names(&connect()?, &data_dir()?)?;
                 println!("names for {n} symbols");
@@ -660,6 +678,384 @@ fn backtest_swing(rules: bmv_trader::swing::Rules) -> Result<(), String> {
             "not passed"
         }
     );
+    Ok(())
+}
+
+/// Trial 10's symbols: trial 9's universe (stocks by name) that still traded in the last 30
+/// sessions of the research data, plus SPY for the calendar. Built once and cached in data/desk/,
+/// so the universe is fixed for the whole test (DESIGN §7f).
+fn live_symbols(dir: &Path) -> Result<Vec<String>, String> {
+    use bmv_trader::scan::{self, ADJUSTED_SIP};
+    let cache = dir.join("desk").join("live_symbols.json");
+    if cache.exists() {
+        return history::read_json(&cache);
+    }
+    let spy = scan::read_daily(dir, ADJUSTED_SIP, "SPY")?;
+    let cutoff = spy
+        .len()
+        .checked_sub(30)
+        .map(|i| spy[i].date.clone())
+        .ok_or("too few SPY bars")?;
+    let names = scan::read_asset_names(dir)?;
+    let mut out = vec!["SPY".to_string()];
+    for s in scan::read_universe(dir)? {
+        if s == "SPY" || names.get(&s).is_some_and(|n| bmv_trader::swing::is_fund(n)) {
+            continue;
+        }
+        let bars = scan::read_daily(dir, ADJUSTED_SIP, &s)?;
+        if bars.last().is_some_and(|b| b.date >= cutoff) {
+            out.push(s);
+        }
+    }
+    history::write_json(&cache, &out)?;
+    Ok(out)
+}
+
+/// Days of daily bars each night: enough that EMA 200 has forgotten its seed (DESIGN §7f).
+const LIVE_DAYS: u64 = 1100;
+
+fn et_now() -> chrono::DateTime<chrono_tz::Tz> {
+    chrono::Utc::now().with_timezone(&chrono_tz::America::New_York)
+}
+
+fn live_calendar(dir: &Path) -> Result<bmv_trader::momentum::Calendar, String> {
+    let spy = bmv_trader::scan::read_daily(dir, bmv_trader::scan::ADJUSTED_SIP_LIVE, "SPY")?;
+    bmv_trader::momentum::Calendar::new(&spy)
+}
+
+/// Trial 10 nightly (DESIGN §7f). Shadow only: it reads Alpaca's market data and never orders.
+/// Every signal is logged as Queued before any money is spent; a night cut short resumes there.
+fn desk_run() -> Result<(), String> {
+    use bmv_trader::desk::{self, Analysis, Status};
+    let (home, dir) = (config::home()?, data_dir()?);
+    let _lock = desk::lock(&home)?;
+    let et = et_now();
+    let today = et.date_naive().to_string();
+    let alpaca = connect()?;
+    // Alpaca's calendar knows holidays and half-days
+    let rows: Vec<history::CalendarRow> = alpaca.get(
+        broker::Api::Trading,
+        &format!("/v2/calendar?start={today}&end={today}"),
+    )?;
+    let session_today = history::parse_calendar(&rows)?
+        .into_iter()
+        .find(|s| s.date == today);
+    if session_today
+        .as_ref()
+        .is_some_and(|s| et.timestamp() < s.close + 20 * 60)
+    {
+        return Err("run 20 minutes or more after today's close, so the daily bar is final".into());
+    }
+    let symbols = live_symbols(&dir)?;
+    let from = (et.date_naive() - chrono::Days::new(LIVE_DAYS)).to_string();
+    eprintln!("refreshing {} symbols, {from}..{today}", symbols.len());
+    bmv_trader::scan::refresh_live(&alpaca, &dir, &symbols, &from, &today, &mut |d, n| {
+        if d % 1000 == 0 || d == n {
+            eprintln!("  {d}/{n}");
+        }
+    })?;
+    let cal = live_calendar(&dir)?;
+    let target = cal.sessions.last().cloned().ok_or("no SPY bars")?;
+    if session_today.is_some() && target != today {
+        return Err(format!(
+            "today is a session but SPY's newest bar is {target}: the data isn't ready, run again later"
+        ));
+    }
+    let path = desk::signals_path(&home, &target);
+    let signals: Vec<bmv_trader::swing::Signal> = if path.exists() {
+        history::read_json(&path)?
+    } else {
+        let found = desk::find_signals(&home, &cal)?;
+        history::write_json(&path, &found)?;
+        let when = et_now().to_rfc3339();
+        for (i, sig) in found.iter().enumerate() {
+            desk::record(
+                &home,
+                &Analysis {
+                    when: when.clone(),
+                    signal: sig.clone(),
+                    rank: i + 1,
+                    status: Status::Queued,
+                },
+            )?;
+        }
+        found
+    };
+    println!("{} signals on {target}", signals.len());
+    let key = desk::anthropic_key()?;
+    for (i, sig) in signals.into_iter().enumerate() {
+        let rank = i + 1;
+        let current = desk::read_analyses(&home)?;
+        let done = current.iter().any(|a| {
+            a.signal.date == sig.date && a.signal.symbol == sig.symbol && a.status != Status::Queued
+        });
+        if done {
+            continue;
+        }
+        let status = if rank > desk::MAX_PER_DAY {
+            Status::Unanalysed {
+                reason: format!("over the daily cap of {}", desk::MAX_PER_DAY),
+            }
+        } else if let Some(reason) = desk::over_budget(&desk::all_runs(&home)?, &today) {
+            Status::Unanalysed { reason }
+        } else {
+            match &key {
+                None => Status::Unanalysed {
+                    reason: "no ANTHROPIC_API_KEY in the Keychain".into(),
+                },
+                Some(k) => {
+                    eprintln!(
+                        "  analysing #{rank} {} (volume ratio {:.1})",
+                        sig.symbol, sig.ratio
+                    );
+                    desk::analyse(&home, k, &sig.symbol, &sig.date).0
+                }
+            }
+        };
+        println!("  #{rank} {}: {}", sig.symbol, describe(&status));
+        desk::record(
+            &home,
+            &Analysis {
+                when: et_now().to_rfc3339(),
+                signal: sig,
+                rank,
+                status,
+            },
+        )?;
+    }
+    let cards = desk::score_all(&home, &cal, &desk::read_analyses(&home)?)?;
+    history::write_json(&desk::desk_dir(&home).join("outcomes.json"), &cards)?;
+    desk_report(&home, &cal).map(|_| ())
+}
+
+fn describe(s: &bmv_trader::desk::Status) -> String {
+    use bmv_trader::desk::Status;
+    match s {
+        Status::Queued => "queued".into(),
+        Status::Rated {
+            rating, cost_usd, ..
+        } => format!("{rating:?} (${cost_usd:.2})"),
+        Status::Failed { reason, cost_usd } => format!("failed: {reason} (${cost_usd:.2})"),
+        Status::Unanalysed { reason } => format!("not analysed: {reason}"),
+    }
+}
+
+/// Trial 10 so far: counts, spend, missed sessions and when the verdict is due. Outcome averages
+/// stay hidden until the verdict, so nobody can stop the test on a good-looking night.
+fn desk_report(
+    home: &Path,
+    cal: &bmv_trader::momentum::Calendar,
+) -> Result<Vec<bmv_trader::desk::Scorecard>, String> {
+    use bmv_trader::desk::{self, Status};
+    let today = et_now().date_naive().to_string();
+    let analyses = desk::read_analyses(home)?;
+    let cards = desk::score_all(home, cal, &analyses)?;
+    let t = desk::tally(&cards);
+    let count = |f: &dyn Fn(&Status) -> bool| analyses.iter().filter(|a| f(&a.status)).count();
+    let runs = desk::all_runs(home)?;
+    let (day, month) = desk::spent(&runs, &today);
+    let first = desk::first_analysis(&analyses);
+    let start = analyses.iter().map(|a| a.signal.date.clone()).min();
+    let missed: Vec<&String> = cal
+        .sessions
+        .iter()
+        .filter(|d| start.as_ref().is_some_and(|s| *d >= s))
+        .filter(|d| !desk::signals_path(home, d).exists())
+        .collect();
+    println!(
+        "trial 10: {} signals, {} rated, {} failed, {} not analysed, {} queued",
+        analyses.len(),
+        count(&|s| matches!(s, Status::Rated { .. })),
+        count(&|s| matches!(s, Status::Failed { .. })),
+        count(&|s| matches!(s, Status::Unanalysed { .. })),
+        count(&|s| *s == Status::Queued)
+    );
+    println!(
+        "  rated trades: {} finished, {} still open, {} skipped (no entry)",
+        t.done, t.pending, t.skipped
+    );
+    println!(
+        "  spend: ${day:.2} today, ${month:.2} this month (caps ${:.2} / ${:.0}); next run ~{}",
+        desk::DAILY_BUDGET_USD,
+        desk::MONTHLY_BUDGET_USD,
+        desk::expected_cost(&runs).map_or("unmeasured".into(), |c| format!("${c:.2}"))
+    );
+    if !missed.is_empty() {
+        println!(
+            "  MISSED sessions (no signals logged): {}",
+            missed
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let due = desk::sample(&cards, first.as_deref(), &today);
+    println!(
+        "  verdict: {}",
+        match &due {
+            None => format!(
+                "not due (at {} rated signals, or {} days after {})",
+                desk::TARGET_SIGNALS,
+                desk::MAX_DAYS,
+                first.as_deref().unwrap_or("the first analysis")
+            ),
+            Some(s)
+                if s.iter()
+                    .any(|c| c.scored == bmv_trader::swing::Scored::Pending) =>
+                "sample fixed; waiting for its trades to finish".into(),
+            Some(_) => "READY: run `bmv-trader desk-verdict`".into(),
+        }
+    );
+    Ok(cards)
+}
+
+/// The trials logged so far, by name; a log that can't be read is an error, not "none".
+fn logged_trials(log: &Path) -> Result<Vec<String>, String> {
+    let text = match std::fs::read_to_string(log) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read {}: {e}", log.display())),
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            serde_json::from_str::<stats::Trial>(l)
+                .map(|t| t.strategy)
+                .map_err(|e| format!("{}: {e}", log.display()))
+        })
+        .collect()
+}
+
+/// Trial 10's verdict on its fixed sample, once every trade in it has finished; logged once.
+fn desk_verdict() -> Result<(), String> {
+    use bmv_trader::desk;
+    let (home, dir) = (config::home()?, data_dir()?);
+    let _lock = desk::lock(&home)?;
+    let today = et_now().date_naive();
+    let log = dir.join("trials.jsonl");
+    let trials = logged_trials(&log)?;
+    if trials.iter().any(|t| t == desk::TRIAL_NAME) {
+        return Err("trial 10 is already logged".into());
+    }
+    if trials.len() + 1 != desk::TRIAL_NUMBER {
+        return Err(format!(
+            "trials.jsonl holds {} trials; trial 10 must be the 10th (DESIGN §7f)",
+            trials.len()
+        ));
+    }
+    let (_, to) = bmv_trader::scan::daily_range(&dir, bmv_trader::scan::ADJUSTED_SIP_LIVE)?;
+    let fresh = history::canonical_date(&to)?;
+    if (today - fresh).num_days() > 4 {
+        return Err(format!("the live bars end {to}: run `desk-run` first"));
+    }
+    let cal = live_calendar(&dir)?;
+    let cards = desk_report(&home, &cal)?;
+    let analyses = desk::read_analyses(&home)?;
+    let first = desk::first_analysis(&analyses);
+    let sample = desk::sample(&cards, first.as_deref(), &today.to_string())
+        .ok_or("not due yet: the verdict waits for its pre-registered sample")?;
+    if sample
+        .iter()
+        .any(|c| c.scored == bmv_trader::swing::Scored::Pending)
+    {
+        return Err("the sample's trades haven't all finished yet".into());
+    }
+    let t = desk::tally(&sample);
+    let gate = desk::verdict(&sample);
+    let alpha = stats::FAMILY_ALPHA / desk::TRIAL_NUMBER as f64;
+    let trial = stats::Trial {
+        when: chrono::Utc::now().to_rfc3339(),
+        strategy: desk::TRIAL_NAME.into(),
+        params: format!(
+            "TradingAgents veto on trial 9 signals; {} / {}; sample {} rated ({} finished, {} skipped); units: expectancy_r = AI-weighted mean R, ci_low = lower bound of D",
+            desk::QUICK_MODEL,
+            desk::DEEP_MODEL,
+            sample.len(),
+            t.done,
+            t.skipped
+        ),
+        period: format!("{}..{today}", first.unwrap_or_default()),
+        trades: t.done,
+        expectancy_r: t.weighted.unwrap_or(0.0),
+        profit_factor: None,
+        max_drawdown_r: 0.0,
+        ci_low: desk::d_lower_bound(&sample, alpha, stats::resamples_for(alpha)),
+    };
+    let logged = stats::record_trial(&log, &trial)?;
+    let r = |x: Option<f64>| x.map_or("—".into(), |x| format!("{x:+.3}R"));
+    println!(
+        "trial {logged}: {}; all {}, approved {}, vetoed {}, AI-weighted {}, D {}",
+        desk::TRIAL_NAME,
+        r(t.mean_all),
+        r(t.mean_approved),
+        r(t.mean_vetoed),
+        r(t.weighted),
+        r(t.d)
+    );
+    for c in &gate.checks {
+        println!(
+            "  [{}] {}: {}",
+            if c.passed { "pass" } else { "FAIL" },
+            c.name,
+            c.detail
+        );
+    }
+    println!(
+        "verdict: {}",
+        if gate.passed() {
+            "the AI veto earns its next step"
+        } else {
+            "the AI adds nothing measurable"
+        }
+    );
+    Ok(())
+}
+
+/// One analyst run outside the trial, to measure cost; it still counts toward the budget. Each
+/// run gets a fresh memory folder, so it can't influence trial ratings.
+fn desk_analyse(symbol: &str, date: &str) -> Result<(), String> {
+    use bmv_trader::desk::{self, Analysis, Status};
+    use bmv_trader::swing::Signal;
+    let home = config::home()?;
+    let _lock = desk::lock(&home)?;
+    let today = et_now().date_naive().to_string();
+    let key = desk::anthropic_key()?
+        .ok_or("add ANTHROPIC_API_KEY to the Keychain first (service bmv-trader)")?;
+    if let Some(r) = desk::over_budget(&desk::all_runs(&home)?, &today) {
+        return Err(r);
+    }
+    let signal = Signal {
+        symbol: symbol.into(),
+        date: date.into(),
+        ratio: 0.0,
+        close: 0.0,
+        atr: 0.0,
+    };
+    // the spend is recorded before the answer is shown, so a failed write can't hide it
+    let (status, calls) = desk::analyse(&home, &key, symbol, date);
+    desk::record_manual(
+        &home,
+        &Analysis {
+            when: et_now().to_rfc3339(),
+            signal,
+            rank: 0,
+            status: status.clone(),
+        },
+    )?;
+    for c in &calls {
+        println!(
+            "  {} in {} out {} ${:.4}",
+            c.model,
+            c.input,
+            c.output,
+            desk::call_cost(c)
+        );
+    }
+    println!("{symbol} {date}: {}", describe(&status));
+    if let Status::Rated { summary, .. } = &status {
+        println!("{summary}");
+    }
     Ok(())
 }
 

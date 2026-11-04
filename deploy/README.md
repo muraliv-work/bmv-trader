@@ -43,3 +43,23 @@ the plist. Full Disk Access is tied to that exact file, so after a rebuild check
 launchctl bootout gui/$(id -u)/com.bmv-trader.backstop
 rm ~/Library/LaunchAgents/com.bmv-trader.backstop.plist
 ```
+
+# Trial 10 nightly analyst (launchd)
+
+`bmv-trader desk-run` runs on weekdays at 16:30 Mac time (17:30 ET on US Central time). It downloads
+the last ~420 days of adjusted daily bars, finds trial 9's signals on today's close, asks the
+TradingAgents analyst (Claude only) about the top ones within the $100/month budget, and scores older
+signals. It **never places an order**.
+
+Before installing:
+
+```sh
+# the analyst's only key; it is passed to the sidecar and nothing else is
+security add-generic-password -s bmv-trader -a ANTHROPIC_API_KEY -w
+# one manual run first, to measure what an analysis costs (counts toward the budget)
+mkdir -p data/desk
+target/release/bmv-trader desk-analyse --symbols AAPL --date 2026-11-03
+```
+
+Install, check and remove work like the backstop above, with `com.bmv-trader.desk.plist`. The log is
+`data/desk/run.log`; `bmv-trader desk-report` shows progress at any time.

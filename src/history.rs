@@ -249,7 +249,7 @@ fn fetched_path(dir: &Path) -> PathBuf {
 
 /// Writes via a per-process temp file, synced, then renamed: an interrupted or concurrent run
 /// never leaves a half file under the real name.
-pub(crate) fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<(), String> {
+pub fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<(), String> {
     let dir = path.parent().ok_or("no parent directory")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
@@ -263,7 +263,7 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<(), String>
     std::fs::rename(&tmp, path).map_err(|e| format!("cannot rename into {}: {e}", path.display()))
 }
 
-pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     serde_json::from_slice(&bytes)
         .map_err(|e| format!("corrupt cache file {}: {e}", path.display()))

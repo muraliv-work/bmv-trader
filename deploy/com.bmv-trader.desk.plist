@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Trial 10 nightly (DESIGN §7f): `bmv-trader desk-run` on weekdays at 16:30 Mac time, which is
+     17:30 ET on a Mac set to US Central time. Shadow only: it downloads bars, asks the analyst and
+     scores; it never places an order. If the Mac sleeps through it, launchd runs it on wake.
+     Install: deploy/README.md -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bmv-trader.desk</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/target/release/bmv-trader</string>
+    <string>desk-run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BMV_HOME</key>
+    <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/data/desk/run.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/data/desk/run.log</string>
+</dict>
+</plist>

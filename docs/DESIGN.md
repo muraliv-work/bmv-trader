@@ -387,6 +387,20 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
 
   Otherwise the AI adds nothing measurable and stays out of the decision path.
 - **Budget, enforced in code:** $100 a month, $3.30 a day. The cost per run is computed from token usage. Over the cap, signals are logged as "unanalysed: budget".
+- **Settled after the tier-1 review, before any run:**
+  - **Universe:** fixed for the whole test. It is trial 9's stocks (funds excluded by name) that traded in the last 30 sessions of the research data. SPY is the calendar only and is never a signal. New listings are not added, a known small survivorship effect.
+  - **Bars:** the last **1,100 days** are downloaded each night, so EMA 200 has forgotten its seed (under 1% weight) and live signals match the backtest's.
+  - **Run timing:** a run waits until 20 minutes after Alpaca's close for the day. Holidays and half-days come from Alpaca's calendar. A session whose bar isn't in yet is an error, not a skipped day.
+  - **Logging and resume:** every signal is logged **Queued before any money is spent**. A night cut short resumes there. A signal's first final answer counts, and later lines can't replace it. Sessions with no signals file are reported as missed.
+  - **Scoring:** uses the ATR and close logged at signal time, rescaled by the signal-day close in the fresh bars, so a split since then changes nothing. Eligibility isn't re-checked. An exit at a last close counts only after the symbol has had no bar for 5 sessions (delisted); otherwise the trade is still open.
+  - **Sample:** fixed by date, not outcome. It is the **first 150 rated signals by date and rank**, or, once 6 months have passed since the first analysis, every rated signal from those 6 months. The verdict waits until every trade in the sample has finished. It is judged at 1 − 0.05/10 even if other trials are logged later.
+  - **No peeking:** nightly reports show counts, spend and missed sessions only. Outcome averages and D appear only in the one-time verdict.
+  - **Analyst isolation:**
+    - Each run gets a fresh folder as its HOME, memory log and cache, so no rating can see an earlier outcome. Manual `desk-analyse` runs can't leak into the trial either.
+    - It runs under a macOS sandbox (`sandbox-exec`) that blocks reading the project (except the sidecar), the Keychain and the `security` tool.
+    - Only the answer line marked `BMV_RESULT` is read.
+  - **Cost:** usage is written call by call. A crashed run is charged what it reported, or a full day's budget ($3.30) if it reported nothing. A rating with no usage from the rating model is a failure.
+  - **Residual risk, accepted:** the sidecar's ~85 Python packages are pinned by version (`requirements.lock`) and TradingAgents by commit, but not by hash. The sandbox is the containment.
 - **Known limits:**
   - 150 signals can show clear harm or a large benefit; a small edge would stay unproven.
   - LLM answers vary from run to run.

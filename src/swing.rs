@@ -147,6 +147,8 @@ pub struct Outcome {
     pub r: f64,
     /// (entry − stop) / entry.
     pub stop_fraction: f64,
+    /// Sold at the last close because no later bar exists: delisted, or the data simply ends.
+    pub at_data_end: bool,
 }
 
 /// One symbol on one signal day: always eligible (liquid, with a tradable entry), and a Desk
@@ -172,6 +174,7 @@ fn simulate_trade(on: &[Option<&DailyBar>], e: usize, atr: f64) -> Option<Outcom
         exit: at,
         r: (exit - entry - COST_PER_SIDE * (entry + exit)) / (entry - stop),
         stop_fraction: (entry - stop) / entry,
+        at_data_end: false,
     };
     let last = (e + MAX_HOLD).min(on.len() - 1);
     for (j, b) in on.iter().enumerate().take(last + 1).skip(e) {
@@ -206,7 +209,10 @@ fn simulate_trade(on: &[Option<&DailyBar>], e: usize, atr: f64) -> Option<Outcom
         .enumerate()
         .rev()
         .find_map(|(j, b)| Some((e + j, (*b)?)))?;
-    Some(r(b.close, j))
+    Some(Outcome {
+        at_data_end: true,
+        ..r(b.close, j)
+    })
 }
 
 /// Finite, positive, and the high and low bracket the open and close.
@@ -219,6 +225,54 @@ fn sane(b: &DailyBar) -> bool {
         && b.high >= b.open.max(b.close)
 }
 
+/// A symbol's sane bars on the calendar and its indicators, by own-bar index.
+struct Series<'a> {
+    on: Vec<Option<&'a DailyBar>>,
+    /// Session index of each own bar.
+    idx: Vec<usize>,
+    own: Vec<&'a DailyBar>,
+    emas: Vec<Vec<Option<f64>>>,
+    rsi: Vec<Option<f64>>,
+    atr: Vec<Option<f64>>,
+}
+
+impl<'a> Series<'a> {
+    fn new(bars: &'a [DailyBar], cal: &Calendar) -> Self {
+        // a bar with an impossible high or low counts as missing: a bad print could fake a fill
+        let on: Vec<Option<&DailyBar>> = cal
+            .aligned(bars)
+            .into_iter()
+            .map(|b| b.filter(|b| sane(b)))
+            .collect();
+        let idx: Vec<usize> = (0..on.len()).filter(|&i| on[i].is_some()).collect();
+        let own: Vec<&DailyBar> = idx.iter().map(|&i| on[i].unwrap()).collect();
+        let close: Vec<f64> = own.iter().map(|b| b.close).collect();
+        Series {
+            emas: EMAS.iter().map(|&n| ema(&close, n)).collect(),
+            rsi: rsi(&close, RSI_LEN),
+            atr: atr(&own, ATR_LEN),
+            on,
+            idx,
+            own,
+        }
+    }
+
+    /// The ATR at own bar `k` if the symbol is in the trial universe there (history, liquidity,
+    /// volatility floor). The baseline draws from exactly this set.
+    fn eligible(&self, k: usize, rules: &Rules) -> Option<f64> {
+        if k + 1 < MIN_HISTORY || k < ATR_LEN + ATR_WINDOW {
+            return None;
+        }
+        let a = self.atr[k]?;
+        (momentum::liquid(&self.on, self.idx[k]) && a >= rules.min_atr_fraction * self.own[k].close)
+            .then_some(a)
+    }
+
+    fn signal(&self, k: usize) -> Option<f64> {
+        desk_signal(k, &self.own, &self.emas, &self.rsi, &self.atr)
+    }
+}
+
 /// Every eligible day of one symbol, keyed by signal session.
 pub fn candidates(
     symbol: usize,
@@ -226,46 +280,122 @@ pub fn candidates(
     cal: &Calendar,
     rules: &Rules,
 ) -> Vec<(usize, Cand)> {
-    // a bar with an impossible high or low counts as missing: a bad print could fake a fill
-    let on: Vec<Option<&DailyBar>> = cal
-        .aligned(bars)
-        .into_iter()
-        .map(|b| b.filter(|b| sane(b)))
-        .collect();
-    let idx: Vec<usize> = (0..on.len()).filter(|&i| on[i].is_some()).collect();
-    let own: Vec<&DailyBar> = idx.iter().map(|&i| on[i].unwrap()).collect();
-    let close: Vec<f64> = own.iter().map(|b| b.close).collect();
-    let emas: Vec<Vec<Option<f64>>> = EMAS.iter().map(|&n| ema(&close, n)).collect();
-    let rsi = rsi(&close, RSI_LEN);
-    let atr = atr(&own, ATR_LEN);
+    let ser = Series::new(bars, cal);
     let mut out = Vec::new();
-    for (k, &s) in idx.iter().enumerate() {
-        // the baseline draws from the same universe the signal can trade
-        if k + 1 < MIN_HISTORY || k < ATR_LEN + ATR_WINDOW {
-            continue;
-        }
-        let (Some(a), Some(next)) = (atr[k], on.get(s + 1).copied().flatten()) else {
+    for (k, &s) in ser.idx.iter().enumerate() {
+        let Some(a) = ser.eligible(k, rules) else {
             continue;
         };
-        if !momentum::liquid(&on, s)
-            || next.open > own[k].close * (1.0 + MAX_CHASE)
-            || a < rules.min_atr_fraction * own[k].close
-        {
+        let Some(next) = ser.on.get(s + 1).copied().flatten() else {
+            continue;
+        };
+        if next.open > ser.own[k].close * (1.0 + MAX_CHASE) {
             continue;
         }
-        let Some(trade) = simulate_trade(&on, s + 1, a) else {
+        let Some(trade) = simulate_trade(&ser.on, s + 1, a) else {
             continue;
         };
         out.push((
             s,
             Cand {
                 symbol,
-                ratio: desk_signal(k, &own, &emas, &rsi, &atr),
+                ratio: ser.signal(k),
                 out: trade,
             },
         ));
     }
     out
+}
+
+/// A Desk Signal on the calendar's last session (trial 10, DESIGN §7f).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Signal {
+    pub symbol: String,
+    pub date: String,
+    pub ratio: f64,
+    pub close: f64,
+    pub atr: f64,
+}
+
+/// The Desk Signal on the last calendar session, if the symbol traded that day and fired.
+pub fn signal_today(
+    symbol: &str,
+    bars: &[DailyBar],
+    cal: &Calendar,
+    rules: &Rules,
+) -> Option<Signal> {
+    let ser = Series::new(bars, cal);
+    let k = ser.own.len().checked_sub(1)?;
+    if ser.idx[k] + 1 != cal.sessions.len() {
+        return None;
+    }
+    let atr = ser.eligible(k, rules)?;
+    Some(Signal {
+        symbol: symbol.to_string(),
+        date: cal.sessions[ser.idx[k]].clone(),
+        ratio: ser.signal(k)?,
+        close: ser.own[k].close,
+        atr,
+    })
+}
+
+/// What a forward signal came to, from bars after its day.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Scored {
+    /// Not enough later bars yet.
+    Pending,
+    /// No entry: no bar the next session, or the open chased more than 0.5%.
+    Skipped(String),
+    Done {
+        r: f64,
+        exit_date: String,
+    },
+}
+
+/// A symbol with no bar for this many sessions before the newest is treated as delisted.
+pub const DELISTED_AFTER: usize = 5;
+
+/// Scores a logged signal with trial 9's exits from bars after its day. It uses the ATR logged at
+/// signal time, rescaled by today's adjustment of the signal-day close, so later downloads can't
+/// change whether or how it was eligible. An exit at the last close counts only when the symbol
+/// has stopped trading (no bar for `DELISTED_AFTER` sessions); otherwise the trade is still open.
+pub fn score_forward(bars: &[DailyBar], cal: &Calendar, signal: &Signal) -> Scored {
+    let ser = Series::new(bars, cal);
+    let Some(s) = cal.sessions.iter().position(|d| *d == signal.date) else {
+        return Scored::Skipped(format!("{} is not in the calendar", signal.date));
+    };
+    let Some(k) = ser.idx.iter().position(|&i| i == s) else {
+        return Scored::Skipped(format!("no bar on {} in the fresh bars", signal.date));
+    };
+    let scale = ser.own[k].close / signal.close;
+    let atr = signal.atr * scale;
+    if !(scale.is_finite() && scale > 0.0 && atr.is_finite() && atr > 0.0) {
+        return Scored::Skipped("signal close or ATR unusable".into());
+    }
+    let (e, last) = (s + 1, cal.sessions.len() - 1);
+    if e > last {
+        return Scored::Pending;
+    }
+    let Some(next) = ser.on[e] else {
+        // a missing bar on the newest session may just be late
+        return if e == last {
+            Scored::Pending
+        } else {
+            Scored::Skipped("no bar the next session".into())
+        };
+    };
+    if next.open > ser.own[k].close * (1.0 + MAX_CHASE) {
+        return Scored::Skipped("chased: opened > 0.5% above the close".into());
+    }
+    let newest_bar = ser.idx.last().copied().unwrap_or(0);
+    match simulate_trade(&ser.on, e, atr) {
+        Some(o) if o.at_data_end && newest_bar + DELISTED_AFTER > last => Scored::Pending,
+        Some(o) => Scored::Done {
+            r: o.r,
+            exit_date: cal.sessions[o.exit].clone(),
+        },
+        None => Scored::Skipped("no valid stop".into()),
+    }
 }
 
 /// The Desk Signal at own-bar `k`: its volume ratio, if every condition holds.
@@ -792,6 +922,7 @@ mod tests {
                 exit,
                 r,
                 stop_fraction: 0.02,
+                at_data_end: false,
             },
         }
     }
@@ -851,6 +982,7 @@ mod tests {
                     exit: 6 + i % 100,
                     r: if i % 3 == 0 { -1.0 } else { 1.0 },
                     stop_fraction: 0.02,
+                    at_data_end: false,
                 },
             })
             .collect();
@@ -943,5 +1075,90 @@ mod tests {
         ] {
             assert!(!is_fund(s), "{s}");
         }
+    }
+
+    #[test]
+    fn signal_today_matches_the_backtest_and_scoring_waits_for_bars() {
+        let (n, k) = (320, 300);
+        let full = breakout_bars(n, k);
+        // the calendar ends on the breakout day: tonight's view of it
+        let ds = dates(n);
+        let tonight = Calendar::new(
+            &ds[..=k]
+                .iter()
+                .map(|d| bar(d, 1.0, 1.0, 1.0, 1.0, 1))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let sig = signal_today("X", &full[..=k], &tonight, &TRIAL_8).unwrap();
+        let back = candidates(0, &full, &cal(n), &TRIAL_8);
+        let then = back.iter().find(|(d, _)| *d == k).unwrap().1;
+        assert_eq!(Some(sig.ratio), then.ratio, "same signal as the backtest");
+        assert_eq!(sig.date, ds[k]);
+        assert_eq!(
+            signal_today("X", &full[..k], &tonight, &TRIAL_8),
+            None,
+            "no bar today"
+        );
+        assert_eq!(score_forward(&full[..=k], &tonight, &sig), Scored::Pending);
+        let later = Calendar::new(
+            &ds[..=k + 3]
+                .iter()
+                .map(|d| bar(d, 1.0, 1.0, 1.0, 1.0, 1))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            score_forward(&full[..=k + 3], &later, &sig),
+            Scored::Pending,
+            "a quiet hold isn't done until its time stop"
+        );
+        match score_forward(&full, &cal(n), &sig) {
+            Scored::Done { r, .. } => assert!((r - then.out.r).abs() < 1e-12, "same outcome"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_newest_bar_keeps_the_trade_open_until_it_looks_delisted() {
+        let (n, k) = (320, 300);
+        let full = breakout_bars(n, k);
+        let ds = dates(n);
+        let at = |m: usize| {
+            Calendar::new(
+                &ds[..m]
+                    .iter()
+                    .map(|d| bar(d, 1.0, 1.0, 1.0, 1.0, 1))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let sig = signal_today("X", &full[..=k], &at(k + 1), &TRIAL_8).unwrap();
+        // the symbol's bars stop after k+3 while the calendar runs on
+        let stopped = &full[..=k + 3];
+        assert_eq!(
+            score_forward(stopped, &at(k + 6), &sig),
+            Scored::Pending,
+            "3 sessions quiet"
+        );
+        match score_forward(stopped, &at(k + 3 + DELISTED_AFTER + 1), &sig) {
+            Scored::Done { exit_date, .. } => assert_eq!(exit_date, ds[k + 3], "last close"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            score_forward(&full[..=k], &at(k + 2), &sig),
+            Scored::Pending,
+            "the entry bar may just be late"
+        );
+        let split = Signal {
+            close: sig.close / 2.0,
+            atr: sig.atr / 2.0,
+            ..sig.clone()
+        };
+        assert_eq!(
+            score_forward(&full, &at(n), &split),
+            score_forward(&full, &at(n), &sig),
+            "a split since the signal rescales its ATR"
+        );
     }
 }

@@ -34,6 +34,8 @@ pub struct DailySet {
     feed: &'static str,
     adjustment: &'static str,
     folder: &'static str,
+    /// The set keeps its own symbol list (`_symbols.json`) instead of the whole universe.
+    listed: bool,
 }
 
 /// Raw IEX prices: the gap scan compares today's open with yesterday's real close.
@@ -41,12 +43,27 @@ pub const RAW_IEX: DailySet = DailySet {
     feed: history::FEED,
     adjustment: "raw",
     folder: history::FEED,
+    listed: false,
 };
 /// Split- and dividend-adjusted SIP prices, from 2016: returns over months (DESIGN §13c).
 pub const ADJUSTED_SIP: DailySet = DailySet {
     feed: "sip",
     adjustment: "all",
     folder: "sip-all",
+    listed: false,
+};
+/// The last ~420 days of the same adjusted bars for trial 10 (DESIGN §7f), downloaded fresh each
+/// night so every bar shares today's split and dividend adjustment.
+pub const ADJUSTED_SIP_LIVE: DailySet = DailySet {
+    feed: "sip",
+    adjustment: "all",
+    folder: "sip-live",
+    listed: true,
+};
+/// Where a refresh downloads before it replaces `sip-live`, so a failed night leaves the old set.
+const LIVE_STAGING: DailySet = DailySet {
+    folder: "sip-live.tmp",
+    ..ADJUSTED_SIP_LIVE
 };
 const EXCHANGES: [&str; 5] = ["NYSE", "NASDAQ", "AMEX", "ARCA", "BATS"];
 
@@ -285,8 +302,7 @@ pub fn fetch_daily(
     to: &str,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<usize, String> {
-    let universe: Vec<String> = history::read_json(&universe_path(dir))
-        .map_err(|e| format!("{e}: run `bmv-trader universe` first"))?;
+    let universe = symbols_of(dir, set)?;
     // Resuming skips symbols that have a file, so every file must cover the same range.
     let range = DailyRange {
         from: from.into(),
@@ -391,9 +407,7 @@ pub type OnDaily<'a> = dyn FnMut(&str, Vec<DailyBar>) -> Result<(), String> + 'a
 /// Each universe symbol with bars in `set`, one at a time, so a long history needn't fit in memory.
 /// Errors if a symbol has no file (a partial download).
 pub fn for_each_daily(dir: &Path, set: DailySet, f: &mut OnDaily<'_>) -> Result<(), String> {
-    let universe: Vec<String> = history::read_json(&universe_path(dir))
-        .map_err(|e| format!("{e}: run `bmv-trader universe` first"))?;
-    for s in universe {
+    for s in symbols_of(dir, set)? {
         let bars: Vec<DailyBar> = history::read_json(&daily_path(dir, set, &s))
             .map_err(|e| format!("{e}: run `bmv-trader fetch-daily` first"))?;
         if !bars.is_empty() {
@@ -401,6 +415,51 @@ pub fn for_each_daily(dir: &Path, set: DailySet, f: &mut OnDaily<'_>) -> Result<
         }
     }
     Ok(())
+}
+
+/// The symbols `set` holds: its own list, or the whole universe.
+fn symbols_of(dir: &Path, set: DailySet) -> Result<Vec<String>, String> {
+    if set.listed {
+        history::read_json(&dir.join("daily").join(set.folder).join("_symbols.json"))
+            .map_err(|e| format!("{e}: run `bmv-trader desk-run` to download it"))
+    } else {
+        read_universe(dir)
+    }
+}
+
+/// Every symbol `bmv-trader universe` listed.
+pub fn read_universe(dir: &Path) -> Result<Vec<String>, String> {
+    history::read_json(&universe_path(dir))
+        .map_err(|e| format!("{e}: run `bmv-trader universe` first"))
+}
+
+/// Downloads `symbols` over [from, to] into a staging folder, then swaps it in as `sip-live`.
+/// A failure leaves yesterday's set in place.
+pub fn refresh_live(
+    alpaca: &Alpaca,
+    dir: &Path,
+    symbols: &[String],
+    from: &str,
+    to: &str,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<usize, String> {
+    let staging = dir.join("daily").join(LIVE_STAGING.folder);
+    let live = dir.join("daily").join(ADJUSTED_SIP_LIVE.folder);
+    match std::fs::remove_dir_all(&staging) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot clear {}: {e}", staging.display())),
+    }
+    history::write_json(&staging.join("_symbols.json"), &symbols)?;
+    let n = fetch_daily(alpaca, dir, LIVE_STAGING, from, to, progress)?;
+    match std::fs::remove_dir_all(&live) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot replace {}: {e}", live.display())),
+    }
+    std::fs::rename(&staging, &live)
+        .map_err(|e| format!("cannot move {} into place: {e}", staging.display()))?;
+    Ok(n)
 }
 
 /// One symbol's bars in `set`.

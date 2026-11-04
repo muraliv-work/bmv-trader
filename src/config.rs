@@ -40,7 +40,7 @@ pub const KEYCHAIN_SERVICE: &str = "bmv-trader";
 
 /// One Keychain item, via Apple's own CLI (absolute path, so PATH can't swap it). Not found is
 /// None; any other failure, such as a locked keychain, a denied prompt or a hang, is an error.
-fn keychain(account: &str) -> Result<Option<String>, String> {
+pub(crate) fn keychain(account: &str) -> Result<Option<String>, String> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     // A locked keychain over SSH can wait forever on a prompt; startup must fail instead of hang.

@@ -3,6 +3,7 @@
 pub mod backtest;
 pub mod broker;
 pub mod config;
+pub mod desk;
 pub mod engine;
 pub mod history;
 pub mod live;

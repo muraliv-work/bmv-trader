@@ -1,0 +1,2 @@
+# Trial 10 analyst (DESIGN §7f). Pinned commit, installed from GitHub, never from REFERENCE-REPOS/.
+tradingagents @ git+https://github.com/TauricResearch/TradingAgents@c4544913a14ed3df5f1ed7b9e8483270ce20682a
