@@ -384,10 +384,9 @@ mod tests {
     use super::*;
 
     fn home() -> PathBuf {
-        let tag = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // a counter, not the clock: two tests can start in the same nanosecond and share a folder
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tag = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let h = std::env::temp_dir().join(format!("bmv-notes-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(h.join("data")).unwrap();
         h
