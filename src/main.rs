@@ -19,6 +19,7 @@ const USAGE: &str = "usage:
   bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD [--adjusted]   daily bars for the universe
                       (raw IEX for the scan; --adjusted: split- and dividend-adjusted SIP, for momentum)
   bmv-trader momentum                     trial 7: 12-1 month momentum on the adjusted daily bars (DESIGN §13c)
+  bmv-trader backtest-swing               trial 8: the Desk Signal swing strategy on the adjusted daily bars (DESIGN §7d)
   bmv-trader scan     --from YYYY-MM-DD --to YYYY-MM-DD   each day's gappers, and their minute bars
   bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--strategy orb|gap|vwap] [--scan] [--symbols ...] [--fold-days 21]
                       [--seeds 5] [--holdout] [--holdout-again] [--trend] [--marketable]
@@ -161,6 +162,7 @@ fn main() {
                 fetch_daily(&from, &to, args.has("--adjusted"))
             }
             Some("momentum") => momentum(),
+            Some("backtest-swing") => backtest_swing(),
             Some("scan") => {
                 let (from, to) = args.dates()?;
                 scan(&from, &to)
@@ -480,6 +482,141 @@ fn momentum() -> Result<(), String> {
         .map(|(s, n)| format!("{s} {n}"))
         .collect();
     println!("most-held names (months): {}", most.join(", "));
+    let gate = st.gate(logged);
+    for c in &gate.checks {
+        println!(
+            "  [{}] {}: {}",
+            if c.passed { "pass" } else { "FAIL" },
+            c.name,
+            c.detail
+        );
+    }
+    println!(
+        "P1 gate: {}",
+        if gate.passed() {
+            "PASSED (the holdout is next)"
+        } else {
+            "not passed"
+        }
+    );
+    Ok(())
+}
+
+/// Trial 8 (DESIGN §7d): research sessions only; logs the trial once, then prints the gate.
+fn backtest_swing() -> Result<(), String> {
+    use bmv_trader::momentum::{self as mo, Calendar};
+    use bmv_trader::scan::ADJUSTED_SIP;
+    use bmv_trader::swing::{self as sw, Cand};
+    let dir = data_dir()?;
+    let cut_date = holdout_from(&dir, &[])?;
+    let log = dir.join("trials.jsonl");
+    if std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.contains(&format!("\"strategy\":\"{}\"", sw::TRIAL_NAME)))
+    {
+        return Err(format!(
+            "{} is already in {}: trial 8 has run",
+            sw::TRIAL_NAME,
+            log.display()
+        ));
+    }
+    let (from, to) = bmv_trader::scan::daily_range(&dir, ADJUSTED_SIP)?;
+    if (from.as_str(), to.as_str()) != (mo::DATA_FROM, mo::DATA_TO) {
+        return Err(format!(
+            "adjusted bars cover {from}..{to}, but trial 8 is pre-registered on {}..{}",
+            mo::DATA_FROM,
+            mo::DATA_TO
+        ));
+    }
+    eprintln!("adjusted SIP daily bars {from}..{to}; holdout from {cut_date} stays unseen");
+    let spy = bmv_trader::scan::read_daily(&dir, ADJUSTED_SIP, mo::BENCHMARK)?;
+    let cal = Calendar::new(&spy)?;
+    let mut names: Vec<String> = Vec::new();
+    let mut days: Vec<Vec<Cand>> = vec![Vec::new(); cal.sessions.len()];
+    bmv_trader::scan::for_each_daily(&dir, ADJUSTED_SIP, &mut |s, bars| {
+        for (d, c) in sw::candidates(names.len(), &bars, &cal) {
+            days[d].push(c);
+        }
+        names.push(s.to_string());
+        if names.len().is_multiple_of(2000) {
+            eprintln!("  {} symbols", names.len());
+        }
+        Ok(())
+    })?;
+    let first = |d: &str| cal.sessions.iter().position(|s| s.as_str() >= d);
+    let start = first(sw::RESEARCH_FROM).ok_or("no session after the research start")?;
+    let cut = first(&cut_date).ok_or("no session at the holdout start")?;
+    let (trades, per_day) = sw::portfolio(&days, &names, start, cut);
+    let base = sw::baseline(&days, &per_day, cut);
+    let st = sw::Study::new(trades, base, start..cut, &cal, &spy)?;
+    let period = format!("{}..{}", cal.sessions[start], cal.sessions[cut - 1]);
+    let trials = stats::count_trials(&log)? + 1;
+    let ci_low = st.ci(trials).map(|(lo, _)| lo);
+    let trial = stats::Trial {
+        when: chrono::Utc::now().to_rfc3339(),
+        strategy: sw::TRIAL_NAME.into(),
+        params: format!(
+            "EMA {:?} stack, {}-day high, volume {}x, RSI > {}, ATR < p{}; stop {}xATR, target {}xATR, {} sessions; max {} open; {}% per side",
+            sw::EMAS,
+            sw::BREAKOUT,
+            sw::VOLUME_RATIO,
+            sw::RSI_MIN,
+            sw::ATR_MAX_PERCENTILE * 100.0,
+            sw::STOP_ATR,
+            sw::TARGET_ATR,
+            sw::MAX_HOLD,
+            sw::MAX_OPEN,
+            sw::COST_PER_SIDE * 100.0
+        ),
+        period: period.clone(),
+        trades: st.trades.len(),
+        expectancy_r: st.expectancy(),
+        profit_factor: st.profit_factor(),
+        max_drawdown_r: st.max_drawdown_r(),
+        ci_low,
+    };
+    let logged = stats::record_trial(&log, &trial)?;
+    let wins = st.trades.iter().filter(|t| t.out.r > 0.0).count();
+    println!("trial {logged}: swing Desk Signal, {period}");
+    println!(
+        "{} trades, {:.0}% winners, expectancy {:+.3}R; random entries {:+.3}R over {} trades",
+        st.trades.len(),
+        100.0 * wins as f64 / st.trades.len().max(1) as f64,
+        st.expectancy(),
+        st.baseline.iter().map(|t| t.out.r).sum::<f64>() / st.baseline.len().max(1) as f64,
+        st.baseline.len()
+    );
+    println!(
+        "at 1% risk per trade: CAGR {:+.1}%, Sharpe {:.2}, max DD {:.1}%; SPY CAGR {:+.1}%, Sharpe {:.2}, max DD {:.1}%",
+        mo::cagr(&st.monthly) * 100.0,
+        mo::sharpe(&st.monthly),
+        mo::max_drawdown(&st.monthly) * 100.0,
+        mo::cagr(&st.spy_monthly) * 100.0,
+        mo::sharpe(&st.spy_monthly),
+        mo::max_drawdown(&st.spy_monthly) * 100.0
+    );
+    let late = st
+        .trades
+        .iter()
+        .filter(|t| t.out.exit > t.out.entry + sw::MAX_HOLD)
+        .count();
+    println!(
+        "{late} trades exited after the time stop (missing bars or delisted); peak gross exposure {:.0}% of equity",
+        st.peak_gross() * 100.0
+    );
+    let mut most: BTreeMap<&str, usize> = BTreeMap::new();
+    for t in &st.trades {
+        *most.entry(names[t.symbol].as_str()).or_default() += 1;
+    }
+    let mut most: Vec<(&str, usize)> = most.into_iter().collect();
+    most.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let top: Vec<String> = most
+        .iter()
+        .take(15)
+        .map(|(s, n)| format!("{s} {n}"))
+        .collect();
+    println!("most-traded names: {}", top.join(", "));
     let gate = st.gate(logged);
     for c in &gate.checks {
         println!(

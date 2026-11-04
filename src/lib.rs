@@ -14,6 +14,7 @@ pub mod safety;
 pub mod scan;
 pub mod stats;
 pub mod strategy;
+pub mod swing;
 pub mod ui;
 pub mod vetting;
 pub mod watch;

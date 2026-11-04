@@ -331,6 +331,17 @@ On a half-day (close at 13:00), all of this shifts automatically.
   - at least 100 trades
   - **plus** CAGR and Sharpe above SPY, on point estimates
 - **No event filter in trial 8.** Point-in-time earnings dates aren't loaded yet. An earnings and macro filter would be its own trial.
+- **Conventions settled after review, before the run:**
+  - **Time stop:** sold at the open of the 11th session counting the entry session as the 1st, so sessions e..e+9 are held. Missing bars on that day mean the next bar's open.
+  - **ATR filter:** the current ATR must be strictly below the 90th value (nearest rank, index 89) of its last 100 values, the current one included.
+  - **Windows count bars, not sessions:** the 20-bar high, the 20-bar volume mean and the indicators use the symbol's own bars, so a symbol with gaps reaches further back.
+  - **Slots:** a slot frees only after its exit day, so an exit at the open doesn't free a slot that same open. Names skipped for chasing never take a slot.
+  - **Baseline pool:** the §7d universe exactly. That means liquid, at least 250 bars, a full ATR window and a tradable next open. Baseline trades aren't capacity-limited.
+  - **Bad prints:** a bar with a non-finite or non-positive price, or a high or low that doesn't bracket the open and close, counts as missing.
+  - **SPY comparison:** over exactly the research sessions. SPY's last month ends at the last research close.
+  - **Equity:** each month books 1% × R of the trades that exited in it. Nothing is marked to market or compounded within the month, and leverage is uncapped. The run prints peak gross exposure, so the CAGR check can be read for what it is. The Sharpe check is soft evidence, because realized-only P&L understates volatility.
+  - **Bootstrap:** one-day blocks of entry days, per §13. Overlapping holds make the interval somewhat too narrow. Wider blocks would be a new trial.
+  - **Cut:** trades still open at the cut take a slot but aren't counted, so a few long holds near the cut drop out (about 10 sessions' worth).
 - **One run, logged once.** Any changed number is a new trial.
 
 ## 8. Decision pipeline (one candidate)

@@ -69,6 +69,18 @@ impl Calendar {
         })
     }
 
+    /// A symbol's usable bars by session index; sessions it didn't trade (or bars off the
+    /// calendar) are None.
+    pub(crate) fn aligned<'a>(&self, bars: &'a [DailyBar]) -> Vec<Option<&'a DailyBar>> {
+        let mut on = vec![None; self.sessions.len()];
+        for b in bars.iter().filter(|b| usable(b)) {
+            if let Some(&i) = self.index.get(&b.date) {
+                on[i] = Some(b);
+            }
+        }
+        on
+    }
+
     pub fn date(&self, month: usize) -> &str {
         &self.sessions[self.rebalances[month]]
     }
@@ -95,12 +107,7 @@ fn usable(b: &DailyBar) -> bool {
 
 /// A symbol's score and return for every month of the calendar.
 pub fn months(bars: &[DailyBar], cal: &Calendar) -> Vec<Month> {
-    let mut on: Vec<Option<&DailyBar>> = vec![None; cal.sessions.len()];
-    for b in bars.iter().filter(|b| usable(b)) {
-        if let Some(&i) = cal.index.get(&b.date) {
-            on[i] = Some(b);
-        }
-    }
+    let on = cal.aligned(bars);
     (0..cal.rebalances.len())
         .map(|k| {
             let r = cal.rebalances[k];
@@ -122,6 +129,15 @@ fn score(on: &[Option<&DailyBar>], s: usize) -> Option<f64> {
     }
     on[s]?;
     let (recent, past) = (on[s - SKIP]?, on[s - LOOKBACK]?);
+    liquid(on, s).then(|| recent.close / past.close - 1.0)
+}
+
+/// At least $20M average dollar volume over the 63 sessions ending at `s`, with bars on at
+/// least 60 of them (shared by trials 7 and 8).
+pub(crate) fn liquid(on: &[Option<&DailyBar>], s: usize) -> bool {
+    if s + 1 < LIQUIDITY_SESSIONS {
+        return false;
+    }
     let window: Vec<&DailyBar> = on[s + 1 - LIQUIDITY_SESSIONS..=s]
         .iter()
         .flatten()
@@ -131,8 +147,7 @@ fn score(on: &[Option<&DailyBar>], s: usize) -> Option<f64> {
         .iter()
         .map(|b| b.close * b.volume as f64)
         .sum::<f64>();
-    (window.len() >= MIN_LIQUIDITY_BARS && dollars / window.len() as f64 >= MIN_DOLLAR_VOLUME)
-        .then(|| recent.close / past.close - 1.0)
+    window.len() >= MIN_LIQUIDITY_BARS && dollars / window.len() as f64 >= MIN_DOLLAR_VOLUME
 }
 
 /// Bought at the open of session `entry`, sold at the open of `exit`; if it has no bar there
