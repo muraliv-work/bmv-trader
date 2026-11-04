@@ -426,6 +426,45 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
 - **Reading:** a realistic post-earnings drift today is a few percent a year, and a good daily-bar model's IC is about 0.02–0.04. **Both trials as first planned are badly underpowered:** they would likely fail even if the edge were real. Their designs must change before pre-registration, or they shouldn't run (DECISION R9).
 - **Caveat:** the IC spread comes from the 12-1 score alone, which swings more than a blended model's would, so trial 12's numbers are on the cautious side.
 
+## 7h. Trials 11 and 12: the strategy evolution lab (pre-registered 2026-11-04, before any lab code)
+
+**Why it replaces the earlier trials 11 and 12:** §7g showed both were badly underpowered, and post-earnings drift also needed a new data source. The lab instead searches stock-ranking formulas on daily bars. It is a **candidate generator, not a judge**: the search sees already-used data thousands of times, so its best backtest is mostly luck. Each later stage is used once, and the verdict comes from new data.
+
+- **Universe and label:**
+  - trial 7's universe: all US stocks in the adjusted SIP bars, delisted names included, liquid at the signal session (`momentum::liquid`), stocks only by name (`swing::is_fund`)
+  - monthly rebalances from trial 7's calendar
+  - label: `held_return` from the rebalance open to the next rebalance open, with a last-close exit for delisted names
+- **Features:** 20 scale-free ones, each computed from bars at or before the signal session only:
+  - returns over 5, 21, 63 and 126 sessions, and 12-1 momentum
+  - daily-return standard deviation over 21 and 63 sessions, and ATR(14) over close
+  - position in the 20- and 60-session high-low range
+  - close over the 20-, 50- and 200-session moving averages, minus 1
+  - volume over its 20-session average, and log dollar volume over 63 sessions
+  - the largest one-day return in 21 sessions, and the share of up days in 21 sessions
+- **Formulas:** a typed tree of features, cross-sectional rank, negation and + − × ÷, where ÷ by near-zero gives "missing". At most depth 4 and 9 nodes. **Never code:** LLM output enters only after it parses as this type (DECISION S25).
+- **Metrics:**
+  - primary: mean monthly Spearman IC between the score and the label across all eligible names
+  - tradability: a top-20 equal-weight portfolio net of 0.2% per side, against trial 7's 20-seed random-20 baseline
+  - turnover
+- **Stages:**
+
+  | Stage | Months | Rule |
+  |---|---|---|
+  | Search | 2016-02 → 2022-12 | Mutation and crossover over a population, plus local-LLM ideas (Tier 2). Fitness = search IC − 0.002 a node − a turnover penalty. A candidate needs a top-20 above random. Every try is logged |
+  | Validation | 2023-01 → 2025-09 | **Once.** The top 20 distinct search candidates are frozen, then scored. Up to 3 advance if their IC's 3-month-block lower bound at 1 − 0.05/11 is above 0 and their top-20 beats random. The search's "luck line" (the best IC expected by chance from N tries) is printed beside them. **Logged as trial 11** |
+  | Untouched year | 2025-10-02 → 2026-10 | **Once,** as a disaster check only. A pick is dropped if its IC is clearly below 0, or if its top-20 trails random by over 1% a month. Twelve months can't prove an edge |
+  | Forward | the first month after that, onward | **Trial 12, the verdict.** Its gate is pre-registered in §7i before it starts |
+
+- **Leak and gaming canaries (tests before any real run):**
+  - no feature can read the label or any later bar
+  - labels shuffled within each month give a best IC near the luck line
+  - a planted future-return feature gives an IC near 1, and a one-month shift of it gives about 0
+  - the stage guards refuse search months after 2022-12, and a second validation or final run
+  - the parser rejects bad JSON
+- **Known limits:**
+  - At a monthly IC standard deviation of about 0.10, a 12-month forward test can confirm only an IC around 0.08. A forward pass is evidence, not proof; live money stays an owner decision (P5).
+  - The validation period is 33 months. A realistic IC of 0.02–0.04 may not clear its bound.
+
 ## 8. Decision pipeline (one candidate)
 
 1. **Strategy** emits a `Candidate`, which is journaled.
