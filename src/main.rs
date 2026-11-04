@@ -19,6 +19,7 @@ const USAGE: &str = "usage:
   bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD [--adjusted]   daily bars for the universe
                       (raw IEX for the scan; --adjusted: split- and dividend-adjusted SIP, for momentum)
   bmv-trader momentum                     trial 7: 12-1 month momentum on the adjusted daily bars (DESIGN §13c)
+  bmv-trader power                        the smallest effect trials 11 and 12 could detect (spreads from trial 7)
   bmv-trader desk-run                     trial 10 nightly (20 min after the close): live bars, signals, analyst ratings, scores
   bmv-trader desk-report                  trial 10 so far: signals, ratings, spend, outcomes
   bmv-trader desk-analyse --symbols X --date YYYY-MM-DD  one analyst run outside the trial (measures cost)
@@ -173,6 +174,7 @@ fn main() {
                 fetch_daily(&from, &to, args.has("--adjusted"))
             }
             Some("momentum") => momentum(),
+            Some("power") => power(),
             Some("desk-run") => desk_run(),
             Some("desk-report") => {
                 let (home, dir) = (config::home()?, data_dir()?);
@@ -434,9 +436,97 @@ fn fetch_daily(from: &str, to: &str, adjusted: bool) -> Result<(), String> {
 }
 
 /// Trial 7 (DESIGN §13c): research months only; logs the trial, then prints the gate.
-fn momentum() -> Result<(), String> {
+/// Trial 7's calendar and every symbol's monthly score and return, from the pre-registered bars.
+fn trial7_months(
+    dir: &Path,
+    cut: &str,
+) -> Result<
+    (
+        bmv_trader::momentum::Calendar,
+        BTreeMap<String, Vec<bmv_trader::momentum::Month>>,
+    ),
+    String,
+> {
     use bmv_trader::momentum::{self as mo, Calendar};
     use bmv_trader::scan::ADJUSTED_SIP;
+    let (from, to) = bmv_trader::scan::daily_range(dir, ADJUSTED_SIP)?;
+    if (from.as_str(), to.as_str()) != (mo::DATA_FROM, mo::DATA_TO) {
+        return Err(format!(
+            "adjusted bars cover {from}..{to}, but trial 7 is pre-registered on {}..{}",
+            mo::DATA_FROM,
+            mo::DATA_TO
+        ));
+    }
+    eprintln!("adjusted SIP daily bars {from}..{to}; holdout from {cut} stays unseen");
+    let spy = bmv_trader::scan::read_daily(dir, ADJUSTED_SIP, mo::BENCHMARK)?;
+    let cal = Calendar::new(&spy)?;
+    let mut by_symbol = BTreeMap::new();
+    let mut seen = 0;
+    bmv_trader::scan::for_each_daily(dir, ADJUSTED_SIP, &mut |s, bars| {
+        by_symbol.insert(s.to_string(), mo::months(&bars, &cal));
+        seen += 1;
+        if seen % 2000 == 0 {
+            eprintln!("  {seen} symbols");
+        }
+        Ok(())
+    })?;
+    Ok((cal, by_symbol))
+}
+
+/// Research plan step 2: how big an edge trials 11 and 12 could detect. Uses trial 7's spreads
+/// only (its months are already spent); logs nothing and prints no new mean.
+fn power() -> Result<(), String> {
+    use bmv_trader::momentum as mo;
+    use bmv_trader::power as pw;
+    let dir = data_dir()?;
+    let cut = holdout_from(&dir, &[])?;
+    let (cal, by_symbol) = trial7_months(&dir, &cut)?;
+    let st = mo::study(&by_symbol, &cal, &cut)?;
+    let excess = st.excess();
+    println!(
+        "spread guide: trial 7, {} research months, monthly excess over random-20 sd {:.2}%",
+        excess.len(),
+        100.0 * pw::sd(&excess)
+    );
+    println!("\ntrial 11 (earnings drift), gate at 1 - 0.05/11, 3-month blocks:");
+    println!("  months  power  smallest monthly excess  (a year)");
+    for months in [115, 80] {
+        let se = pw::block_se(&excess, mo::BLOCK_MONTHS, months);
+        for power in [0.5, 0.8] {
+            let d = pw::detectable(se, 11, power);
+            println!(
+                "  {months:>6}  {:>4.0}%  {:>22.2}%  ({:.1}%)",
+                power * 100.0,
+                d * 100.0,
+                d * 1200.0
+            );
+        }
+    }
+    let k0 = (0..cal.rebalances.len())
+        .find(|&k| st.dates.first().is_some_and(|d| cal.date(k) == d))
+        .ok_or("trial 7's first month isn't in the calendar")?;
+    let ic = pw::monthly_ic(&by_symbol, k0..k0 + st.dates.len());
+    println!(
+        "\ntrial 12 (ML ranking), gate at 1 - 0.05/12: monthly IC sd {:.3} over {} months (12-1 score)",
+        pw::sd(&ic),
+        ic.len()
+    );
+    println!("  months  power  smallest mean IC");
+    for months in [69] {
+        let se = pw::block_se(&ic, mo::BLOCK_MONTHS, months);
+        for power in [0.5, 0.8] {
+            println!(
+                "  {months:>6}  {:>4.0}%  {:>16.3}",
+                power * 100.0,
+                pw::detectable(se, 12, power)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn momentum() -> Result<(), String> {
+    use bmv_trader::momentum as mo;
     let dir = data_dir()?;
     let cut = holdout_from(&dir, &[])?;
     let log = dir.join("trials.jsonl");
@@ -452,27 +542,7 @@ fn momentum() -> Result<(), String> {
             log.display()
         ));
     }
-    let (from, to) = bmv_trader::scan::daily_range(&dir, ADJUSTED_SIP)?;
-    if (from.as_str(), to.as_str()) != (mo::DATA_FROM, mo::DATA_TO) {
-        return Err(format!(
-            "adjusted bars cover {from}..{to}, but trial 7 is pre-registered on {}..{}",
-            mo::DATA_FROM,
-            mo::DATA_TO
-        ));
-    }
-    eprintln!("adjusted SIP daily bars {from}..{to}; holdout from {cut} stays unseen");
-    let spy = bmv_trader::scan::read_daily(&dir, ADJUSTED_SIP, mo::BENCHMARK)?;
-    let cal = Calendar::new(&spy)?;
-    let mut by_symbol = BTreeMap::new();
-    let mut seen = 0;
-    bmv_trader::scan::for_each_daily(&dir, ADJUSTED_SIP, &mut |s, bars| {
-        by_symbol.insert(s.to_string(), mo::months(&bars, &cal));
-        seen += 1;
-        if seen % 2000 == 0 {
-            eprintln!("  {seen} symbols");
-        }
-        Ok(())
-    })?;
+    let (cal, by_symbol) = trial7_months(&dir, &cut)?;
     let st = mo::study(&by_symbol, &cal, &cut)?;
     let period = format!(
         "{}..{}",

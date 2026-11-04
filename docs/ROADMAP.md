@@ -52,7 +52,7 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 ## Research: trials 11 and 12 (plan approved 2026-11-03; stop rule DECISION R9)
 - [x] Pre-register the trial 10 scorecard (DESIGN §7f) and the stop rule R9
 - [ ] `desk-verdict` prints the scorecard (code before the verdict, in late December)
-- [ ] Power check (`bmv-trader power`): the smallest effect trials 11 and 12 could detect; picks their primary metrics
+- [x] Power check (`bmv-trader power`, DESIGN §7g): both trials as first planned are badly underpowered (trial 11 needs about +26%/yr excess, trial 12 an IC of about 0.05); their designs change before pre-registration
 - [ ] Earnings data probe (`earnings-probe`): Nasdaq calendar coverage, match rate; trial 11 is cut below 85%
 - [ ] Trial 11: post-earnings drift (`src/pead.rs`): pre-register, fetch, canaries, review, one run
 - [ ] Trial 12: ML ranking, ridge in Rust (`src/ml.rs`): pre-register, canaries, review, one run

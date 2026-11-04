@@ -162,7 +162,10 @@ fn held_return(on: &[Option<&DailyBar>], entry: usize, exit: usize) -> Option<f6
 }
 
 /// Eligible names in month `k`: (symbol, score, return), in symbol order.
-fn eligible(by_symbol: &BTreeMap<String, Vec<Month>>, k: usize) -> Vec<(&str, f64, f64)> {
+pub(crate) fn eligible(
+    by_symbol: &BTreeMap<String, Vec<Month>>,
+    k: usize,
+) -> Vec<(&str, f64, f64)> {
     by_symbol
         .iter()
         .filter_map(|(s, m)| match m.get(k)? {

@@ -12,6 +12,7 @@ pub mod market_data;
 pub mod momentum;
 pub mod money;
 pub mod notes;
+pub mod power;
 pub mod risk;
 pub mod safety;
 pub mod scan;

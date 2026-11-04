@@ -410,6 +410,22 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
   - LLM answers vary from run to run.
   - The data sources of TradingAgents' tools (yfinance, SEC EDGAR) are free and unofficial.
 
+## 7g. Power check for trials 11 and 12 (run 2026-11-04, before either trial exists)
+
+`bmv-trader power` scales trial 7's spreads (its months are already spent, so nothing new is seen) to each trial's months and test level. It prints only spreads, never a new mean.
+
+- **Spread guide:** trial 7 has 104 research months. Its monthly excess over random-20 has a standard deviation of 9.08%, and the 12-1 score's monthly IC has a standard deviation of 0.156. Standard errors use 3-month blocks.
+- **Trial 11 as first planned** (top-decile announcers, at most 20 held, against random announcers, at 1 − 0.05/11) needs a true excess of:
+
+  | Months | 50% chance of passing | 80% chance of passing |
+  |---|---|---|
+  | 115 | +2.14% a month (+25.7% a year) | +2.77% (+33.3% a year) |
+  | 80 | +2.57% (+30.8% a year) | +3.33% (+39.9% a year) |
+
+- **Trial 12 as first planned** (69 predicted months, at 1 − 0.05/12) needs a mean IC of **0.049** for a 50% chance of passing, or **0.063** for 80%.
+- **Reading:** a realistic post-earnings drift today is a few percent a year, and a good daily-bar model's IC is about 0.02–0.04. **Both trials as first planned are badly underpowered:** they would likely fail even if the edge were real. Their designs must change before pre-registration, or they shouldn't run (DECISION R9).
+- **Caveat:** the IC spread comes from the 12-1 score alone, which swings more than a blended model's would, so trial 12's numbers are on the cautious side.
+
 ## 8. Decision pipeline (one candidate)
 
 1. **Strategy** emits a `Candidate`, which is journaled.
