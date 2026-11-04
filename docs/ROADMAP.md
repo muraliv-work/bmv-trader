@@ -42,6 +42,7 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 - [x] Phase 0: design records (DESIGN §1, §4b roles, §7d, §9, §10; DECISION S19–S21, A10–A11, R2i)
 - [ ] Phase 1: trial 8 **failed** (−0.52R; T-bill ETFs with tiny stops, R2i); trial 9 with a volatility floor and stocks only **failed** (0.000R, CAGR −1.2% vs SPY +15.0%, R2j). No swing order until a swing trial passes
 - [ ] **Trial 10, AI veto forward test (DESIGN §7f; plan approved 2026-11-03): runs before Phases 2–6, which wait on its verdict.** Steps: live daily data, `signal_today`, TradingAgents sidecar, `desk-run`/`desk-report`, tier-1 review, the owner adds the Anthropic key and installs the plist
+- [ ] **Tier 2 (DESIGN §10, A13/S22; plan approved 2026-11-03):** local Ollama via OmniRoute, daily key rotation, `llm-health`, low-risk notes jobs. The owner sets up Ollama, the OmniRoute combo and the key
 - [ ] Phase 2: engine swing book (`bmv-s-` ids, scoped flatten and backstop, GTC stops, risk split, per-book console); tier-1 review
 - [ ] Phase 3: data layer, OpenBB sidecar from pinned PyPI (the HEAD checkout crashes on start) plus `src/openbb.rs`
 - [ ] Phase 4: `src/llm.rs` tiers, cost ledger and `llm-health`, then the TradingAgents sidecar (Claude-only, social off)

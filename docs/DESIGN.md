@@ -483,6 +483,17 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
 
   It writes `data/llm_health.json`.
 - **OmniRoute's CLI loads `.env` from its working directory.** Our code reaches OmniRoute only over HTTP, and runs the CLI only from `~/.omniroute` with `env -i`.
+- **Tier 2 is local (DECISION A13):** OmniRoute (`127.0.0.1:20128`) routes to **local Ollama** (`127.0.0.1:11434`), through a combo `bmv-local` holding one local model. Nothing leaves the Mac.
+  - **Jobs:** these only reword facts the code already computed. Their output goes to `data/notes/`, which no decision code reads.
+    - the nightly desk brief (counts, spend and missed nights, never trial 10 outcomes)
+    - an analyst digest of each night's Sonnet summaries (passed as untrusted text)
+    - an engine session summary
+    - a weekly research digest
+  - **Behaviour:** jobs are idempotent per output file. They fall back to a numbers-only note when Tier 2 is down and never block anything.
+- **Key rotation (DECISION S22):**
+  - `llm-rotate` regenerates the OmniRoute key **daily**, using the OmniRoute CLI from `~/.omniroute` with a cleared environment.
+  - It stores the key in the Keychain over stdin, so the secret never appears in a process list, then re-applies the key's policy: only `bmv-local`, $0 a day, rate-limited.
+  - `llm-health` then checks Ollama, OmniRoute, a probe call, the key's age and the Tier-1 month-to-date spend, and writes `data/llm_health.json`.
 - **Cost control:** cached system prompt; Claude called only for candidates that passed the pre-check, capped per day; tokens and cost journaled per call.
 
 ### AI controls (P4)
