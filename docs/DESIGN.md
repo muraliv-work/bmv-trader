@@ -483,7 +483,8 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
   - The sample is frozen to `data/retro/sample.json`, with its hash logged, before any analysis.
   - If the speed check shows the full sample is too slow, the sample becomes every k-th session. k is committed before any untouched-year analysis.
 - **Analyst:** TradingAgents at trial 10's pinned commit, with the same analysts (market, news, fundamentals) and the same single debate and risk rounds.
-  - Models: **`qwen3:30b-a3b` for both tiers**, through the sidecar's `ollama` provider on 127.0.0.1:11434, at $0.
+  - Models: **`qwen3:8b` for both tiers, with reasoning off** (`reasoning_effort: "none"`, sent in each request's `extra_body`), through the sidecar's `ollama` provider on 127.0.0.1:11434, at $0.
+  - **Amended 2026-11-04, before any untouched-year analysis.** The first choice, `qwen3:30b-a3b`, failed the speed check on three 2024 signals: 17 and 43 minutes, and one 45-minute timeout. That would have meant about 6 days for the sample, and a failure rate far over the 10% limit.
   - The same sandbox, plus a fresh HOME, memory and cache per run.
   - The first answer counts; nothing is re-run.
 - **Mapping, outcome and metric:** trial 10's (§7f).
@@ -509,8 +510,8 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
     - The 80%-power MDE of D is **0.096R** on the registered mix (5 Hold, 1 Underweight). For context, it's 0.163R on a decisive mix and 0.152R on a half-Hold mix.
 - **Known limits:**
   - The free Yahoo news feed often can't reach back, so some analyses run without news. That biases toward no effect; it doesn't leak.
-  - Qwen3 30B is not Claude: a pass shows an LLM veto can help, and a fail doesn't settle trial 10.
-  - The 30B's reasoning can't be turned off, so analyses are slow.
+  - Qwen3 8B is not Claude: a pass shows an LLM veto can help, and a fail doesn't settle trial 10.
+  - The 8B is weaker than the 30B, so a fail says less about LLM vetoes in general.
   - Adjusted prices carry later splits, which changes scale only.
   - This uses up the untouched year.
 

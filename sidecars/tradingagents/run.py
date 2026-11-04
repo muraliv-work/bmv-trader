@@ -13,7 +13,7 @@ import sys
 QUICK_MODEL = "claude-haiku-5-5"
 DEEP_MODEL = "claude-sonnet-5-5"
 # trial 12 (DESIGN §7i): both tiers on the local model, via Ollama on loopback, no key
-LOCAL_MODEL = "qwen3:30b-a3b"
+LOCAL_MODEL = "qwen3:8b"
 SUMMARY_CHARS = 2000
 RESULT_PREFIX = "BMV_RESULT "
 # exit code for "Anthropic refused the request before any call was billed" (bad key, workspace)
@@ -74,6 +74,21 @@ def main():
 
     # importing tradingagents runs load_dotenv() from the working directory
     import tradingagents
+
+    if local:
+        # Qwen3 on this Ollama ignores /no_think; only reasoning_effort turns its hidden reasoning off.
+        # Sent in extra_body, as TradingAgents' own MiniMax client does for its flag.
+        from tradingagents.llm_clients import openai_client
+
+        cls = openai_client.LocalCompatibleChatOpenAI
+        original = cls._get_request_payload
+
+        def no_reasoning(self, input_, *, stop=None, **kwargs):
+            payload = original(self, input_, stop=stop, **kwargs)
+            payload.setdefault("extra_body", {})["reasoning_effort"] = "none"
+            return payload
+
+        cls._get_request_payload = no_reasoning
     from langchain_core.callbacks import BaseCallbackHandler
     from tradingagents.default_config import DEFAULT_CONFIG
     from tradingagents.graph.trading_graph import TradingAgentsGraph

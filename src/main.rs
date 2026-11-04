@@ -1309,8 +1309,9 @@ fn retro_verdict() -> Result<(), String> {
         when: chrono::Utc::now().to_rfc3339(),
         strategy: retro::TRIAL_NAME.into(),
         params: format!(
-            "{} rated, {failed} failed; qwen3:30b-a3b both tiers; D in R; ci_low is D's one-sided bound at 1 - 0.05/12",
-            cards.len()
+            "{} rated, {failed} failed; {} both tiers, reasoning off; D in R; ci_low is D's one-sided bound at 1 - 0.05/12",
+            cards.len(),
+            desk::LOCAL_MODEL
         ),
         period: format!(
             "{}..{}",

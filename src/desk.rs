@@ -27,9 +27,8 @@ pub const TRIAL_NAME: &str = "ai-veto forward";
 /// The pinned sidecar (sidecars/tradingagents/requirements.txt).
 pub const TRADINGAGENTS_VERSION: &str = "0.7.1";
 const TIMEOUT: Duration = Duration::from_secs(15 * 60);
-/// Trial 12's local analyst (DESIGN §7i), both tiers; its reasoning can't be turned off, so it
-/// gets longer.
-pub const LOCAL_MODEL: &str = "qwen3:30b-a3b";
+/// Trial 12's local analyst (DESIGN §7i), both tiers, reasoning off; local runs get longer.
+pub const LOCAL_MODEL: &str = "qwen3:8b";
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const SUMMARY_CHARS: usize = 2000;
 /// The most stdout read from the sidecar; its answer is one short line.
