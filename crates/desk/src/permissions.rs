@@ -122,18 +122,15 @@ pub fn allowed(role: Role, action: Action) -> bool {
     }
 }
 
-/// Proof that the owner, not an agent, is acting. Only the Touch ID / password Keychain prompt can
-/// make one (S30); an agent token never carries one.
+/// Proof that the owner, not an agent, is acting. Made only by `Store::approve_owner_action`,
+/// after the owner's Secure Enclave signature (Touch ID) over that one request checks out, and
+/// used up by the action it was made for. Nothing outside this crate can make one.
 #[derive(Debug)]
 pub struct HumanProof(());
 
 impl HumanProof {
-    /// shortcut: the Keychain prompt arrives with the Desk API (build step 2); until then no code
-    /// path outside tests can prove a human, so human-only actions are refused (fail closed).
-    pub fn from_keychain_prompt() -> crate::Result<HumanProof> {
-        Err(crate::DeskError::Denied(
-            "the Touch ID signing prompt isn't wired yet (build step 2)".into(),
-        ))
+    pub(crate) fn signed() -> HumanProof {
+        HumanProof(())
     }
 
     #[cfg(test)]
@@ -170,6 +167,5 @@ mod tests {
         assert!(!allowed(Role::Developer, Action::RunOfficialBacktest));
         assert!(!allowed(Role::Validator, Action::SubmitStrategyVersion));
         assert!(Role::Validator.second_line() && !Role::HeadOfDesk.second_line());
-        assert!(HumanProof::from_keychain_prompt().is_err());
     }
 }

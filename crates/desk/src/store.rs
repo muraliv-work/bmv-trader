@@ -20,7 +20,8 @@ use sqlx::{Sqlite, Transaction};
 use std::str::FromStr;
 
 /// Tables whose rows are history: never updated, never deleted.
-const APPEND_ONLY: [&str; 8] = [
+const APPEND_ONLY: [&str; 9] = [
+    "owner_key",
     "audit_log",
     "strategy_versions",
     "backtest_runs",
@@ -65,6 +66,11 @@ CREATE TABLE IF NOT EXISTS paper_stats (
 CREATE TABLE IF NOT EXISTS budgets (
   agent_id TEXT NOT NULL REFERENCES agents(id), month TEXT NOT NULL, limit_usd TEXT NOT NULL,
   spent_usd TEXT NOT NULL, PRIMARY KEY (agent_id, month));
+CREATE TABLE IF NOT EXISTS owner_key (
+  id INTEGER PRIMARY KEY CHECK (id = 1), public_key TEXT NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS owner_requests (
+  id TEXT PRIMARY KEY, payload TEXT NOT NULL, requested_by TEXT NOT NULL REFERENCES agents(id),
+  expires TEXT NOT NULL, status TEXT NOT NULL, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit_log (
   seq INTEGER PRIMARY KEY, at TEXT NOT NULL, agent_id TEXT NOT NULL, action TEXT NOT NULL,
   detail TEXT NOT NULL, prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
@@ -82,7 +88,7 @@ pub const LIMIT_NAMES: [&str; 7] = [
 ];
 
 pub struct Store {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 fn now() -> String {
@@ -154,8 +160,8 @@ impl Store {
         Ok(Store { pool })
     }
 
-    /// The owner adds an agent. Agents can't add agents (fixed org chart). The very first agent
-    /// must be the owner (Board) itself.
+    /// The owner adds an agent (through `approve_owner_action`). Agents can't add agents (fixed
+    /// org chart); the Board itself is created only by `init_owner`.
     pub async fn add_agent(
         &self,
         by: &str,
@@ -169,22 +175,16 @@ impl Store {
                 "changing the org chart needs the owner's Touch ID".into(),
             ));
         }
+        if role == Role::Board {
+            return Err(DeskError::Denied(
+                "there is one owner, registered by `desk init`".into(),
+            ));
+        }
         let mut tx = self.pool.begin().await?;
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents")
-            .fetch_one(&mut *tx)
-            .await?;
-        if count == 0 {
-            if role != Role::Board || id != by {
-                return Err(DeskError::Denied(
-                    "the first agent must be the owner (Board)".into(),
-                ));
-            }
-        } else if role_in(&mut tx, by).await? != Role::Board {
+        if role_in(&mut tx, by).await? != Role::Board {
             return Err(DeskError::Denied(
                 "only the owner changes the org chart".into(),
             ));
-        } else if role == Role::Board {
-            return Err(DeskError::Denied("there is one owner".into()));
         }
         sqlx::query("INSERT INTO agents (id, role, created) VALUES (?, ?, ?)")
             .bind(id)
@@ -201,6 +201,115 @@ impl Store {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Creates the Board agent `board` with the owner's public key, on an empty desk only. The
+    /// caller (`init_owner`) has already checked the key signs with Touch ID.
+    pub(crate) async fn bootstrap_owner(&self, public_hex: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents")
+            .fetch_one(&mut *tx)
+            .await?;
+        if count > 0 {
+            return Err(DeskError::Denied("the desk already has an owner".into()));
+        }
+        sqlx::query("INSERT INTO agents (id, role, created) VALUES ('board', 'board', ?)")
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO owner_key (id, public_key, at) VALUES (1, ?, ?)")
+            .bind(public_hex)
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
+        append(
+            &mut tx,
+            "board",
+            "init_owner",
+            json!({"public_key": public_hex}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn insert_owner_request(
+        &self,
+        by: &str,
+        id: &str,
+        payload: &str,
+        expires: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO owner_requests (id, payload, requested_by, expires, status, at) VALUES (?, ?, ?, ?, 'pending', ?)",
+        )
+        .bind(id)
+        .bind(payload)
+        .bind(by)
+        .bind(expires)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+        append(
+            &mut tx,
+            by,
+            "request_owner",
+            json!({"request": id, "payload": payload}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Open requests: (id, payload, requested by, expires).
+    pub(crate) async fn open_owner_requests(
+        &self,
+        now: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT id, payload, requested_by, expires FROM owner_requests WHERE status = 'pending' AND expires > ? ORDER BY at",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Closes a pending request if `check(payload, expires, owner key)` passes, in one transaction,
+    /// so a request is approved at most once; returns its payload.
+    pub(crate) async fn redeem_owner_request(
+        &self,
+        id: &str,
+        check: impl FnOnce(&str, &str, &str) -> Result<()>,
+    ) -> Result<String> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT payload, expires FROM owner_requests WHERE id = ? AND status = 'pending'",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (payload, expires) = row.ok_or_else(|| {
+            DeskError::Denied("no open request with that id (used, expired or unknown)".into())
+        })?;
+        let public: String = sqlx::query_scalar("SELECT public_key FROM owner_key WHERE id = 1")
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| DeskError::Denied("no owner registered: run `desk init`".into()))?;
+        check(&payload, &expires, &public)?;
+        let n = sqlx::query(
+            "UPDATE owner_requests SET status = 'approved' WHERE id = ? AND status = 'pending'",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n != 1 {
+            return Err(DeskError::Denied("this request was just used".into()));
+        }
+        append(&mut tx, "board", "approve_owner", json!({"request": id})).await?;
+        tx.commit().await?;
+        Ok(payload)
     }
 
     /// An agent's role, from the store (never from the agent's own claim).
@@ -937,9 +1046,7 @@ mod tests {
 
     async fn desk() -> Store {
         let s = Store::open("sqlite::memory:").await.unwrap();
-        s.add_agent("board", "board", Role::Board, Some(proof()))
-            .await
-            .unwrap();
+        s.bootstrap_owner("test-key").await.unwrap();
         for (id, role) in [
             ("res-1", Role::Researcher),
             ("strat-1", Role::Strategist),
