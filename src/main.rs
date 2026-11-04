@@ -19,7 +19,8 @@ const USAGE: &str = "usage:
   bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD [--adjusted]   daily bars for the universe
                       (raw IEX for the scan; --adjusted: split- and dividend-adjusted SIP, for momentum)
   bmv-trader momentum                     trial 7: 12-1 month momentum on the adjusted daily bars (DESIGN §13c)
-  bmv-trader backtest-swing               trial 8: the Desk Signal swing strategy on the adjusted daily bars (DESIGN §7d)
+  bmv-trader asset-names                  Alpaca's name for each universe symbol (for trial 9's fund filter)
+  bmv-trader backtest-swing --trial 8|9   the Desk Signal swing strategy on the adjusted daily bars (DESIGN §7d, §7e)
   bmv-trader scan     --from YYYY-MM-DD --to YYYY-MM-DD   each day's gappers, and their minute bars
   bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--strategy orb|gap|vwap] [--scan] [--symbols ...] [--fold-days 21]
                       [--seeds 5] [--holdout] [--holdout-again] [--trend] [--marketable]
@@ -37,7 +38,8 @@ const MAX_SEEDS: usize = 50;
 
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
-const VALUE_FLAGS: [&str; 7] = [
+const VALUE_FLAGS: [&str; 8] = [
+    "--trial",
     "--strategy",
     "--from",
     "--to",
@@ -162,7 +164,16 @@ fn main() {
                 fetch_daily(&from, &to, args.has("--adjusted"))
             }
             Some("momentum") => momentum(),
-            Some("backtest-swing") => backtest_swing(),
+            Some("asset-names") => {
+                let n = bmv_trader::scan::fetch_asset_names(&connect()?, &data_dir()?)?;
+                println!("names for {n} symbols");
+                Ok(())
+            }
+            Some("backtest-swing") => backtest_swing(match args.get("--trial") {
+                Some("8") => bmv_trader::swing::TRIAL_8,
+                Some("9") => bmv_trader::swing::TRIAL_9,
+                other => return Err(format!("--trial must be 8 or 9, got {other:?}")),
+            }),
             Some("scan") => {
                 let (from, to) = args.dates()?;
                 scan(&from, &to)
@@ -503,7 +514,7 @@ fn momentum() -> Result<(), String> {
 }
 
 /// Trial 8 (DESIGN §7d): research sessions only; logs the trial once, then prints the gate.
-fn backtest_swing() -> Result<(), String> {
+fn backtest_swing(rules: bmv_trader::swing::Rules) -> Result<(), String> {
     use bmv_trader::momentum::{self as mo, Calendar};
     use bmv_trader::scan::ADJUSTED_SIP;
     use bmv_trader::swing::{self as sw, Cand};
@@ -513,18 +524,20 @@ fn backtest_swing() -> Result<(), String> {
     if std::fs::read_to_string(&log)
         .unwrap_or_default()
         .lines()
-        .any(|l| l.contains(&format!("\"strategy\":\"{}\"", sw::TRIAL_NAME)))
+        .any(|l| l.contains(&format!("\"strategy\":\"{}\"", rules.name)))
     {
         return Err(format!(
-            "{} is already in {}: trial 8 has run",
-            sw::TRIAL_NAME,
-            log.display()
+            "{} is already in {}: trial {} has run",
+            rules.name,
+            log.display(),
+            rules.trial
         ));
     }
     let (from, to) = bmv_trader::scan::daily_range(&dir, ADJUSTED_SIP)?;
     if (from.as_str(), to.as_str()) != (mo::DATA_FROM, mo::DATA_TO) {
         return Err(format!(
-            "adjusted bars cover {from}..{to}, but trial 8 is pre-registered on {}..{}",
+            "adjusted bars cover {from}..{to}, but trial {} is pre-registered on {}..{}",
+            rules.trial,
             mo::DATA_FROM,
             mo::DATA_TO
         ));
@@ -532,10 +545,20 @@ fn backtest_swing() -> Result<(), String> {
     eprintln!("adjusted SIP daily bars {from}..{to}; holdout from {cut_date} stays unseen");
     let spy = bmv_trader::scan::read_daily(&dir, ADJUSTED_SIP, mo::BENCHMARK)?;
     let cal = Calendar::new(&spy)?;
+    let asset_names = if rules.stocks_only {
+        bmv_trader::scan::read_asset_names(&dir)?
+    } else {
+        BTreeMap::new()
+    };
+    let mut funds = 0;
     let mut names: Vec<String> = Vec::new();
     let mut days: Vec<Vec<Cand>> = vec![Vec::new(); cal.sessions.len()];
     bmv_trader::scan::for_each_daily(&dir, ADJUSTED_SIP, &mut |s, bars| {
-        for (d, c) in sw::candidates(names.len(), &bars, &cal) {
+        if rules.stocks_only && asset_names.get(s).is_some_and(|n| sw::is_fund(n)) {
+            funds += 1;
+            return Ok(());
+        }
+        for (d, c) in sw::candidates(names.len(), &bars, &cal, &rules) {
             days[d].push(c);
         }
         names.push(s.to_string());
@@ -555,7 +578,7 @@ fn backtest_swing() -> Result<(), String> {
     let ci_low = st.ci(trials).map(|(lo, _)| lo);
     let trial = stats::Trial {
         when: chrono::Utc::now().to_rfc3339(),
-        strategy: sw::TRIAL_NAME.into(),
+        strategy: rules.name.into(),
         params: format!(
             "EMA {:?} stack, {}-day high, volume {}x, RSI > {}, ATR < p{}; stop {}xATR, target {}xATR, {} sessions; max {} open; {}% per side",
             sw::EMAS,
@@ -576,9 +599,12 @@ fn backtest_swing() -> Result<(), String> {
         max_drawdown_r: st.max_drawdown_r(),
         ci_low,
     };
+    if rules.stocks_only {
+        println!("{funds} funds left out by name");
+    }
     let logged = stats::record_trial(&log, &trial)?;
     let wins = st.trades.iter().filter(|t| t.out.r > 0.0).count();
-    println!("trial {logged}: swing Desk Signal, {period}");
+    println!("trial {logged}: {}, {period}", rules.name);
     println!(
         "{} trades, {:.0}% winners, expectancy {:+.3}R; random entries {:+.3}R over {} trades",
         st.trades.len(),

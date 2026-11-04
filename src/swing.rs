@@ -27,7 +27,49 @@ pub const RANDOM_SEEDS: u64 = 5;
 pub const RISK_PER_TRADE: f64 = 0.01;
 pub const FOLD_SESSIONS: usize = 63;
 pub const RESEARCH_FROM: &str = "2017-01-03";
-pub const TRIAL_NAME: &str = "swing desk-signal";
+/// What differs between the swing trials (DESIGN §7d, §7e); everything else is shared.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rules {
+    pub trial: u32,
+    pub name: &'static str,
+    /// ATR(14) at the signal close must be at least this fraction of the close (0 = none).
+    pub min_atr_fraction: f64,
+    /// Leave out funds by Alpaca asset name.
+    pub stocks_only: bool,
+}
+
+pub const TRIAL_8: Rules = Rules {
+    trial: 8,
+    name: "swing desk-signal",
+    min_atr_fraction: 0.0,
+    stocks_only: false,
+};
+pub const TRIAL_9: Rules = Rules {
+    trial: 9,
+    name: "swing desk-signal vol-stocks",
+    min_atr_fraction: 0.015,
+    stocks_only: true,
+};
+
+/// A fund by its Alpaca asset name (DESIGN §7e); case-insensitive.
+pub fn is_fund(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let words: Vec<&str> = n
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .collect();
+    ["etf", "etn", "etns", "fund", "spdr"]
+        .iter()
+        .any(|w| words.contains(w))
+        || [
+            "ishares",
+            "proshares",
+            "direxion",
+            "exchange-traded",
+            "exchange traded",
+        ]
+        .iter()
+        .any(|p| n.contains(p))
+}
 
 /// Exponential moving average seeded with the simple average of the first `n` values.
 fn ema(x: &[f64], n: usize) -> Vec<Option<f64>> {
@@ -178,7 +220,12 @@ fn sane(b: &DailyBar) -> bool {
 }
 
 /// Every eligible day of one symbol, keyed by signal session.
-pub fn candidates(symbol: usize, bars: &[DailyBar], cal: &Calendar) -> Vec<(usize, Cand)> {
+pub fn candidates(
+    symbol: usize,
+    bars: &[DailyBar],
+    cal: &Calendar,
+    rules: &Rules,
+) -> Vec<(usize, Cand)> {
     // a bar with an impossible high or low counts as missing: a bad print could fake a fill
     let on: Vec<Option<&DailyBar>> = cal
         .aligned(bars)
@@ -200,7 +247,10 @@ pub fn candidates(symbol: usize, bars: &[DailyBar], cal: &Calendar) -> Vec<(usiz
         let (Some(a), Some(next)) = (atr[k], on.get(s + 1).copied().flatten()) else {
             continue;
         };
-        if !momentum::liquid(&on, s) || next.open > own[k].close * (1.0 + MAX_CHASE) {
+        if !momentum::liquid(&on, s)
+            || next.open > own[k].close * (1.0 + MAX_CHASE)
+            || a < rules.min_atr_fraction * own[k].close
+        {
             continue;
         }
         let Some(trade) = simulate_trade(&on, s + 1, a) else {
@@ -693,7 +743,7 @@ mod tests {
     fn desk_signal_fires_on_a_breakout_in_an_uptrend_only() {
         let (n, k) = (320, 300);
         let cal = cal(n);
-        let c = candidates(0, &breakout_bars(n, k), &cal);
+        let c = candidates(0, &breakout_bars(n, k), &cal, &TRIAL_8);
         let at = |s: usize| c.iter().find(|(d, _)| *d == s).map(|(_, x)| x.ratio);
         assert!(at(k).flatten().is_some_and(|r| r >= 3.0), "{:?}", at(k));
         assert_eq!(
@@ -705,7 +755,7 @@ mod tests {
 
         let mut weak = breakout_bars(n, k);
         weak[k].volume = 1_200_000;
-        let c = candidates(0, &weak, &cal);
+        let c = candidates(0, &weak, &cal, &TRIAL_8);
         assert_eq!(
             c.iter().find(|(d, _)| *d == k).unwrap().1.ratio,
             None,
@@ -714,7 +764,7 @@ mod tests {
 
         let mut chase = breakout_bars(n, k);
         chase[k + 1].open = chase[k].close * 1.01;
-        let c = candidates(0, &chase, &cal);
+        let c = candidates(0, &chase, &cal, &TRIAL_8);
         assert!(
             c.iter().all(|(d, _)| *d != k),
             "an entry > 0.5% above the close is skipped"
@@ -727,7 +777,10 @@ mod tests {
                 b
             })
             .collect();
-        assert!(candidates(0, &thin, &cal).is_empty(), "under $20M a day");
+        assert!(
+            candidates(0, &thin, &cal, &TRIAL_8).is_empty(),
+            "under $20M a day"
+        );
     }
 
     fn cand(symbol: usize, ratio: Option<f64>, entry: usize, exit: usize, r: f64) -> Cand {
@@ -822,7 +875,7 @@ mod tests {
         let (n, k) = (320, 300);
         let cal = cal(n);
         let young: Vec<DailyBar> = breakout_bars(n, k)[100..].to_vec();
-        let c = candidates(0, &young, &cal);
+        let c = candidates(0, &young, &cal, &TRIAL_8);
         assert!(
             c.iter().all(|(s, _)| *s >= 100 + MIN_HISTORY - 1),
             "under 250 bars: not even in the baseline pool"
@@ -854,5 +907,41 @@ mod tests {
             (last - (160.0 / 159.0 - 1.0)).abs() < 1e-12,
             "only the sessions before the cut"
         );
+    }
+
+    #[test]
+    fn trial_9_floor_and_fund_names() {
+        let (n, k) = (320, 300);
+        let cal = cal(n);
+        let bars = breakout_bars(n, k);
+        assert!(!candidates(0, &bars, &cal, &TRIAL_8).is_empty());
+        // the fixture's ATR is about 1-2% of an ~80 price at the breakout, well under 15%
+        let strict = Rules {
+            min_atr_fraction: 0.15,
+            ..TRIAL_9
+        };
+        assert!(
+            candidates(0, &bars, &cal, &strict).is_empty(),
+            "under the floor"
+        );
+        for f in [
+            "iShares 0-3 Month Treasury Bond ETF",
+            "SPDR Bloomberg 1-3 Month T-Bill ETF",
+            "ProShares UltraPro QQQ",
+            "Direxion Daily Semiconductor Bull 3X Shares",
+            "PIMCO Enhanced Short Maturity Active Exchange-Traded Fund",
+            "iPath Bloomberg Commodity Index Total Return ETN",
+            "Some Income Fund",
+        ] {
+            assert!(is_fund(f), "{f}");
+        }
+        for s in [
+            "Apple Inc. Common Stock",
+            "Northern Trust Corporation",
+            "Fundamental Global Inc.",
+            "Invesco QQQ Trust, Series 1",
+        ] {
+            assert!(!is_fund(s), "{s}");
+        }
     }
 }

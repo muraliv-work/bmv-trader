@@ -183,6 +183,8 @@ pub fn is_ticker(s: &str) -> bool {
 struct Asset {
     symbol: String,
     exchange: String,
+    #[serde(default)]
+    name: String,
 }
 
 /// Every listed US stock symbol, active and inactive, on the main exchanges. Inactive ones are
@@ -205,6 +207,37 @@ pub fn fetch_universe(alpaca: &Alpaca, dir: &Path) -> Result<usize, String> {
     symbols.dedup();
     history::write_json(&universe_path(dir), &symbols)?;
     Ok(symbols.len())
+}
+
+fn asset_names_path(dir: &Path) -> PathBuf {
+    dir.join("daily").join("asset_names.json")
+}
+
+/// Alpaca's asset name for each symbol already in `universe.json` (DESIGN §7e), which is left
+/// unchanged so earlier trials keep their universe. Returns how many symbols got a name.
+pub fn fetch_asset_names(alpaca: &Alpaca, dir: &Path) -> Result<usize, String> {
+    let universe: Vec<String> = history::read_json(&universe_path(dir))
+        .map_err(|e| format!("{e}: run `bmv-trader universe` first"))?;
+    let mut names = BTreeMap::new();
+    for status in ["active", "inactive"] {
+        let assets: Vec<Asset> = alpaca.get(
+            Api::Trading,
+            &format!("/v2/assets?status={status}&asset_class=us_equity"),
+        )?;
+        for a in assets {
+            if !a.name.is_empty() && universe.binary_search(&a.symbol).is_ok() {
+                names.entry(a.symbol).or_insert(a.name);
+            }
+        }
+    }
+    history::write_json(&asset_names_path(dir), &names)?;
+    Ok(names.len())
+}
+
+/// The names `fetch_asset_names` saved.
+pub fn read_asset_names(dir: &Path) -> Result<BTreeMap<String, String>, String> {
+    history::read_json(&asset_names_path(dir))
+        .map_err(|e| format!("{e}: run `bmv-trader asset-names` first"))
 }
 
 #[derive(Deserialize)]
