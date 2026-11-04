@@ -748,8 +748,12 @@ fn desk_run() -> Result<(), String> {
     }
     let symbols = live_symbols(&dir)?;
     let from = (et.date_naive() - chrono::Days::new(LIVE_DAYS)).to_string();
-    eprintln!("refreshing {} symbols, {from}..{today}", symbols.len());
-    bmv_trader::scan::refresh_live(&alpaca, &dir, &symbols, &from, &today, &mut |d, n| {
+    // the free plan refuses SIP data from the last 15 minutes; today's bar is stamped at midnight
+    let end = (chrono::Utc::now() - chrono::Duration::minutes(20))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    eprintln!("refreshing {} symbols, {from}..{end}", symbols.len());
+    bmv_trader::scan::refresh_live(&alpaca, &dir, &symbols, &from, &end, &mut |d, n| {
         if d % 1000 == 0 || d == n {
             eprintln!("  {d}/{n}");
         }
@@ -945,7 +949,7 @@ fn desk_verdict() -> Result<(), String> {
         ));
     }
     let (_, to) = bmv_trader::scan::daily_range(&dir, bmv_trader::scan::ADJUSTED_SIP_LIVE)?;
-    let fresh = history::canonical_date(&to)?;
+    let fresh = history::canonical_date(to.get(..10).unwrap_or(&to))?;
     if (today - fresh).num_days() > 4 {
         return Err(format!("the live bars end {to}: run `desk-run` first"));
     }
