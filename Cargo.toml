@@ -17,3 +17,8 @@ overflow-checks = true
 
 [dev-dependencies]
 proptest = "1.12.0"
+
+[workspace]
+members = ["crates/desk"]
+# agent worktrees are their own checkouts, not members
+exclude = [".claude/worktrees"]

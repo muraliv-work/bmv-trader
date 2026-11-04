@@ -290,6 +290,23 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - **Wave 3:** Risk, Compliance, Ops, Product Owner, Platform Engineer, once a strategy heads to paper.
 - **Compliance:** supports margin under $25k (the PDT limit of 3 day trades in 5 days), margin of $25k or more, and cash accounts (settled cash only). It tracks wash sales. The owner picks the account before any live approval.
 
+### Step 1 as built (`crates/desk`), and what step 2 must close
+- **Layout:** `store`, `audit`, `lifecycle` and `permissions` are modules of one `desk` crate, not four crates. They can be split later.
+- **Enforced and tested:**
+  - **Permissions:** agents can't hire; an agent's role comes from the store; the Developer can't read held-out data.
+  - **Gate rules:** maker-checker by agent and by role, every forward gate checking its evidence from the store, no skipping, and halting only through `halt`, which records its reason.
+  - **Who may halt and resume:** only the Risk Manager or Compliance may call their own kind of halt, and only the owner lifts it.
+  - **Frozen artifacts:** criteria freeze at the spec, or at the first backtest. Code changes only before validation; after that, the strategy must fail back to a new version.
+  - **Limits and budgets:** limits come from an allowlist, are never negative, and only the owner sets or loosens them. Budget check and charge are one atomic step.
+  - **History:** append-only tables, `INSERT OR REPLACE` included; a hash chain with every signer on each step; an empty log counts as tampering.
+- **Gaps that build step 2 must close:**
+  - **Anchor the head hash** outside the database, or key it with a Keychain secret. Today someone who can write the file could rewrite the whole chain.
+  - **Run the desk as its own macOS user,** with the database at mode 600.
+  - **Bind each `HumanProof`** to one action, strategy and target state, with a nonce, an expiry, and its id in the audit entry. Today each proof is single-use but not bound to an action.
+  - **The real Touch ID prompt:** until it exists, no code outside tests can prove a human, so every human-only action is refused.
+  - **Use `BEGIN IMMEDIATE`,** or one writer process, once more than one process opens the database.
+  - **The spec's §11 items "halt cancels orders within 5 s" and "a Validator mismatch is an automatic FAIL"** arrive with steps 6 and 3.
+
 ### Build order (the spec's §12; the owner's go-ahead after each step)
 1. The `store`, `audit`, `lifecycle` and `permissions` crates, with the spec's §11 tests.
 2. `desk_api` (axum) plus MCP tools.

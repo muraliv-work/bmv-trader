@@ -3,7 +3,7 @@
 set -euo pipefail
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 cd "$(dirname "$0")/.."
-cargo fmt --check
-cargo clippy -q --all-targets -- -D warnings
-cargo test -q
+cargo fmt --all --check
+cargo clippy -q --workspace --all-targets -- -D warnings
+cargo test -q --workspace
 echo "check: OK"

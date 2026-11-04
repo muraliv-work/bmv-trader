@@ -74,7 +74,7 @@ The working list for building bmv-trader. Each task is done when: tests pass (`s
 
 ## Quant Desk (DESIGN §4c, DECISION R12, S29–S34)
 - [x] Design and decisions
-- [ ] Step 1: `store`, `audit`, `lifecycle`, `permissions` crates with the spec's §11 tests
+- [x] Step 1: `crates/desk` (store, audit, lifecycle, permissions) with the spec's §11 tests; security and Rust reviews fixed (DESIGN §4c, "Step 1 as built")
 - [ ] Step 2: `desk_api` (axum) plus MCP tools
 - [ ] Step 3: backtest and stress harness, deflated Sharpe; the Validator reproduces all 11 trials (R12 part A). ⛔ Owner picks the Validator's model family
 - [ ] Step 4: risk and execution, paper only, wrapping `risk::gate` and the engine
