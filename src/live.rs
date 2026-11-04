@@ -830,6 +830,104 @@ pub fn require_flat(positions: &[Position], open_orders: &[Order]) -> Result<(),
     ))
 }
 
+/// The ticker allow-list (DESIGN §9): `config/allowlist.txt`, one symbol per line, `#` starts a
+/// comment. The owner edits it; a missing, empty or malformed list means no trading.
+pub fn allowlist(home: &Path) -> Result<BTreeSet<String>, String> {
+    let path = home.join("config").join("allowlist.txt");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("ticker allow-list {}: {e}", path.display()))?;
+    let mut names = BTreeSet::new();
+    for line in text.lines() {
+        let name = line
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
+        if name.is_empty() {
+            continue;
+        }
+        if !history::valid_symbol(&name) {
+            return Err(format!("ticker allow-list: {name:?} is not a ticker"));
+        }
+        names.insert(name);
+    }
+    if names.is_empty() {
+        return Err(format!("ticker allow-list {} is empty", path.display()));
+    }
+    Ok(names)
+}
+
+/// Every symbol the run would watch must be on the allow-list.
+pub fn check_watchlist(watch: &[String], allowed: &BTreeSet<String>) -> Result<(), String> {
+    let off: Vec<&str> = watch
+        .iter()
+        .filter(|w| !allowed.contains(&w.to_ascii_uppercase()))
+        .map(String::as_str)
+        .collect();
+    if off.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "not on the ticker allow-list (config/allowlist.txt): {}",
+            off.join(", ")
+        ))
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Peak {
+    cents: i64,
+    at: String,
+}
+
+/// The drawdown auto-halt (owner, 2026-11-04): the account's high-water mark lives in
+/// data/equity_peak.json and moves up at each session start. Equity more than the mode's limit
+/// below it engages the kill switch, so nothing trades until the owner clears it.
+pub fn check_drawdown(home: &Path, equity: Usd, limits: &Limits) -> Result<(), String> {
+    let path = home.join("data").join("equity_peak.json");
+    let peak = match std::fs::read_to_string(&path) {
+        Ok(t) => {
+            serde_json::from_str::<Peak>(&t)
+                .map_err(|e| {
+                    format!(
+                        "{}: {e} (fix or delete it to restart the peak)",
+                        path.display()
+                    )
+                })?
+                .cents
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    if equity.cents() > peak {
+        let tmp = path.with_extension("json.tmp");
+        let body = serde_json::to_string(&Peak {
+            cents: equity.cents(),
+            at: chrono::Utc::now().to_rfc3339(),
+        })
+        .map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(home.join("data"))
+            .and_then(|_| std::fs::write(&tmp, body))
+            .and_then(|_| std::fs::rename(&tmp, &path))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        return Ok(());
+    }
+    // integer cents: equity × 100 below peak × (100 − limit)
+    let floor = i128::from(peak) * i128::from(100 - limits.max_drawdown_pct());
+    if i128::from(equity.cents()) * 100 < floor {
+        let fell = Usd::from_cents(peak - equity.cents());
+        let reason = format!(
+            "drawdown halt: equity {equity} is {fell} below its peak {} (limit {}%)",
+            Usd::from_cents(peak),
+            limits.max_drawdown_pct()
+        );
+        safety::engage(&safety::stop_path(home), &reason)?;
+        return Err(reason);
+    }
+    Ok(())
+}
+
 /// A restart can't forget today's daily-loss halt.
 pub fn check_day_pnl(a: &Account, limits: &Limits) -> Result<(), String> {
     let pnl = a.equity - a.last_equity;
@@ -856,12 +954,21 @@ pub fn startup(
     home: &Path,
     settings: Settings,
     watchlist: Vec<String>,
+    desk: Option<&crate::desk_link::Link>,
 ) -> Result<Runner<Alpaca>, String> {
     refuse_live(mode)?;
     let limits = Limits::for_mode(Mode::Paper);
     safety::startup_checks(&limits, home)?;
+    let allowed = allowlist(home)?;
+    check_watchlist(&watchlist, &allowed)?;
     let account = alpaca.account()?;
+    // the desk's go-ahead for this strategy, and its tighter limits, when the link is on
+    let limits = match desk {
+        Some(d) => d.approve(mode, limits, account.equity)?,
+        None => limits,
+    };
     check_day_pnl(&account, &limits)?;
+    check_drawdown(home, account.equity, &limits)?;
     let clock: Clock = alpaca.get(Api::Trading, "/v2/clock")?;
     check_skew(&clock.timestamp, chrono::Utc::now().timestamp_millis())?;
     let today = chrono::Utc::now()
@@ -882,7 +989,7 @@ pub fn startup(
     }
     require_flat(&alpaca.positions()?, &open_orders(&alpaca)?)?;
     let journal = Journal::open(&journal_path(home))?;
-    let engine = State::new(limits, settings)?;
+    let engine = State::new(limits, settings, crate::risk::Allowed::Only(allowed))?;
     let feed = Feed::new(watchlist, session.open, session.close)?;
     Runner::new(
         engine,
@@ -1257,6 +1364,7 @@ mod tests {
         let s = RiskState {
             entries_allowed: true,
             buying_power: Usd::from_cents(1_000_000_000),
+            allowed: crate::risk::Allowed::Any,
             ..RiskState::default()
         };
         risk::gate(&c, Verdict::Approve, &s, &Limits::for_mode(Mode::Paper)).unwrap()
@@ -1872,8 +1980,49 @@ mod tests {
                 entry: Entry::Orb,
                 trend_filter: false,
             },
+            crate::risk::Allowed::Any,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn the_allow_list_fails_closed_and_the_drawdown_halt_latches() {
+        let t = Tmp::new();
+        let home = &t.0;
+        assert!(allowlist(home).is_err(), "no file, no trading");
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        let list = home.join("config/allowlist.txt");
+        std::fs::write(&list, "# only comments\n\n").unwrap();
+        assert!(allowlist(home).is_err(), "empty, no trading");
+        std::fs::write(&list, "SPY\nqqq  # index\nBRK.B\n").unwrap();
+        let names = allowlist(home).unwrap();
+        assert_eq!(names.len(), 3);
+        assert!(check_watchlist(&["spy".into(), "QQQ".into()], &names).is_ok());
+        let off = check_watchlist(&["SPY".into(), "TSLA".into()], &names).unwrap_err();
+        assert!(off.contains("TSLA") && !off.contains("SPY,"));
+        std::fs::write(&list, "SPY\nnot a ticker\n").unwrap();
+        assert!(allowlist(home).is_err());
+
+        let paper = Limits::for_mode(Mode::Paper);
+        let usd = |d: i64| Usd::from_cents(d * 100);
+        check_drawdown(home, usd(25_000), &paper).unwrap();
+        check_drawdown(home, usd(26_000), &paper).unwrap(); // a new peak
+        check_drawdown(home, usd(23_500), &paper).unwrap(); // 9.6% down: inside 10%
+        assert_eq!(
+            safety::kill_switch(&safety::stop_path(home)),
+            KillSwitch::Clear
+        );
+        let e = check_drawdown(home, usd(23_300), &paper).unwrap_err(); // 10.4% down
+        assert!(e.contains("drawdown halt"), "{e}");
+        assert!(matches!(
+            safety::kill_switch(&safety::stop_path(home)),
+            KillSwitch::Engaged(_)
+        ));
+        // live is tighter: 5%
+        let live = Limits::for_mode(Mode::Live);
+        let t2 = Tmp::new();
+        check_drawdown(&t2.0, usd(1_000), &live).unwrap();
+        assert!(check_drawdown(&t2.0, usd(940), &live).is_err());
     }
 
     #[test]

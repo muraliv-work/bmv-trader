@@ -683,6 +683,7 @@ mod tests {
         let s = RiskState {
             entries_allowed: true,
             buying_power: Usd::from_cents(1_000_000_000),
+            allowed: crate::risk::Allowed::Any,
             ..RiskState::default()
         };
         gate(

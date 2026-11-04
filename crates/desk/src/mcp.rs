@@ -114,6 +114,13 @@ const TOOLS: &[Tool] = &[
         ],
     },
     Tool {
+        name: "strategy_limits",
+        about: "A strategy's risk limits, each at its latest version.",
+        method: "GET",
+        path: "/v1/strategies/{strategy}/limits",
+        args: &[STRATEGY],
+    },
+    Tool {
         name: "request_owner_action",
         about: "Ask the owner (Touch ID) for a human-only action; it waits for their signature.",
         method: "POST",

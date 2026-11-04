@@ -452,6 +452,19 @@ impl Store {
         Ok(false)
     }
 
+    /// A strategy's risk limits, each at its latest version: (name, value).
+    pub async fn limits(&self, strategy: i64) -> Result<Vec<(String, String)>> {
+        self.state(strategy).await?;
+        Ok(sqlx::query_as(
+            "SELECT name, value FROM risk_limits r WHERE strategy_id = ?
+               AND version = (SELECT MAX(version) FROM risk_limits WHERE strategy_id = r.strategy_id AND name = r.name)
+             ORDER BY name",
+        )
+        .bind(strategy)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Every strategy: (id, name, state, version).
     pub async fn strategies(&self) -> Result<Vec<(i64, String, String, i64)>> {
         Ok(

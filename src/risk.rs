@@ -23,6 +23,8 @@ pub struct Limits {
     max_trades_per_day: usize,
     consecutive_loss_halt: u32,
     max_per_cluster: usize,
+    /// Equity this many percent below its high-water mark trips the kill switch (owner, 2026-11-04).
+    max_drawdown_pct: i64,
     /// Minimum R = max(entry × min_r_bps / 10 000, min_r).
     min_r_bps: i64,
     min_r: Usd,
@@ -31,9 +33,9 @@ pub struct Limits {
 impl Limits {
     pub fn for_mode(mode: Mode) -> Self {
         let d = |dollars: i64| Usd::from_cents(dollars * 100);
-        let (notional, risk, positions, halt, trades, losses, cluster) = match mode {
-            Mode::Paper => (2_500, 250, 5, 500, 10, 3, 2),
-            Mode::Live => (500, 50, 2, 100, 3, 2, 1),
+        let (notional, risk, positions, halt, trades, losses, cluster, drawdown) = match mode {
+            Mode::Paper => (2_500, 250, 5, 500, 10, 3, 2, 10),
+            Mode::Live => (500, 50, 2, 100, 3, 2, 1, 5),
         };
         Limits {
             mode,
@@ -44,6 +46,7 @@ impl Limits {
             max_trades_per_day: trades,
             consecutive_loss_halt: losses,
             max_per_cluster: cluster,
+            max_drawdown_pct: drawdown,
             min_r_bps: 15,
             min_r: Usd::from_cents(5),
         }
@@ -57,6 +60,51 @@ impl Limits {
     }
     pub fn consecutive_loss_halt(&self) -> u32 {
         self.consecutive_loss_halt
+    }
+    pub fn max_drawdown_pct(&self) -> i64 {
+        self.max_drawdown_pct
+    }
+
+    /// This mode's limits with one of the desk's risk limits applied (build step 4): a desk limit
+    /// only ever tightens, never loosens. A limit the engine can't enforce is refused, so a run
+    /// never trades under a limit it silently ignores.
+    pub fn tightened(mut self, name: &str, value: &str, equity: Usd) -> Result<Limits, String> {
+        let count = |v: &str| {
+            v.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("desk limit {name} = {v:?} is not a whole number"))
+        };
+        let pct = |v: &str| {
+            v.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|p| p.is_finite() && *p >= 0.0)
+                .ok_or_else(|| format!("desk limit {name} = {v:?} is not a percentage"))
+        };
+        match name {
+            "max_position_usd" => self.max_notional = self.max_notional.min(Usd::parse(value)?),
+            "max_daily_loss_usd" => {
+                self.daily_loss_halt = self.daily_loss_halt.min(Usd::parse(value)?)
+            }
+            "max_trades_per_day" => {
+                self.max_trades_per_day = self.max_trades_per_day.min(count(value)?)
+            }
+            "max_open_positions" => self.max_positions = self.max_positions.min(count(value)?),
+            // whole percent, rounded down so it never loosens
+            "max_drawdown_pct" => {
+                self.max_drawdown_pct = self.max_drawdown_pct.min(pct(value)?.floor() as i64)
+            }
+            "max_account_pct" => {
+                let cap = (equity.cents() as f64 * pct(value)? / 100.0).floor() as i64;
+                self.max_notional = self.max_notional.min(Usd::from_cents(cap));
+            }
+            other => {
+                return Err(format!(
+                    "desk limit {other} isn't enforced by the engine yet; refusing to trade under it"
+                ));
+            }
+        }
+        Ok(self)
     }
 
     fn min_r_for(&self, entry: Price) -> Usd {
@@ -105,7 +153,31 @@ impl Exposure {
     }
 }
 
-/// Everything the gate needs to know about now. Defaults fail closed: no entries, no buying power.
+/// Which symbols may be traded (DESIGN §9). The default allows nothing, so a snapshot built
+/// without the allow-list fails closed; `Any` is for research backtests only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Allowed {
+    Any,
+    Only(std::collections::BTreeSet<String>),
+}
+
+impl Default for Allowed {
+    fn default() -> Self {
+        Allowed::Only(Default::default())
+    }
+}
+
+impl Allowed {
+    pub fn permits(&self, symbol: &str) -> bool {
+        match self {
+            Allowed::Any => true,
+            Allowed::Only(names) => names.contains(&symbol.to_ascii_uppercase()),
+        }
+    }
+}
+
+/// Everything the gate needs to know about now. Defaults fail closed: no entries, no buying power,
+/// no allowed symbols.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RiskState {
     pub kill_switch: bool,
@@ -118,12 +190,15 @@ pub struct RiskState {
     pub traded_today: Vec<String>,
     /// Positions, working entries and reservations, excluding this candidate's own reservation.
     pub open: Vec<Exposure>,
+    pub allowed: Allowed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rejection {
     KillSwitch,
     Halted,
+    /// Not on the ticker allow-list.
+    NotAllowed,
     OutsideWindow,
     DailyLoss,
     ConsecutiveLosses,
@@ -198,6 +273,7 @@ pub fn gate(
     let checks = [
         (s.kill_switch, KillSwitch),
         (s.halted, Halted),
+        (!s.allowed.permits(symbol), NotAllowed),
         (!s.entries_allowed, OutsideWindow),
         (s.pnl_today <= Usd::ZERO - l.daily_loss_halt, DailyLoss),
         (
@@ -269,6 +345,7 @@ pub fn self_test(l: &Limits) -> Result<(), String> {
     let ok = RiskState {
         entries_allowed: true,
         buying_power: Usd::from_cents(1_000_000_000),
+        allowed: Allowed::Only(["SPY".to_string()].into()),
         ..RiskState::default()
     };
     let syms = |prefix: &str, n: usize| (0..n).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>();
@@ -289,7 +366,7 @@ pub fn self_test(l: &Limits) -> Result<(), String> {
 
     let reduce_1pct =
         Verdict::Reduce(crate::vetting::Factor::percent(1).ok_or("self-test factor")?);
-    let cases: [(&str, &Candidate, Verdict, RiskState, Rejection); 14] = [
+    let cases: [(&str, &Candidate, Verdict, RiskState, Rejection); 15] = [
         (
             "kill switch",
             &spy,
@@ -409,6 +486,16 @@ pub fn self_test(l: &Limits) -> Result<(), String> {
             },
             BuyingPower,
         ),
+        (
+            "not on the allow-list",
+            &spy,
+            Verdict::Approve,
+            RiskState {
+                allowed: Allowed::default(),
+                ..ok.clone()
+            },
+            NotAllowed,
+        ),
     ];
     if Exposure::new("Y", Usd::ZERO - l.daily_loss_halt).risk() != Usd::ZERO {
         return Err("risk self-test 'negative exposure': must count as zero risk".into());
@@ -426,6 +513,32 @@ pub fn self_test(l: &Limits) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn desk_limits_only_tighten() {
+        let base = || Limits::for_mode(Mode::Paper);
+        let eq = Usd::from_cents(2_500_000);
+        let t = base().tightened("max_position_usd", "1000", eq).unwrap();
+        assert_eq!(t.max_notional, Usd::from_cents(100_000));
+        let loose = base().tightened("max_position_usd", "99999", eq).unwrap();
+        assert_eq!(loose, base(), "a looser desk limit changes nothing");
+        let t = base().tightened("max_daily_loss_usd", "200", eq).unwrap();
+        assert_eq!(t.daily_loss_halt, Usd::from_cents(20_000));
+        let t = base().tightened("max_trades_per_day", "2", eq).unwrap();
+        assert_eq!(t.max_trades_per_day, 2);
+        let t = base().tightened("max_drawdown_pct", "7.9", eq).unwrap();
+        assert_eq!(t.max_drawdown_pct, 7);
+        let t = base().tightened("max_account_pct", "4", eq).unwrap();
+        assert_eq!(t.max_notional, Usd::from_cents(100_000), "4% of $25,000");
+        assert!(
+            base()
+                .tightened("max_correlated_exposure_pct", "10", eq)
+                .is_err()
+        );
+        assert!(base().tightened("max_open_positions", "-1", eq).is_err());
+        assert!(base().tightened("max_drawdown_pct", "NaN", eq).is_err());
+    }
+
     use super::*;
     use crate::vetting::Factor;
     use proptest::prelude::*;
@@ -450,6 +563,7 @@ mod tests {
         RiskState {
             entries_allowed: true,
             buying_power: usd(1_000_000),
+            allowed: crate::risk::Allowed::Any,
             ..RiskState::default()
         }
     }
@@ -908,6 +1022,7 @@ mod tests {
                         .into_iter()
                         .map(|(s, r)| Exposure::new(s, Usd::from_cents(r)))
                         .collect(),
+                    allowed: Allowed::Any,
                 }
             })
     }

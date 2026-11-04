@@ -2788,14 +2788,29 @@ fn run(symbols: &[String], trend: bool, orb: OrbParams) -> Result<(), String> {
         entry: Entry::Orb,
         trend_filter: trend,
     };
+    let desk = bmv_trader::desk_link::Link::from_env()?;
+    // a halt the desk should know about: the drawdown halt at startup, or a run that stopped
+    let report = |why: &str| {
+        if let Some(d) = &desk
+            && let Err(e) = d.report_halt(why)
+        {
+            eprintln!("desk: couldn't report the halt: {e}");
+        }
+    };
     let mut r = live::startup(
         broker::Alpaca::new(cfg)?,
         mode,
         &home,
         settings,
         symbols.to_vec(),
-    )?;
-    live::run(&mut r, &home)?;
+        desk.as_ref(),
+    )
+    .inspect_err(|e| {
+        if e.starts_with("drawdown halt") {
+            report(e)
+        }
+    })?;
+    live::run(&mut r, &home).inspect_err(|e| report(e))?;
     println!(
         "session done: pnl_today {}, halted {}",
         r.engine.pnl_today(),

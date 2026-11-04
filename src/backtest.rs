@@ -139,7 +139,11 @@ pub fn run(days: &[Day], settings: Settings, model: FillModel) -> Result<Vec<Day
     if settings.vetting {
         return Err("backtests run rules-only; Claude can't be backtested (DESIGN §13)".into());
     }
-    let mut engine = State::new(Limits::for_mode(Mode::Paper), settings)?;
+    let mut engine = State::new(
+        Limits::for_mode(Mode::Paper),
+        settings,
+        crate::risk::Allowed::Any,
+    )?;
     let mut sim = Sim {
         rng: model.seed.max(1),
         model,

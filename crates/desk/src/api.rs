@@ -224,6 +224,17 @@ struct Limit {
     value: String,
 }
 
+async fn limits(Ctx(s): Desk, h: HeaderMap, Path(id): Path<i64>) -> Reply {
+    caller(&s, &h).await?;
+    let rows: Vec<Value> = s
+        .limits(id)
+        .await?
+        .into_iter()
+        .map(|(name, value)| json!({"name": name, "value": value}))
+        .collect();
+    Ok(Json(json!(rows)))
+}
+
 /// Tightening only; loosening is an owner request.
 async fn limit(Ctx(s): Desk, h: HeaderMap, Path(id): Path<i64>, Json(b): Json<Limit>) -> Reply {
     let agent = caller(&s, &h).await?;
@@ -275,7 +286,7 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/v1/strategies/{id}/paper", post(paper))
         .route("/v1/strategies/{id}/sign", post(sign))
         .route("/v1/strategies/{id}/halt", post(halt))
-        .route("/v1/strategies/{id}/limits", post(limit))
+        .route("/v1/strategies/{id}/limits", get(limits).post(limit))
         .route("/v1/owner/requests", get(pending).post(request))
         .route("/v1/owner/requests/{id}/approve", post(approve))
         .route("/v1/audit/verify", get(verify))

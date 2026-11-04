@@ -5,6 +5,7 @@ pub mod backtest;
 pub mod broker;
 pub mod config;
 pub mod desk;
+pub mod desk_link;
 pub mod engine;
 pub mod history;
 pub mod lab;

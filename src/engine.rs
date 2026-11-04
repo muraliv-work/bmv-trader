@@ -226,6 +226,7 @@ struct Session {
 
 #[derive(Debug)]
 pub struct State {
+    allowed: risk::Allowed,
     limits: Limits,
     settings: Settings,
     session: Option<Session>,
@@ -247,7 +248,8 @@ pub struct State {
 
 impl State {
     /// Refuses to build an engine whose risk gate or strategy settings fail their self-checks.
-    pub fn new(limits: Limits, settings: Settings) -> Result<Self, String> {
+    /// `allowed` is the ticker allow-list the gate applies; `Allowed::Any` for research only.
+    pub fn new(limits: Limits, settings: Settings, allowed: risk::Allowed) -> Result<Self, String> {
         risk::self_test(&limits)?;
         settings.orb.validate()?;
         if limits.mode() == crate::config::Mode::Live && settings.entry != Entry::Orb {
@@ -272,6 +274,7 @@ impl State {
             consecutive_losses: 0,
             buying_power: Usd::ZERO,
             unresolved: BTreeMap::new(),
+            allowed,
         })
     }
 
@@ -939,6 +942,7 @@ impl State {
                 .map(|(_, t)| t.candidate.symbol().to_string())
                 .collect(),
             open,
+            allowed: self.allowed.clone(),
         }
     }
 }
@@ -974,6 +978,7 @@ mod tests {
                 entry: Entry::Orb,
                 trend_filter: false,
             },
+            risk::Allowed::Any,
         )
         .unwrap();
         e.step(start("2024-01-02", 0));
@@ -1087,16 +1092,23 @@ mod tests {
             entry: Entry::Orb,
             trend_filter: false,
         };
-        assert!(State::new(Limits::for_mode(Mode::Paper), bad).is_err());
+        assert!(State::new(Limits::for_mode(Mode::Paper), bad, risk::Allowed::Any).is_err());
         let random = Settings {
             vetting: false,
             orb: OrbParams::default(),
             entry: Entry::Random { seed: 1 },
             trend_filter: false,
         };
-        assert!(State::new(Limits::for_mode(Mode::Paper), random.clone()).is_ok());
         assert!(
-            State::new(Limits::for_mode(Mode::Live), random).is_err(),
+            State::new(
+                Limits::for_mode(Mode::Paper),
+                random.clone(),
+                risk::Allowed::Any
+            )
+            .is_ok()
+        );
+        assert!(
+            State::new(Limits::for_mode(Mode::Live), random, risk::Allowed::Any).is_err(),
             "the baseline never runs live"
         );
     }
@@ -1111,6 +1123,7 @@ mod tests {
                 entry: Entry::Orb,
                 trend_filter: false,
             },
+            risk::Allowed::Any,
         )
         .unwrap();
         let ms = Event::SessionStart {
@@ -1235,6 +1248,7 @@ mod tests {
                     entry: Entry::Orb,
                     trend_filter: true,
                 },
+                risk::Allowed::Any,
             )
             .unwrap();
             e.step(start("2024-01-02", 0));
@@ -1315,6 +1329,7 @@ mod tests {
                     entry: Entry::Random { seed: 7 },
                     trend_filter,
                 },
+                risk::Allowed::Any,
             )
             .unwrap();
             e.step(start("2024-01-02", 0));
@@ -1370,6 +1385,7 @@ mod tests {
                 entry: Entry::Orb,
                 trend_filter: false,
             },
+            risk::Allowed::Any,
         )
         .unwrap();
         e.step(Event::SessionStart {

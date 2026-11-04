@@ -1,0 +1,13 @@
+# Ticker allow-list (DESIGN §9, build step 4): the only symbols the engine may trade, paper or live.
+# One per line; '#' starts a comment. A missing or empty list means no trading at all.
+# The owner edits this file; agents can't change it (it's under git, merged only by the owner).
+SPY
+QQQ
+AAPL
+MSFT
+NVDA
+AMD
+META
+AMZN
+GOOGL
+TSLA

@@ -349,6 +349,22 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - The VALIDATED gate refuses any version with a mismatched pair.
 - **First run (2026-11-04):** all 10 finished trials reproduce, and all 10 fail. Momentum (trial 7) is the only one that survives costs and most years.
 
+### Step 4 as built: allow-list, drawdown halt, desk link (paper)
+- **Ticker allow-list:** `config/allowlist.txt` is edited by the owner and merged only by them.
+  - The risk gate refuses any symbol not on it (`Rejection::NotAllowed`), and the startup self-test proves it fires.
+  - A run refuses to start if its watchlist goes beyond the list, or if the list is missing, empty or malformed.
+  - `risk::Allowed` defaults to allowing nothing. Only research backtests pass `Allowed::Any`.
+- **Drawdown auto-halt (owner, 2026-11-04):** 10% below the equity high-water mark on paper, 5% live.
+  - The peak lives in `data/equity_peak.json` and moves up at each session start.
+  - A breach engages the kill switch with the reason, and nothing trades until the owner clears it.
+  - Intraday losses stay capped by the daily-loss halt.
+- **Desk link, `src/desk_link.rs`:** off until step 5 (owner, 2026-11-04).
+  - With `BMV_DESK_LINK=on` and `BMV_DESK_STRATEGY=<id>`, a run signs in as an Ops agent, using the Keychain item `bmv-desk/<agent>`.
+  - It trades only while the desk has that strategy in `paper_trading` (or live, on a live account).
+  - Each desk limit only tightens the engine's own (`Limits::tightened`). A limit the engine can't enforce yet, such as `max_correlated_exposure_pct`, refuses the run.
+  - A drawdown halt, or a run that stops on an error, is reported to the desk as an operational halt.
+- **Still open:** anything that can delete `data/equity_peak.json` resets the peak. Agents can't, being sandboxed with no shell. Moving the peak into the desk database in step 6 would close this.
+
 ### Build order (the spec's §12; the owner's go-ahead after each step)
 1. The `store`, `audit`, `lifecycle` and `permissions` crates, with the spec's §11 tests.
 2. `desk_api` (axum) plus MCP tools.
