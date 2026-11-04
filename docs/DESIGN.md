@@ -496,6 +496,10 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
   - the weighted mean R is above 0
 
   Logged once as trial 12, "ai-veto retro local".
+- **Failures (added 2026-11-04 after the security review, before any trial 12 run):**
+  - `retro-run` starts only if Ollama answers and has the model, and it stops after 3 failures in a row. That way an outage pauses the run instead of marking the sample as failed.
+  - A failure that is recorded stays final (the first answer counts).
+  - **If more than 10% of the sample failed, the trial is void, not judged.** The sample's SHA-256 is stored when it is frozen and checked on every read.
 - **Power gate (DECISION R9), run before any code:**
   - **Spread guide:** trial 9's research-period trade R spread, plus trial 10's first-night rating mix. Never untouched-year data.
   - **Rule:** the trial is built only if **the smallest D it detects with 80% power is at most 0.20R**. Otherwise it stops there and is recorded.

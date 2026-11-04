@@ -22,6 +22,11 @@ const USAGE: &str = "usage:
   bmv-trader power                        the smallest effect trials 11 and 12 could detect (spreads from trial 7)
   bmv-trader lab-search [--minutes 5] [--seed 1]  evolve ranking formulas on the search months only (DESIGN §7h)
   bmv-trader retro-power                  trial 12's power gate: research-period signals only (DESIGN §7i)
+  bmv-trader retro-sample                 trial 12: freeze each untouched-year session's top signal (once)
+  bmv-trader retro-speed [--count 3]      the local analyst on 2024 signals: minutes per run (outcomes unused)
+  bmv-trader retro-run [--hours 8]        trial 12: analyse the frozen sample with the local model; resumes
+  bmv-trader retro-report                 trial 12 so far: counts and ratings only
+  bmv-trader retro-verdict                trial 12's verdict, once every signal is answered (logged once)
   bmv-trader lab-validate                 ONCE: freeze the top 20 distinct formulas, score them on 2023-01..2025-09, log trial 11
   bmv-trader lab-ideas [--count 10]       ask the local model (Tier 2) for new formulas; the next lab-search starts from them
   bmv-trader desk-run                     trial 10 nightly (20 min after the close): live bars, signals, analyst ratings, scores
@@ -51,7 +56,7 @@ const MAX_SEEDS: usize = 50;
 
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
-const VALUE_FLAGS: [&str; 12] = [
+const VALUE_FLAGS: [&str; 13] = [
     "--date",
     "--trial",
     "--strategy",
@@ -64,6 +69,7 @@ const VALUE_FLAGS: [&str; 12] = [
     "--minutes",
     "--seed",
     "--count",
+    "--hours",
 ];
 const SWITCHES: [&str; 7] = [
     "--adjusted",
@@ -184,6 +190,11 @@ fn main() {
             Some("power") => power(),
             Some("lab-validate") => lab_validate(),
             Some("retro-power") => retro_power(),
+            Some("retro-sample") => retro_sample(),
+            Some("retro-speed") => retro_speed(args.num("--count", 3, 1..=20)?),
+            Some("retro-run") => retro_run(args.num("--hours", 8, 1..=72)?),
+            Some("retro-report") => retro_report(),
+            Some("retro-verdict") => retro_verdict(),
             Some("lab-ideas") => lab_ideas(args.num("--count", 10, 1..=100)?),
             Some("lab-search") => lab_search(
                 args.num("--minutes", 5, 1..=600)?,
@@ -1039,6 +1050,306 @@ fn swing_days(
     Ok((cal, names, days, start, cut))
 }
 
+/// Trial 12's sample (DESIGN §7i): each untouched-year session's top trial 9 signal, frozen once.
+fn retro_sample() -> Result<(), String> {
+    use bmv_trader::retro::{self, Pick};
+    let (home, dir) = (config::home()?, data_dir()?);
+    let _lock = retro::lock(&home)?;
+    let cut_date = holdout_from(&dir, &[])?;
+    if cut_date != retro::FROM {
+        return Err(format!(
+            "the holdout starts {cut_date}, but trial 12 is pre-registered from {}",
+            retro::FROM
+        ));
+    }
+    let (cal, names, days, _, cut) = swing_days(&dir, &bmv_trader::swing::TRIAL_9, &cut_date)?;
+    // the hold (entry next session, up to MAX_HOLD more) must end inside the data
+    let last = cal
+        .sessions
+        .len()
+        .saturating_sub(bmv_trader::swing::MAX_HOLD + 1);
+    let picks: Vec<Pick> = retro::top_per_session(&days, &names, cut..last)
+        .into_iter()
+        .map(|(d, c)| Pick {
+            date: cal.sessions[d].clone(),
+            symbol: names[c.symbol].clone(),
+            ratio: c.ratio.unwrap_or(0.0),
+        })
+        .collect();
+    let path = retro::freeze(&home, &picks)?;
+    let hash = retro::sha256(&path)?;
+    println!(
+        "trial 12 sample frozen: {} signals, {}..{}; sha256 {hash}",
+        picks.len(),
+        picks.first().map_or("", |p| p.date.as_str()),
+        picks.last().map_or("", |p| p.date.as_str())
+    );
+    Ok(())
+}
+
+/// Speed and load check (DESIGN §7i step 4): the local analyst on `count` research-period (2024)
+/// signals. Outcomes are never computed; timings go to data/retro/speed.jsonl.
+fn retro_speed(count: usize) -> Result<(), String> {
+    use bmv_trader::desk::{self, Analyst, Status};
+    use bmv_trader::retro;
+    let (home, dir) = (config::home()?, data_dir()?);
+    let _lock = retro::lock(&home)?;
+    let cut_date = holdout_from(&dir, &[])?;
+    let (cal, names, days, start, cut) = swing_days(&dir, &bmv_trader::swing::TRIAL_9, &cut_date)?;
+    let in_2024: Vec<usize> = (start..cut)
+        .filter(|&d| cal.sessions[d].starts_with("2024-"))
+        .collect();
+    let step = (in_2024.len() / count.max(1)).max(1);
+    let picks = retro::top_per_session(&days, &names, start..cut);
+    for &d in in_2024.iter().step_by(step).take(count) {
+        let Some((_, c)) = picks.iter().find(|(x, _)| *x == d) else {
+            continue;
+        };
+        let (symbol, date) = (&names[c.symbol], &cal.sessions[d]);
+        let t = std::time::Instant::now();
+        let (status, calls) = desk::analyse(&home, &Analyst::Local, symbol, date);
+        let minutes = t.elapsed().as_secs_f64() / 60.0;
+        let what = match &status {
+            Status::Rated { rating, .. } => format!("rated {rating:?}"),
+            Status::Failed { reason, .. } => format!("FAILED: {reason:?}"),
+            other => format!("{other:?}"),
+        };
+        let (input, output): (u64, u64) = calls
+            .iter()
+            .fold((0, 0), |a, c| (a.0 + c.input, a.1 + c.output));
+        println!(
+            "{date} {symbol}: {what} in {minutes:.1} min, {} calls, {input} in / {output} out tokens",
+            calls.len()
+        );
+        append_jsonl(
+            &retro::dir(&home).join("speed.jsonl"),
+            &[
+                serde_json::json!({"date": date, "symbol": symbol, "minutes": minutes, "calls": calls.len(),
+                "input": input, "output": output, "ok": matches!(status, Status::Rated { .. })}),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Trial 12's runner: analyses the frozen sample in order until `hours` pass; resumes where it
+/// stopped. Prints each answer; outcomes are never computed here.
+fn retro_run(hours: usize) -> Result<(), String> {
+    use bmv_trader::desk::{self, Analyst, Status};
+    use bmv_trader::retro::{self, Row};
+    let home = config::home()?;
+    let _lock = retro::lock(&home)?;
+    if logged_trials(&data_dir()?.join("trials.jsonl"))?
+        .iter()
+        .any(|t| t == retro::TRIAL_NAME)
+    {
+        return Err("trial 12 is already logged".into());
+    }
+    let picks = retro::read_sample(&home)?;
+    bmv_trader::llm::ollama_has(desk::LOCAL_MODEL, std::time::Duration::from_secs(5))
+        .map_err(|e| format!("the local analyst isn't ready: {e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(hours as u64 * 3600);
+    let mut fails_in_a_row = 0;
+    let mut done = retro::finals(&retro::read_rows(&home)?);
+    let total = picks.len();
+    for p in picks {
+        if done.contains_key(&(p.date.clone(), p.symbol.clone())) {
+            continue;
+        }
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "time is up: {} of {total} answered; run retro-run again to continue",
+                done.len()
+            );
+            return Ok(());
+        }
+        let when = || et_now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        retro::append_row(
+            &home,
+            &Row {
+                when: when(),
+                pick: p.clone(),
+                status: Status::Queued,
+            },
+        )?;
+        let t = std::time::Instant::now();
+        let (status, _) = desk::analyse(&home, &Analyst::Local, &p.symbol, &p.date);
+        retro::append_row(
+            &home,
+            &Row {
+                when: when(),
+                pick: p.clone(),
+                status: status.clone(),
+            },
+        )?;
+        let what = match &status {
+            Status::Rated { rating, .. } => format!("{rating:?}"),
+            Status::Failed { reason, .. } => format!("failed: {reason:?}"),
+            other => format!("{other:?}"),
+        };
+        fails_in_a_row = if matches!(status, Status::Failed { .. }) {
+            fails_in_a_row + 1
+        } else {
+            0
+        };
+        done.insert((p.date.clone(), p.symbol.clone()), status);
+        println!(
+            "{}/{total} {} {}: {what} ({:.1} min)",
+            done.len(),
+            p.date,
+            p.symbol,
+            t.elapsed().as_secs_f64() / 60.0
+        );
+        if fails_in_a_row >= retro::MAX_FAILS_IN_A_ROW {
+            return Err(format!(
+                "{fails_in_a_row} failures in a row: stopping so an outage can't sweep the sample; \
+                 check Ollama and data/desk/ta-logs, then run retro-run again"
+            ));
+        }
+    }
+    println!("all {total} signals answered: run retro-verdict");
+    Ok(())
+}
+
+/// Trial 12 so far: counts and ratings only (no outcomes before the verdict).
+fn retro_report() -> Result<(), String> {
+    use bmv_trader::desk::Status;
+    use bmv_trader::retro;
+    let home = config::home()?;
+    let picks = retro::read_sample(&home)?;
+    let done = retro::finals(&retro::read_rows(&home)?);
+    let mut by: BTreeMap<String, usize> = BTreeMap::new();
+    for s in done.values() {
+        let k = match s {
+            Status::Rated { rating, .. } => format!("{rating:?}"),
+            Status::Failed { .. } => "failed".into(),
+            other => format!("{other:?}"),
+        };
+        *by.entry(k).or_default() += 1;
+    }
+    println!(
+        "trial 12: {} of {} signals answered",
+        done.len(),
+        picks.len()
+    );
+    for (k, n) in by {
+        println!("  {k}: {n}");
+    }
+    Ok(())
+}
+
+/// Trial 12's verdict (DESIGN §7i): once, after every pick is answered; logged as trial 12.
+fn retro_verdict() -> Result<(), String> {
+    use bmv_trader::desk::{self, Scorecard, Status};
+    use bmv_trader::retro;
+    use bmv_trader::swing::Scored;
+    let (home, dir) = (config::home()?, data_dir()?);
+    let _lock = retro::lock(&home)?;
+    let log = dir.join("trials.jsonl");
+    if logged_trials(&log)?.iter().any(|t| t == retro::TRIAL_NAME) {
+        return Err("trial 12 is already logged".into());
+    }
+    let picks = retro::read_sample(&home)?;
+    let done = retro::finals(&retro::read_rows(&home)?);
+    let open = picks
+        .iter()
+        .filter(|p| !done.contains_key(&(p.date.clone(), p.symbol.clone())))
+        .count();
+    if open > 0 {
+        return Err(format!(
+            "{open} of {} signals have no answer yet: run retro-run",
+            picks.len()
+        ));
+    }
+    let cut_date = holdout_from(&dir, &[])?;
+    let (cal, names, days, _, _) = swing_days(&dir, &bmv_trader::swing::TRIAL_9, &cut_date)?;
+    let mut cards: Vec<Scorecard> = Vec::new();
+    let mut failed = 0;
+    for p in &picks {
+        let Some(Status::Rated { rating, .. }) = done.get(&(p.date.clone(), p.symbol.clone()))
+        else {
+            failed += 1;
+            continue;
+        };
+        let d = cal
+            .sessions
+            .iter()
+            .position(|s| *s == p.date)
+            .ok_or_else(|| format!("{} not in the calendar", p.date))?;
+        let c = days[d]
+            .iter()
+            .find(|c| names[c.symbol] == p.symbol)
+            .ok_or_else(|| format!("{} {}: the signal is gone from the bars", p.date, p.symbol))?;
+        cards.push(Scorecard {
+            date: p.date.clone(),
+            rank: 1,
+            symbol: p.symbol.clone(),
+            rating: *rating,
+            scored: Scored::Done {
+                r: c.out.r,
+                exit_date: cal.sessions[c.out.exit].clone(),
+            },
+        });
+    }
+    let share = failed as f64 / picks.len() as f64;
+    if share > retro::MAX_FAILED_SHARE {
+        return Err(format!(
+            "{failed} of {} signals failed ({:.0}%, over the pre-registered {:.0}%): trial 12 is void, not judged (DESIGN §7i)",
+            picks.len(),
+            share * 100.0,
+            retro::MAX_FAILED_SHARE * 100.0
+        ));
+    }
+    let gate = desk::verdict(&cards, retro::TRIAL_NUMBER);
+    let t = desk::tally(&cards);
+    let alpha = stats::FAMILY_ALPHA / retro::TRIAL_NUMBER as f64;
+    let trial = stats::Trial {
+        when: chrono::Utc::now().to_rfc3339(),
+        strategy: retro::TRIAL_NAME.into(),
+        params: format!(
+            "{} rated, {failed} failed; qwen3:30b-a3b both tiers; D in R; ci_low is D's one-sided bound at 1 - 0.05/12",
+            cards.len()
+        ),
+        period: format!(
+            "{}..{}",
+            picks.first().map_or("", |p| p.date.as_str()),
+            picks.last().map_or("", |p| p.date.as_str())
+        ),
+        trades: cards.len(),
+        expectancy_r: t.weighted.unwrap_or(0.0),
+        profit_factor: None,
+        max_drawdown_r: 0.0,
+        ci_low: desk::d_lower_bound(&cards, alpha, stats::resamples_for(alpha)),
+    };
+    stats::record_trial(&log, &trial)?;
+    println!(
+        "trial 12, {}: {} rated, {failed} failed",
+        retro::TRIAL_NAME,
+        cards.len()
+    );
+    println!(
+        "  mean R: all {:?}, approved {:?}, vetoed {:?}, AI-weighted {:?}; D {:?}",
+        t.mean_all, t.mean_approved, t.mean_vetoed, t.weighted, t.d
+    );
+    for c in &gate.checks {
+        println!(
+            "  [{}] {}: {}",
+            if c.passed { "pass" } else { "FAIL" },
+            c.name,
+            c.detail
+        );
+    }
+    println!(
+        "{}",
+        if gate.passed() {
+            "TRIAL 12 PASSED"
+        } else {
+            "trial 12 failed"
+        }
+    );
+    Ok(())
+}
+
 /// Trial 12's power gate (DESIGN §7i): research-period top signals only, never the untouched year.
 fn retro_power() -> Result<(), String> {
     use bmv_trader::retro;
@@ -1361,7 +1672,7 @@ fn desk_run() -> Result<(), String> {
                         "  analysing #{rank} {} (volume ratio {:.1})",
                         sig.symbol, sig.ratio
                     );
-                    desk::analyse(&home, k, &sig.symbol, &sig.date).0
+                    desk::analyse(&home, &desk::Analyst::Claude(k), &sig.symbol, &sig.date).0
                 }
             }
         };
@@ -1633,7 +1944,7 @@ fn desk_verdict() -> Result<(), String> {
         return Err("the sample's trades haven't all finished yet".into());
     }
     let t = desk::tally(&sample);
-    let gate = desk::verdict(&sample);
+    let gate = desk::verdict(&sample, desk::TRIAL_NUMBER);
     let alpha = stats::FAMILY_ALPHA / desk::TRIAL_NUMBER as f64;
     let trial = stats::Trial {
         when: chrono::Utc::now().to_rfc3339(),
@@ -1704,7 +2015,7 @@ fn desk_analyse(symbol: &str, date: &str) -> Result<(), String> {
         atr: 0.0,
     };
     // the spend is recorded before the answer is shown, so a failed write can't hide it
-    let (status, calls) = desk::analyse(&home, &key, symbol, date);
+    let (status, calls) = desk::analyse(&home, &desk::Analyst::Claude(&key), symbol, date);
     desk::record_manual(
         &home,
         &Analysis {

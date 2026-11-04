@@ -12,6 +12,8 @@ import sys
 
 QUICK_MODEL = "claude-haiku-5-5"
 DEEP_MODEL = "claude-sonnet-5-5"
+# trial 12 (DESIGN §7i): both tiers on the local model, via Ollama on loopback, no key
+LOCAL_MODEL = "qwen3:30b-a3b"
 SUMMARY_CHARS = 2000
 RESULT_PREFIX = "BMV_RESULT "
 # exit code for "Anthropic refused the request before any call was billed" (bad key, workspace)
@@ -51,11 +53,15 @@ def main():
             sys.exit(3)
     usage_file = os.environ["BMV_USAGE_FILE"]
     workspace = os.environ.get("BMV_ANTHROPIC_WORKSPACE_ID", "")
+    local = os.environ.get("BMV_ANALYST") == "local"
+    if local and any(k.startswith("ANTHROPIC") or k.startswith("BMV_ANTHROPIC") for k in os.environ):
+        sys.stderr.write("refusing to run: the local analyst must not see an Anthropic key\n")
+        sys.exit(3)
     out, sys.stdout = sys.stdout, sys.stderr
 
     import anthropic
 
-    if workspace:
+    if workspace and not local:
         # keys not scoped to a workspace need this header on every request
         for cls in (anthropic.Anthropic, anthropic.AsyncAnthropic):
             def with_workspace(init):
@@ -97,13 +103,14 @@ def main():
                     with open(usage_file, "a") as f:
                         f.write(json.dumps(call) + "\n")
 
+    provider = "ollama" if local else "anthropic"
     config = dict(DEFAULT_CONFIG)
     config.update({
-        "llm_provider": "anthropic",
-        "quick_think_llm": QUICK_MODEL,
-        "deep_think_llm": DEEP_MODEL,
-        "quick_think_provider": "anthropic",
-        "deep_think_provider": "anthropic",
+        "llm_provider": provider,
+        "quick_think_llm": LOCAL_MODEL if local else QUICK_MODEL,
+        "deep_think_llm": LOCAL_MODEL if local else DEEP_MODEL,
+        "quick_think_provider": provider,
+        "deep_think_provider": provider,
         "backend_url": None,
         "quick_think_backend_url": None,
         "deep_think_backend_url": None,
@@ -126,7 +133,7 @@ def main():
         status = next(
             (x.status_code for x in chain(e) if isinstance(x, anthropic.APIStatusError)), None
         )
-        if not usage.calls and status in (400, 401, 403):
+        if not local and not usage.calls and status in (400, 401, 403):
             sys.stderr.write(f"rejected by Anthropic (HTTP {status}) before any billed call\n")
             raise SystemExit(REJECTED) from e
         raise

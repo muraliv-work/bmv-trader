@@ -27,6 +27,10 @@ pub const TRIAL_NAME: &str = "ai-veto forward";
 /// The pinned sidecar (sidecars/tradingagents/requirements.txt).
 pub const TRADINGAGENTS_VERSION: &str = "0.7.1";
 const TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Trial 12's local analyst (DESIGN §7i), both tiers; its reasoning can't be turned off, so it
+/// gets longer.
+pub const LOCAL_MODEL: &str = "qwen3:30b-a3b";
+const LOCAL_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const SUMMARY_CHARS: usize = 2000;
 /// The most stdout read from the sidecar; its answer is one short line.
 const MAX_OUTPUT: u64 = 1 << 20;
@@ -106,14 +110,14 @@ pub fn call_cost(c: &Call) -> f64 {
 }
 
 /// A run must show real usage, only from the two pinned models, including the rating model.
-fn check_models(calls: &[Call]) -> Result<(), String> {
+fn check_models(calls: &[Call], (quick, deep): (&str, &str)) -> Result<(), String> {
     if let Some(c) = calls
         .iter()
-        .find(|c| !(c.model.starts_with(QUICK_MODEL) || c.model.starts_with(DEEP_MODEL)))
+        .find(|c| !(c.model.starts_with(quick) || c.model.starts_with(deep)))
     {
         return Err(format!("unexpected model {:?}", trim(&c.model)));
     }
-    if !calls.iter().any(|c| c.model.starts_with(DEEP_MODEL)) {
+    if !calls.iter().any(|c| c.model.starts_with(deep)) {
         return Err("no usage reported for the rating model".into());
     }
     Ok(())
@@ -183,7 +187,7 @@ pub fn signals_path(home: &Path, date: &str) -> PathBuf {
 
 /// Every line, in file order. A final line without its newline was cut off mid-write (the
 /// process died); it is dropped with a warning, since that run never finished.
-fn read_lines(path: &Path) -> Result<Vec<Analysis>, String> {
+pub(crate) fn read_lines(path: &Path) -> Result<Vec<Analysis>, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -233,7 +237,7 @@ pub fn read_analyses(home: &Path) -> Result<Vec<Analysis>, String> {
     Ok(latest(&read_lines(&analyses_path(home))?))
 }
 
-fn append(path: &Path, a: &Analysis) -> Result<(), String> {
+pub(crate) fn append(path: &Path, a: &Analysis) -> Result<(), String> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
     }
@@ -371,6 +375,16 @@ fn child_env(key: &str, workspace: Option<&str>, run: &Path) -> Vec<(&'static st
     env
 }
 
+/// The local analyst's environment: trial 10's without any Anthropic key, plus the mode switch.
+fn local_env(run: &Path) -> Vec<(&'static str, String)> {
+    let mut env: Vec<_> = child_env("", None, run)
+        .into_iter()
+        .filter(|(k, _)| *k != "ANTHROPIC_API_KEY")
+        .collect();
+    env.push(("BMV_ANALYST", "local".to_string()));
+    env
+}
+
 /// macOS sandbox for the sidecar (DECISION S23): it reads nothing in the user's home except its
 /// run folder, the sidecar and uv's Python; never the project, the Keychain or `security`; and
 /// writes only to its run folder (its HOME and TMPDIR). The network stays open: the analyst needs
@@ -409,9 +423,9 @@ fn sandbox_profile(project: &Path, sidecar: &Path, user_home: &Path, run: &Path)
 }
 
 /// The sidecar's verdict on `ticker` at `date`, or why there isn't one, with what it cost.
-pub fn analyse(home: &Path, key: &Credentials, ticker: &str, date: &str) -> (Status, Vec<Call>) {
-    let (result, calls) = run_sidecar(home, key, ticker, date);
-    let reported: f64 = calls.iter().map(call_cost).sum();
+pub fn analyse(home: &Path, analyst: &Analyst, ticker: &str, date: &str) -> (Status, Vec<Call>) {
+    let (result, calls) = run_sidecar(home, analyst, ticker, date);
+    let reported = analyst.cost(&calls);
     match result {
         Ok(out) => {
             // the answer's own usage is the full list; the file may lag it by nothing
@@ -420,8 +434,8 @@ pub fn analyse(home: &Path, key: &Credentials, ticker: &str, date: &str) -> (Sta
             } else {
                 out.usage.clone()
             };
-            let cost: f64 = calls.iter().map(call_cost).sum();
-            let status = match validate(&out, ticker, date, &calls) {
+            let cost = analyst.cost(&calls);
+            let status = match validate(&out, ticker, date, &calls, analyst.models()) {
                 Ok(rating) => Status::Rated {
                     rating,
                     summary: out.summary,
@@ -446,7 +460,7 @@ pub fn analyse(home: &Path, key: &Credentials, ticker: &str, date: &str) -> (Sta
         Err(Failure::Rejected(reason) | Failure::Other(reason)) => (
             Status::Failed {
                 reason,
-                cost_usd: if reported > 0.0 {
+                cost_usd: if reported > 0.0 || matches!(analyst, Analyst::Local) {
                     reported
                 } else {
                     DAILY_BUDGET_USD
@@ -457,7 +471,13 @@ pub fn analyse(home: &Path, key: &Credentials, ticker: &str, date: &str) -> (Sta
     }
 }
 
-fn validate(out: &SidecarOut, ticker: &str, date: &str, calls: &[Call]) -> Result<Rating, String> {
+fn validate(
+    out: &SidecarOut,
+    ticker: &str,
+    date: &str,
+    calls: &[Call],
+    models: (&str, &str),
+) -> Result<Rating, String> {
     if out.ticker != ticker || out.date != date {
         return Err(format!(
             "answer is for {} {}, asked {ticker} {date}",
@@ -474,7 +494,7 @@ fn validate(out: &SidecarOut, ticker: &str, date: &str, calls: &[Call]) -> Resul
             trim(&out.version)
         ));
     }
-    check_models(calls)?;
+    check_models(calls, models)?;
     Rating::parse(&out.rating).ok_or_else(|| format!("no usable rating: {:?}", trim(&out.rating)))
 }
 
@@ -526,9 +546,46 @@ pub struct Credentials {
     pub workspace: Option<String>,
 }
 
+/// Who rates a signal: Claude for trial 10, or the local model for trial 12 (DECISION S26).
+pub enum Analyst<'a> {
+    Claude(&'a Credentials),
+    Local,
+}
+
+impl Analyst<'_> {
+    /// (quick tier, deep tier that gives the rating)
+    fn models(&self) -> (&'static str, &'static str) {
+        match self {
+            Analyst::Claude(_) => (QUICK_MODEL, DEEP_MODEL),
+            Analyst::Local => (LOCAL_MODEL, LOCAL_MODEL),
+        }
+    }
+
+    fn cost(&self, calls: &[Call]) -> f64 {
+        match self {
+            Analyst::Claude(_) => calls.iter().map(call_cost).sum(),
+            Analyst::Local => 0.0,
+        }
+    }
+
+    fn timeout(&self) -> Duration {
+        match self {
+            Analyst::Claude(_) => TIMEOUT,
+            Analyst::Local => LOCAL_TIMEOUT,
+        }
+    }
+
+    fn env(&self, run: &Path) -> Vec<(&'static str, String)> {
+        match self {
+            Analyst::Claude(k) => child_env(&k.key, k.workspace.as_deref(), run),
+            Analyst::Local => local_env(run),
+        }
+    }
+}
+
 fn run_sidecar(
     home: &Path,
-    key: &Credentials,
+    analyst: &Analyst,
     ticker: &str,
     date: &str,
 ) -> (Result<SidecarOut, Failure>, Vec<Call>) {
@@ -543,7 +600,7 @@ fn run_sidecar(
         .join("ta")
         .join(format!("{date}-{ticker}-{}", std::process::id()));
     let usage_file = run.join("usage.jsonl");
-    let result = spawn_and_wait(home, key, ticker, date, &user_home, &run);
+    let result = spawn_and_wait(home, analyst, ticker, date, &user_home, &run);
     let calls = read_usage(&usage_file);
     let _ = std::fs::remove_dir_all(&run);
     (result, calls)
@@ -551,7 +608,7 @@ fn run_sidecar(
 
 fn spawn_and_wait(
     home: &Path,
-    key: &Credentials,
+    analyst: &Analyst,
     ticker: &str,
     date: &str,
     user_home: &Path,
@@ -591,7 +648,7 @@ fn spawn_and_wait(
         .arg(date)
         .current_dir(&run)
         .env_clear()
-        .envs(child_env(&key.key, key.workspace.as_deref(), &run))
+        .envs(analyst.env(&run))
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -608,9 +665,13 @@ fn spawn_and_wait(
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
-            Ok(None) if start.elapsed() > TIMEOUT => {
+            Ok(None) if start.elapsed() > analyst.timeout() => {
                 kill_group(&mut child);
-                return Err("timed out after 15 minutes".into());
+                return Err(format!(
+                    "timed out after {} minutes",
+                    analyst.timeout().as_secs() / 60
+                )
+                .into());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(500)),
             Err(e) => {
@@ -927,9 +988,10 @@ pub fn d_lower_bound(cards: &[Scorecard], alpha: f64, iters: usize) -> Option<f6
 }
 
 /// The trial 10 gate (DESIGN §7f), on the fixed sample once every trade in it has finished.
-pub fn verdict(sample: &[Scorecard]) -> stats::GateReport {
+/// The gate for trial 10, or for trial 12, which uses trial 10's rules at its own level.
+pub fn verdict(sample: &[Scorecard], trial: usize) -> stats::GateReport {
     let t = tally(sample);
-    let alpha = stats::FAMILY_ALPHA / TRIAL_NUMBER as f64;
+    let alpha = stats::FAMILY_ALPHA / trial as f64;
     let lo = d_lower_bound(sample, alpha, stats::resamples_for(alpha));
     let check = |name: &'static str, passed: bool, detail: String| stats::GateCheck {
         name,
@@ -942,7 +1004,7 @@ pub fn verdict(sample: &[Scorecard]) -> stats::GateReport {
                 "lower bound of D (AI-weighted minus plain mean R) > 0",
                 lo.is_some_and(|x| x > 0.0),
                 format!(
-                    "{} at {:.3}% one-sided, trial {TRIAL_NUMBER}",
+                    "{} at {:.3}% one-sided, trial {trial}",
                     lo.map_or("no bound".into(), |x| format!("{x:+.3}R")),
                     100.0 * (1.0 - alpha)
                 ),
@@ -985,11 +1047,24 @@ mod tests {
     fn sidecar_output_is_strict() {
         let o = out(OK).unwrap();
         assert_eq!(
-            validate(&o, "AAPL", "2026-11-03", &o.usage),
+            validate(
+                &o,
+                "AAPL",
+                "2026-11-03",
+                &o.usage,
+                (QUICK_MODEL, DEEP_MODEL)
+            ),
             Ok(Rating::Buy)
         );
         assert!(
-            validate(&o, "MSFT", "2026-11-03", &o.usage).is_err(),
+            validate(
+                &o,
+                "MSFT",
+                "2026-11-03",
+                &o.usage,
+                (QUICK_MODEL, DEEP_MODEL)
+            )
+            .is_err(),
             "wrong ticker"
         );
         let extra = OK.replace(r#""version""#, r#""size":10,"version""#);
@@ -1001,14 +1076,31 @@ mod tests {
         ] {
             let o = out(&OK.replace(from, to)).unwrap();
             assert!(
-                validate(&o, "AAPL", "2026-11-03", &o.usage).is_err(),
+                validate(
+                    &o,
+                    "AAPL",
+                    "2026-11-03",
+                    &o.usage,
+                    (QUICK_MODEL, DEEP_MODEL)
+                )
+                .is_err(),
                 "{why}"
             );
         }
         let o = out(OK).unwrap();
-        assert!(validate(&o, "AAPL", "2026-11-03", &[]).is_err(), "no usage");
         assert!(
-            validate(&o, "AAPL", "2026-11-03", &o.usage[..1]).is_err(),
+            validate(&o, "AAPL", "2026-11-03", &[], (QUICK_MODEL, DEEP_MODEL)).is_err(),
+            "no usage"
+        );
+        assert!(
+            validate(
+                &o,
+                "AAPL",
+                "2026-11-03",
+                &o.usage[..1],
+                (QUICK_MODEL, DEEP_MODEL)
+            )
+            .is_err(),
             "no rating-model call"
         );
         let long = OK.replace(
@@ -1016,7 +1108,16 @@ mod tests {
             &format!(r#""summary":"{}""#, "x".repeat(2001)),
         );
         let o = out(&long).unwrap();
-        assert!(validate(&o, "AAPL", "2026-11-03", &o.usage).is_err());
+        assert!(
+            validate(
+                &o,
+                "AAPL",
+                "2026-11-03",
+                &o.usage,
+                (QUICK_MODEL, DEEP_MODEL)
+            )
+            .is_err()
+        );
     }
 
     fn run(when: &str, cost: f64) -> Analysis {
@@ -1082,6 +1183,46 @@ mod tests {
             .map(|d| run(&format!("2026-11-{d:02}T17:30:00-05:00"), 3.3))
             .collect();
         assert!(over_budget(&month, "2026-11-30").is_some());
+    }
+
+    #[test]
+    fn the_local_analyst_gets_no_key_costs_nothing_and_checks_its_own_model() {
+        let env = local_env(Path::new("/tmp/run"));
+        assert!(
+            env.iter()
+                .all(|(k, _)| !k.starts_with("ANTHROPIC") && !k.starts_with("ALPACA"))
+        );
+        assert!(env.contains(&("BMV_ANALYST", "local".to_string())));
+        let local = Analyst::Local;
+        let used = [Call {
+            model: LOCAL_MODEL.into(),
+            input: 5000,
+            output: 9000,
+        }];
+        assert_eq!(local.cost(&used), 0.0);
+        assert!(check_models(&used, local.models()).is_ok());
+        assert!(
+            check_models(&used, (QUICK_MODEL, DEEP_MODEL)).is_err(),
+            "trial 10 refuses it"
+        );
+        let claude = [Call {
+            model: DEEP_MODEL.into(),
+            input: 1,
+            output: 1,
+        }];
+        assert!(
+            check_models(&claude, local.models()).is_err(),
+            "trial 12 refuses Claude"
+        );
+        assert!(local.timeout() > TIMEOUT);
+        let k = Credentials {
+            key: "k".into(),
+            workspace: None,
+        };
+        assert_eq!(
+            Analyst::Claude(&k).env(Path::new("/tmp/run")),
+            child_env("k", None, Path::new("/tmp/run"))
+        );
     }
 
     #[test]
@@ -1223,7 +1364,11 @@ mod tests {
         assert_eq!(t.done, 120);
         assert_eq!(t.mean_all, Some(0.0));
         assert_eq!((t.weighted, t.d), (Some(1.0), Some(1.0)));
-        assert!(verdict(&cards).passed(), "a perfect veto passes");
+        assert!(
+            verdict(&cards, TRIAL_NUMBER).passed(),
+            "a perfect veto passes"
+        );
+        assert!(verdict(&cards, 12).checks[0].detail.contains("trial 12"));
 
         let coin: Vec<Scorecard> = (0..120)
             .map(|i| {
@@ -1236,7 +1381,7 @@ mod tests {
             })
             .collect();
         assert!(
-            !verdict(&coin).passed(),
+            !verdict(&coin, TRIAL_NUMBER).passed(),
             "a veto unrelated to outcomes fails"
         );
         assert_eq!(tally(&[]).mean_all, None);

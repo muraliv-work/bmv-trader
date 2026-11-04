@@ -302,6 +302,11 @@ struct OllamaModel {
 }
 
 pub fn ollama_has_model(timeout: Duration) -> Result<String, String> {
+    ollama_has(LOCAL_MODEL, timeout)
+}
+
+/// Whether Ollama answers on loopback and has `model` pulled.
+pub fn ollama_has(model: &str, timeout: Duration) -> Result<String, String> {
     let tags: OllamaTags = client_within(timeout)?
         .get(format!("{OLLAMA}/api/tags"))
         .send()
@@ -311,9 +316,9 @@ pub fn ollama_has_model(timeout: Duration) -> Result<String, String> {
         .map_err(|e| format!("Ollama tags: {e}"))?;
     tags.models
         .iter()
-        .any(|m| m.name == LOCAL_MODEL || m.name.starts_with(&format!("{LOCAL_MODEL}-")))
-        .then(|| format!("{LOCAL_MODEL} present"))
-        .ok_or_else(|| format!("{LOCAL_MODEL} missing: run `ollama pull {LOCAL_MODEL}`"))
+        .any(|m| m.name == model || m.name.starts_with(&format!("{model}-")))
+        .then(|| format!("{model} present"))
+        .ok_or_else(|| format!("{model} missing: run `ollama pull {model}`"))
 }
 
 /// Ollama is up and has the local model; a tiny Tier-2 call through OmniRoute works.
