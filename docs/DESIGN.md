@@ -156,6 +156,50 @@ sequenceDiagram
 - **Journal before act:** an effect is written to the journal before it is executed. If the write fails, the engine halts entries.
 - **On startup and after any reconnect:** take a REST snapshot of positions, open orders and today's fills, then emit `Reconciled`, which replaces all broker-owned state.
 
+## 4b. Three-layer extension (planned 2026-11-03, owner approved)
+
+Three local services sit **above** the Rust engine. They can only propose; the engine alone can trade.
+
+```
+ Agents layer   paperclip (Node + Postgres, 127.0.0.1:3100)  schedules, human approvals, budgets, audit
+      │  wakes on a schedule (minutes, never in the order path)
+ Analyst layer  TradingAgents (Python sidecar)               a rating + thesis per ticker, as strict JSON
+      │  reads
+ Data layer     OpenBB API (127.0.0.1:6900) + Alpaca         earnings, FRED, SEC, ETF holdings | prices
+      │  proposals only: data/proposals/*.json
+ Rust engine    risk gate · broker · STOP · flatten · journal   the only process with Alpaca keys
+```
+
+| Layer | Source (`REFERENCE-REPOS/`, gitignored) | What we use | What we don't |
+|---|---|---|---|
+| Data | OpenBB v5 (Apache-2.0) | Earnings calendar and surprises (nasdaq), FRED macro, SEC fundamentals, ETF holdings, split/dividend calendars | Prices. v5 dropped the price vendors, and it has no delisted or point-in-time universe, so Alpaca stays the price source |
+| Analyst | TradingAgents (Apache-2.0) | The 5-level rating (Buy … Sell) and its thesis | Its entry, stop and size (LLM-invented); its final authority |
+| Agents | paperclip (MIT) | Cron routines, board approvals, per-agent budgets, the audit trail | Any order path or real-time decision; latency is ≥ 30 s |
+
+**Trust boundaries (each enforced in code or config, and tested):**
+1. **No sidecar sees broker keys.** Alpaca keys stay in the Keychain and are read only by the Rust binary. The sidecars run with a scrubbed environment.
+2. **One direction.** Sidecars write proposals to `data/proposals/`. The engine parses them strictly (unknown fields rejected) into the existing verdict type: approve, reduce or reject, so they can only shrink a rules candidate. A rating can never become an order by itself.
+3. **Claude only.** TradingAgents' deep and quick tiers are pinned to `anthropic` with the §10 model ids. Its social-post pre-screen (`TYPESAFE_API_KEY`) is off. paperclip agents use `claude_local` or a process adapter calling the Anthropic API. Free models stay out of the decision path (§2).
+4. **Untrusted text.** The social analyst (Reddit, StockTwits) is off until its text is delimited and capped like §3's news. News reaches prompts only inside `<untrusted_news>`.
+5. **Local only.**
+   - OpenBB binds to 127.0.0.1 with Basic auth on, because CORS defaults to `*`.
+   - paperclip runs in `local_trusted` mode on loopback with telemetry off (`PAPERCLIP_TELEMETRY_DISABLED=1`).
+   - Neither is exposed off the Mac.
+6. **Unknown means stop.** If a sidecar is down, slow or returns something unparseable, that is a reject, never a default approve.
+
+**Measuring the analyst:**
+- TradingAgents can't be backtested honestly, because the model already knows how past prices turned out (§13).
+- It is judged by a pre-registered **forward paper test**: daily ratings for a fixed list, scored over fixed horizons against SPY and a random baseline, logged in `trials.jsonl`.
+- A failed test means it gets no authority.
+- Acting on multi-day ratings needs overnight holds, which is a non-goal (§1) until that test passes.
+
+**Build order:**
+1. Data: an OpenBB sidecar plus a Rust client, first used for a deterministic "no new entry within 2 sessions of earnings" pre-check.
+2. Analyst: a TradingAgents sidecar, run Claude-only with JSON output and per-ticker cost measured first, then the forward test.
+3. Agents: paperclip routines for the pre-market run, end-of-day review and research proposals, with board approval for any strategy change.
+
+**Agent roles:** to be mapped from the owner's reference setup (a Grok trading-bot post) once its text is available. Every role still obeys the AI authority ladder (§10).
+
 ## 5. Components → files
 
 | Module | Responsibility |
