@@ -21,6 +21,7 @@ const USAGE: &str = "usage:
   bmv-trader momentum                     trial 7: 12-1 month momentum on the adjusted daily bars (DESIGN §13c)
   bmv-trader power                        the smallest effect trials 11 and 12 could detect (spreads from trial 7)
   bmv-trader lab-search [--minutes 5] [--seed 1]  evolve ranking formulas on the search months only (DESIGN §7h)
+  bmv-trader lab-ideas [--count 10]       ask the local model (Tier 2) for new formulas; the next lab-search starts from them
   bmv-trader desk-run                     trial 10 nightly (20 min after the close): live bars, signals, analyst ratings, scores
   bmv-trader desk-report                  trial 10 so far: signals, ratings, spend, outcomes
   bmv-trader desk-analyse --symbols X --date YYYY-MM-DD  one analyst run outside the trial (measures cost)
@@ -48,7 +49,7 @@ const MAX_SEEDS: usize = 50;
 
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
-const VALUE_FLAGS: [&str; 11] = [
+const VALUE_FLAGS: [&str; 12] = [
     "--date",
     "--trial",
     "--strategy",
@@ -60,6 +61,7 @@ const VALUE_FLAGS: [&str; 11] = [
     "--port",
     "--minutes",
     "--seed",
+    "--count",
 ];
 const SWITCHES: [&str; 7] = [
     "--adjusted",
@@ -178,6 +180,7 @@ fn main() {
             }
             Some("momentum") => momentum(),
             Some("power") => power(),
+            Some("lab-ideas") => lab_ideas(args.num("--count", 10, 1..=100)?),
             Some("lab-search") => lab_search(
                 args.num("--minutes", 5, 1..=600)?,
                 args.num("--seed", 1, 1..=1_000_000)? as u64,
@@ -494,6 +497,74 @@ fn append_jsonl<T: serde::Serialize>(path: &Path, rows: &[T]) -> Result<(), Stri
     }
     f.write_all(text.as_bytes())
         .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Local-model formula ideas (DESIGN §7h, DECISION S25). It sees the feature list and the best
+/// search-period formulas only; its reply is used only where a line parses as a formula.
+fn lab_ideas(count: usize) -> Result<(), String> {
+    use bmv_trader::lab::{self, Candidate, Expr};
+    use bmv_trader::llm::{self, Tier2Task};
+    let lab_dir = data_dir()?.join("lab");
+    if lab_dir.join("validated").exists() {
+        return Err("the lab has been validated: the search is closed (DESIGN §7h)".into());
+    }
+    let read = |name: &str| std::fs::read_to_string(lab_dir.join(name)).unwrap_or_default();
+    let mut tried: Vec<Candidate> = read("candidates.jsonl")
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    tried.sort_by(|a, b| b.stats.fitness.total_cmp(&a.stats.fitness));
+    let mut known: std::collections::HashSet<String> =
+        tried.iter().map(|c| c.key.clone()).collect();
+    for l in read("ideas.jsonl").lines() {
+        if let Ok(e) = Expr::parse(l) {
+            known.insert(e.key());
+        }
+    }
+    let mut facts = String::from("Features:\n");
+    for f in lab::FEATURES {
+        let name = serde_json::to_string(&f).map_err(|e| e.to_string())?;
+        facts.push_str(&format!("- {}: {}\n", name.trim_matches('"'), f.meaning()));
+    }
+    facts.push_str("\nBest formulas so far (search period; IC is the monthly rank correlation with next month's return):\n");
+    for c in tried.iter().take(10) {
+        facts.push_str(&format!(
+            "- {} (IC {:.3})\n",
+            serde_json::to_string(&c.expr).map_err(|e| e.to_string())?,
+            c.stats.ic_mean
+        ));
+    }
+    let (mut new, mut duplicate, mut rejected, mut calls) = (Vec::new(), 0, 0, 0);
+    while new.len() < count && calls < count.div_ceil(2) + 3 {
+        calls += 1;
+        let reply = match llm::complete(Tier2Task::LabIdea, &facts) {
+            Ok(n) => n.0,
+            Err(e) => {
+                eprintln!("call {calls}: {e}");
+                continue;
+            }
+        };
+        for line in reply.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            match Expr::parse(line) {
+                Ok(e) if known.insert(e.key()) => {
+                    println!("  new: {}", e.key());
+                    new.push(e);
+                }
+                Ok(_) => duplicate += 1,
+                Err(_) => rejected += 1,
+            }
+            if new.len() >= count {
+                break;
+            }
+        }
+    }
+    append_jsonl(&lab_dir.join("ideas.jsonl"), &new)?;
+    println!(
+        "{} new formulas from {calls} local-model calls ({duplicate} already known, {rejected} lines rejected); \
+         the next lab-search starts from them",
+        new.len()
+    );
+    Ok(())
 }
 
 /// Trial 11's search stage (DESIGN §7h): only months whose labels end before 2023 are loaded.

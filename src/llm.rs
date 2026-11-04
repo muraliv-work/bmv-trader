@@ -26,13 +26,16 @@ const OMNIROUTE_CLI: &str = "/opt/homebrew/bin/omniroute";
 /// Qwen3's switch for answering without a thinking block.
 const NO_THINK: &str = " /no_think";
 
-/// The four low-risk jobs. Each owns its fixed prompt; the facts are always computed by code.
+/// The low-risk jobs. Each owns its fixed prompt; the facts are always computed by code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier2Task {
     DeskBrief,
     AnalystDigest,
     SessionSummary,
     WeeklyDigest,
+    /// New ranking formulas for the lab (DESIGN §7h). The reply is untrusted: only lines that
+    /// parse as `lab::Expr` are used (DECISION S25).
+    LabIdea,
 }
 
 impl Tier2Task {
@@ -52,6 +55,16 @@ impl Tier2Task {
             Tier2Task::SessionSummary => {
                 "Summarize this paper-trading session for the owner in under 150 words: what \
                  happened, any halts or errors, and the result. Use only the facts below."
+            }
+            Tier2Task::LabIdea => {
+                "You propose stock-ranking formulas. A formula scores every US stock each month \
+                 from the features listed below; the highest scores are bought for a month. \
+                 Reply with up to 5 formulas, one per line, each a single JSON object and \
+                 nothing else: no prose, no numbering, no code fences. Grammar: \
+                 {\"feat\":NAME} | {\"rank\":F} | {\"neg\":F} | {\"add\":[F,F]} | \
+                 {\"sub\":[F,F]} | {\"mul\":[F,F]} | {\"div\":[F,F]}. At most 9 nodes and \
+                 depth 4. Use only the feature names given. Make each formula different from \
+                 the ones already tried, and prefer simple, economically sensible ideas."
             }
             Tier2Task::WeeklyDigest => {
                 "Write a weekly digest (under 250 words) of this research project from the facts \
