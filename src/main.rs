@@ -39,6 +39,9 @@ const USAGE: &str = "usage:
   bmv-trader llm-health                   check Ollama, OmniRoute, a Tier-2 probe, key age and Claude spend
   bmv-trader llm-rotate                   regenerate the OmniRoute key, store it, re-apply its policy
   bmv-trader llm-daily                    for launchd: llm-rotate, then llm-health
+  bmv-trader free-keys                    rotate the free cloud models' OpenRouter key if due, retire old ones (S42)
+  bmv-trader free-keys --record PROVIDER  log a key pasted with scripts/free-key-add.sh, for its expiry
+  bmv-trader free-keys --connection PROVIDER  a pasted provider's OmniRoute connection, and new|existing
   bmv-trader asset-names                  Alpaca's name for each universe symbol (for trial 9's fund filter)
   bmv-trader backtest-swing --trial 8|9   the Desk Signal swing strategy on the adjusted daily bars (DESIGN §7d, §7e)
   bmv-trader scan     --from YYYY-MM-DD --to YYYY-MM-DD   each day's gappers, and their minute bars
@@ -58,7 +61,7 @@ const MAX_SEEDS: usize = 50;
 
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
-const VALUE_FLAGS: [&str; 13] = [
+const VALUE_FLAGS: [&str; 15] = [
     "--date",
     "--trial",
     "--strategy",
@@ -72,6 +75,8 @@ const VALUE_FLAGS: [&str; 13] = [
     "--seed",
     "--count",
     "--hours",
+    "--record",
+    "--connection",
 ];
 const SWITCHES: [&str; 7] = [
     "--adjusted",
@@ -220,6 +225,7 @@ fn main() {
             Some("notes") => notes(),
             Some("llm-health") => llm_health().map(|_| ()),
             Some("llm-rotate") => llm_rotate(),
+            Some("free-keys") => free_keys(args.get("--record"), args.get("--connection")),
             Some("llm-daily") => {
                 let rotated = llm_rotate();
                 if let Err(e) = &rotated {
@@ -2463,6 +2469,76 @@ fn rotate_error_path(home: &Path) -> std::path::PathBuf {
     home.join("data").join("llm_rotate_error.json")
 }
 
+/// The free cloud models' key lifecycle (S42): with no argument, one OpenRouter pass; with
+/// `--record PROVIDER`, logs a pasted key; with `--connection PROVIDER`, prints that provider's
+/// OmniRoute connection and whether OmniRoute has it yet (for scripts/free-key-add.sh).
+fn free_keys(record: Option<&str>, connection: Option<&str>) -> Result<(), String> {
+    use bmv_trader::free_keys::{self, Config, KeyApi};
+    let home = config::home()?;
+    let cfg = Config::load(&home)?;
+    let log = free_keys::log_path(&home);
+    if let Some(p) = record {
+        println!(
+            "{}",
+            free_keys::record_pasted(&cfg, &log, p, chrono::Utc::now())?
+        );
+        return Ok(());
+    }
+    let user_home = std::path::PathBuf::from(std::env::var("HOME").map_err(|_| "HOME is not set")?);
+    if let Some(p) = connection {
+        let conn = free_keys::pasted_connection(&cfg, p)?;
+        let listed = bmv_trader::llm::run_cli(&bmv_trader::llm::cli_call(
+            &user_home,
+            &["providers", "list", "--output", "json"],
+        ))?;
+        let exists = free_keys::listed_has(&listed, &conn)?;
+        println!("{conn} {}", if exists { "existing" } else { "new" });
+        return Ok(());
+    }
+    let (http, mgmt) = free_keys::openrouter_api()?;
+    let create = |name: &str, limit: f64, expires: &str| {
+        free_keys::openrouter_create(&http, &mgmt, name, limit, expires)
+    };
+    let delete = |hash: &str| free_keys::openrouter_delete(&http, &mgmt, hash);
+    let list = || free_keys::openrouter_list(&http, &mgmt);
+    // the key reaches OmniRoute in this one child's environment, never its arguments; `rotate`
+    // runs OmniRoute's own connectivity test before it reports success
+    let handover = |connection: &str, value: &str| {
+        let mut c = bmv_trader::llm::cli_call(
+            &user_home,
+            &[
+                "providers",
+                "rotate",
+                connection,
+                "--from-env",
+                free_keys::NEW_KEY_VAR,
+                "--yes",
+            ],
+        );
+        c.env.push((free_keys::NEW_KEY_VAR, value.to_string()));
+        bmv_trader::llm::run_cli(&c).map(|_| ())
+    };
+    let test = |connection: &str| {
+        bmv_trader::llm::run_cli(&bmv_trader::llm::cli_call(
+            &user_home,
+            &["providers", "test", connection],
+        ))
+        .map(|_| ())
+    };
+    let api = KeyApi {
+        create: &create,
+        delete: &delete,
+        list: &list,
+    };
+    let omni = free_keys::OmniRoute {
+        handover: &handover,
+        test: &test,
+    };
+    let done = free_keys::run_openrouter(&cfg, &log, chrono::Utc::now(), &api, &omni)?;
+    println!("free keys: {done}");
+    Ok(())
+}
+
 /// Daily OmniRoute key rotation (DECISION S22). No Tier-2 call can be in flight: it holds the
 /// desk and notes locks.
 fn llm_rotate() -> Result<(), String> {
@@ -2565,6 +2641,22 @@ fn llm_health() -> Result<bool, String> {
             }
         }),
     ));
+    match bmv_trader::free_keys::Config::load(&home) {
+        Ok(cfg) => {
+            let events = bmv_trader::free_keys::read_log(&bmv_trader::free_keys::log_path(&home));
+            match events {
+                Ok(ev) => {
+                    for (label, line) in
+                        bmv_trader::free_keys::health(&cfg, &ev, chrono::Utc::now())
+                    {
+                        checks.push(Check::of(&label, line));
+                    }
+                }
+                Err(e) => checks.push(Check::of("free keys log", Err(e))),
+            }
+        }
+        Err(e) => checks.push(Check::of("free keys config", Err(e))),
+    }
     checks.push(Check::of(
         "Claude keys rotated within 35 days",
         keys_age(&home.join("data").join("keys_rotated.json")),

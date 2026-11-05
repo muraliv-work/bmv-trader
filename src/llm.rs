@@ -801,7 +801,7 @@ pub fn omniroute_control(user_home: &Path, args: &[&str]) -> Result<(), String> 
 }
 
 /// Runs the CLI with a time limit; stdout is returned to the caller and never printed.
-fn run_cli(call: &CliCall) -> Result<String, String> {
+pub fn run_cli(call: &CliCall) -> Result<String, String> {
     let mut child = Command::new(call.program)
         .args(&call.args)
         .current_dir(&call.dir)

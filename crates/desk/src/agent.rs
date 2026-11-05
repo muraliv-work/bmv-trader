@@ -167,8 +167,12 @@ struct Model {
 #[serde(deny_unknown_fields)]
 struct Models {
     agents: BTreeMap<String, Model>,
+    // read and checked by the engine (`bmv_trader::llm`, `bmv_trader::free_keys`), not here
     #[allow(dead_code)]
     engine: Value,
+    #[allow(dead_code)]
+    #[serde(default)]
+    free_keys: Option<Value>,
 }
 
 /// The fields that live in the models file, never the agents file.

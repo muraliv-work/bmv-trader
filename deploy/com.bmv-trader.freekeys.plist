@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Free cloud models' keys (DECISION S42): every 6 hours, rotate the OpenRouter key when it is due (rotate_every_hours in deploy/models.json) and retire old ones. Key values go only to OmniRoute's encrypted store. Install: deploy/README.md -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bmv-trader.freekeys</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/target/release/bmv-trader</string>
+    <string>free-keys</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BMV_HOME</key>
+    <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>21600</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/data/free_keys.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/data/free_keys.log</string>
+</dict>
+</plist>

@@ -8,5 +8,11 @@
   "engine": {
     "notes":     { "claude": true,  "claude_model": "claude-haiku-5-5", "free_model": null,       "budget_usd": "2" },
     "lab_ideas": { "claude": false, "claude_model": "claude-haiku-5-5", "free_model": "bmv-free", "budget_usd": "1" }
+  },
+  "free_keys": {
+    "rotate_every_hours": 168,
+    "providers": {
+      "openrouter": { "connection": "openrouter-free", "auto": true, "credit_limit_usd": 0 }
+    }
   }
 }

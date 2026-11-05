@@ -385,6 +385,24 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
     - **It proves each key** before it replaces the old one: a new key goes to a temporary Keychain item, is tested with a free call to the models list, and only then becomes the real one. A failed agent list stops the script, and a step that stopped halfway can be resumed. Each key's date goes in `data/keys_rotated.json`, and the health check uses the older one.
     - **Old keys** are disabled by hand in the Console: Anthropic keys can't be created by API, and the script holds no Admin key.
   - **Reminders:** the health check warns after 35 days, and `deploy/com.bmv-trader.monthly.plist` posts a notification on the 1st.
+- **S42: the free cloud models' keys.**
+  - **`bmv-trader free-keys`** (launchd `com.bmv-trader.freekeys`, every 6 hours) rotates the OpenRouter key when it is due (`free_keys.rotate_every_hours` in `deploy/models.json`):
+    1. It creates `bmv-free-<date>` through OpenRouter's key API, with the management key from the Keychain (`bmv-trader` / `OPENROUTER_MANAGEMENT_KEY`). The new key has a credit cap (default $0, so it can only use free models) and an expiry a week past its rotation date.
+    2. It hands the key to OmniRoute (`providers rotate --from-env`, in one child's environment), and OmniRoute tests it.
+    3. Only after the test passes is the old key deleted. On any failure the new key is deleted and the old one stays.
+    - **Every pass also deletes** any key it made that isn't in use, and a disabled one in use. Keys others made are never touched.
+  - **Providers with no key API** (Groq, Google AI Studio) are added or replaced with `scripts/free-key-add.sh <provider>` (hidden prompt; stdin or a child's environment, never argv), and logged with their `expires_days`.
+  - **Records:** key values live only in OmniRoute's encrypted store. `data/free_keys.jsonl` is an append-only event log of metadata (provider, connection, key id, created, active, retired, failed, expiry); a key's state is its latest event.
+  - **Health:** the daily check shows each provider's key: days left, expired, or a failed rotation.
+  - **Load balancing** is OmniRoute's `bmv-free` combo, across providers.
+  - **Not built:** keys or accounts made to get more free capacity. OpenRouter says extra keys don't change its limits, and free tiers forbid getting around their quotas.
+  - **Safety on failure:**
+    - One pass runs at a time (`data/free_keys.lock`).
+    - Cleanup deletes only keys this job's own log says it created, never one still pending: created, with the handover's outcome unrecorded. A pending key forces the next pass to rotate again, which repairs it.
+    - Every failure is logged as Failed, and the health check shows it, as well as a rotation that is overdue.
+    - After a refused handover, the connection is tested again, so a dead key in OmniRoute can't go unnoticed.
+    - OmniRoute's own output never goes into the log, in case it echoes part of a key.
+  - **Still open:** whether OpenRouter lets a $0-cap key use free models is checked by the first rotation. If not, OmniRoute's test fails, the new key is deleted, and `credit_limit_usd` needs a small value. OmniRoute's own usage and quota numbers aren't in the health check yet.
 - **Part 5, the signers' dry run (2026-11-05).** One heartbeat each, by hand, while trial 12 ran.
   - **Both succeeded:** Validator $0.0071 and Stress Lead $0.0070, 2 turns each. Each ran as its own user through its sudo rule, the desk accepted its token, the reply model matched the pin, and each call was charged to the desk and reported to Paperclip priced.
   - **Fail-closed checks seen on the way:** a missing keys file, and no desk budget that month. Both stopped the run before any paid call.

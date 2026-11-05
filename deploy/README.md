@@ -138,6 +138,16 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.monthly.p
 
 - **Ollama is only for local replay trials:** `brew services start ollama` before one and
   `brew services stop ollama` after. Nothing else needs it.
+- **Free cloud models' keys (S42):**
+  - **OpenRouter:** make a management key at openrouter.ai/settings/management-keys, with an expiry such as 90 days. Store it with `security add-generic-password -s bmv-trader -a OPENROUTER_MANAGEMENT_KEY -w`. Add an OpenRouter connection named `openrouter-free` in OmniRoute, then run `target/release/bmv-trader free-keys` once and install the job:
+
+```sh
+cp deploy/com.bmv-trader.freekeys.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.freekeys.plist
+```
+
+  - **Others** (Groq, Google AI Studio): add each to `free_keys.providers` in `deploy/models.json` with `"auto": false` and `expires_days`, then run `scripts/free-key-add.sh <provider>`. The health check says when to replace it.
+  - **Put every connection in the `bmv-free` combo** in OmniRoute's dashboard.
 - **Agent keys files written before S41** hold only one model key. Give one its OmniRoute key, so
   its switch can flip to free, with `scripts/clip-key-swap.sh <agent> omniroute`, which keeps its
   desk token. Signers never get one.
