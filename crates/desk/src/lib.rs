@@ -2,6 +2,7 @@
 //! lifecycle, the hash-chained audit log, and the store that enforces them. Agents act only through
 //! this; Paperclip schedules them but can't open a gate. Nothing here places an order.
 
+pub mod agent;
 pub mod api;
 pub mod audit;
 pub mod lifecycle;

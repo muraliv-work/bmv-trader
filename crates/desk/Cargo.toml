@@ -10,6 +10,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 # verifies the owner's Secure Enclave (Touch ID) signatures
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# desk-agent: the model call (already in the workspace, same version and features)
+reqwest = { version = "0.13.5", features = ["blocking", "json"] }
 rust_decimal = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

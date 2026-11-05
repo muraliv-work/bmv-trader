@@ -339,6 +339,14 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
 - **Schedule:** the Validator and Stress Lead wake only when a strategy reaches their gate; Head of Desk daily at 16:30 ET; Researcher daily. Switched on after trial 12 ends.
 - **Part 1 as built: the server's limits.** At most 32 connections at once (the rest wait in the backlog). A request gets 5 s, then a 503 and its transaction rolls back. A connection that moves no bytes for 10 s is closed, and none lives past 15 s. Still open: a local process that keeps reconnecting can fill all 32 slots; the fix would be a reserved path (a Unix socket) for the owner and the engine.
 
+- **Part 2 as built: the runner (`desk::agent`, `desk-agent`).**
+  - `desk-agent CHARTER SECRETS` runs one heartbeat. The charter (role prompt, task, provider, pinned model, tools, max tokens and turns) must not be writable by the agent's user; the secrets file (desk token, and the Anthropic or OmniRoute key) must be readable by it only.
+  - The model is offered only the charter's tools, through the same code `desk-mcp` uses; any other tool it names is refused before the desk. A free model is never offered `sign`. Tool results are capped at 20,000 characters.
+  - Before each paid call the runner checks the desk budget covers the worst case (the whole request as input, every allowed output token). After it, the actual cost is charged to the desk (`POST /v1/budget/charge`, at most $10, the caller's own budget only), before anything else is read from the reply. A reply with no usage is booked at the worst case.
+  - A reply from another model, an early stop (`max_tokens`, a refusal), a malformed reply, or running out of turns fails the run (exit 1), so Paperclip shows it as failed.
+  - Each call's usage goes to Paperclip's cost events, only on a plain-HTTP loopback URL. The client follows no redirects and uses no proxy.
+  - **Still open:** the desk can't tell which model made a `sign` call, so A5 rests on the runner and the charter (a signer's token must only ever be in a signer's secrets). A call that fails after it was sent isn't charged. Two runs of one agent at once could overspend by one call each; Paperclip runs one at a time per agent.
+
 ### Step 3 as built: run hashes and the stress battery
 - **`bmv-trader stress-battery`** re-runs every finished trial twice through the same code as `trial-autopsy`.
   - Each run gets an inputs hash (trial, parameters, period, cost and a data fingerprint) and a results hash (every row's date, exact value and exit).

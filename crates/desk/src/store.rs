@@ -585,6 +585,57 @@ impl Store {
         Ok(())
     }
 
+    /// This month's (limit, spent), if the agent has a budget.
+    pub async fn budget(&self, agent_id: &str) -> Result<Option<(Decimal, Decimal)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT limit_usd, spent_usd FROM budgets WHERE agent_id = ? AND month = ?",
+        )
+        .bind(agent_id)
+        .bind(month())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(l, s)| Ok((dec(&l)?, dec(&s)?))).transpose()
+    }
+
+    /// Records what a model call actually cost, after it: always recorded, even past the limit,
+    /// so the books are exact. The runner checks the room before each call (`budget`), and
+    /// `authorize` blocks an agent once it's over. An agent with no budget can't be charged.
+    pub async fn charge(&self, agent_id: &str, cost: Decimal) -> Result<()> {
+        if cost < Decimal::ZERO {
+            return Err(DeskError::Denied("a cost can't be negative".into()));
+        }
+        let m = month();
+        let mut tx = self.pool.begin().await?;
+        let spent: Option<(String,)> =
+            sqlx::query_as("SELECT spent_usd FROM budgets WHERE agent_id = ? AND month = ?")
+                .bind(agent_id)
+                .bind(&m)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let (spent,) = spent
+            .ok_or_else(|| DeskError::Budget(format!("{agent_id} has no budget this month")))?;
+        sqlx::query("UPDATE budgets SET spent_usd = ? WHERE agent_id = ? AND month = ?")
+            .bind(
+                dec(&spent)?
+                    .checked_add(cost)
+                    .ok_or_else(|| DeskError::Denied("that charge overflows".into()))?
+                    .to_string(),
+            )
+            .bind(agent_id)
+            .bind(&m)
+            .execute(&mut *tx)
+            .await?;
+        append(
+            &mut tx,
+            agent_id,
+            "charge",
+            json!({"usd": cost.to_string(), "month": m}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// A Researcher's hypothesis becomes a strategy in IDEA.
     pub async fn create_strategy(&self, researcher: &str, name: &str) -> Result<i64> {
         plain("strategy name", name)?;
@@ -1707,6 +1758,31 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_charge_is_always_booked_and_then_blocks() {
+        let s = desk().await;
+        assert_eq!(s.budget("val-1").await.unwrap(), None);
+        assert!(
+            s.charge("val-1", d("0.01")).await.is_err(),
+            "no budget, no charge"
+        );
+        s.set_budget("board", "val-1", d("1.00"), proof())
+            .await
+            .unwrap();
+        s.charge("val-1", d("0.70")).await.unwrap();
+        // past the limit: still booked, so the books are exact
+        s.charge("val-1", d("0.70")).await.unwrap();
+        assert_eq!(
+            s.budget("val-1").await.unwrap(),
+            Some((d("1.00"), d("1.40")))
+        );
+        assert!(s.charge("val-1", d("-1")).await.is_err(), "no refunds");
+        assert!(matches!(
+            s.authorize("val-1", Action::RunOfficialBacktest).await,
+            Err(DeskError::Budget(_))
+        ));
     }
 
     #[tokio::test]

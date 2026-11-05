@@ -424,6 +424,7 @@ dependencies = [
  "axum",
  "chrono",
  "p256",
+ "reqwest",
  "rust_decimal",
  "serde",
  "serde_json",

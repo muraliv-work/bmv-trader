@@ -229,6 +229,36 @@ async fn halt(Ctx(s): Desk, h: HeaderMap, Path(id): Path<i64>, Json(b): Json<Hal
     Ok(Json(json!({"ok": true})))
 }
 
+/// The caller's own budget this month; an agent sees only its own.
+async fn budget(Ctx(s): Desk, h: HeaderMap) -> Reply {
+    let agent = caller(&s, &h).await?;
+    let (limit, spent) = s
+        .budget(&agent)
+        .await?
+        .ok_or_else(|| DeskError::Budget(format!("{agent} has no budget this month")))?;
+    Ok(Json(
+        json!({"limit_usd": limit.to_string(), "spent_usd": spent.to_string()}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Charge {
+    usd: String,
+}
+
+/// The runner records what a model call cost, against the caller's own budget only.
+async fn charge(Ctx(s): Desk, h: HeaderMap, Json(b): Json<Charge>) -> Reply {
+    let agent = caller(&s, &h).await?;
+    let usd = Decimal::from_str(&b.usd).map_err(|_| denied("usd isn't a decimal amount"))?;
+    // one model call never costs this much; a bigger figure is a bug, not a cost
+    if usd > Decimal::from(10) {
+        return Err(denied("a single charge is at most $10"));
+    }
+    s.charge(&agent, usd).await?;
+    Ok(Json(json!({"ok": true})))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Limit {
@@ -299,6 +329,8 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/v1/strategies/{id}/sign", post(sign))
         .route("/v1/strategies/{id}/halt", post(halt))
         .route("/v1/strategies/{id}/limits", get(limits).post(limit))
+        .route("/v1/budget", get(budget))
+        .route("/v1/budget/charge", post(charge))
         .route("/v1/owner/requests", get(pending).post(request))
         .route("/v1/owner/requests/{id}/approve", post(approve))
         .route("/v1/audit/verify", get(verify))
@@ -708,6 +740,56 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("researcher")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_runner_works_against_a_real_desk() {
+        use crate::agent::{Charter, run};
+        let (addr, store) = up().await;
+        store
+            .add_agent(
+                "board",
+                "val-1",
+                Role::Validator,
+                Some(HumanProof::for_test()),
+            )
+            .await
+            .unwrap();
+        let d = rust_decimal::Decimal::from_str;
+        store
+            .set_budget("board", "val-1", d("1").unwrap(), HumanProof::for_test())
+            .await
+            .unwrap();
+        let token = store.issue_token("val-1").await.unwrap();
+        let charter = Charter::parse(
+            &json!({"agent": "val-1", "provider": "anthropic", "model": "claude-sonnet-5-5",
+                    "prompt": "p", "task": "t", "tools": ["list_strategies"]})
+            .to_string(),
+        )
+        .unwrap();
+        let out = tokio::task::spawn_blocking(move || {
+            let desk = |m: &str, p: &str, b: Option<&Value>| call(&addr, m, p, Some(&token), b);
+            let replies = std::cell::RefCell::new(vec![
+                json!({"model": "claude-sonnet-5-5", "stop_reason": "tool_use",
+                       "usage": {"input_tokens": 1000, "output_tokens": 0},
+                       "content": [{"type": "tool_use", "id": "t1", "name": "list_strategies", "input": {}}]}),
+                json!({"model": "claude-sonnet-5-5", "stop_reason": "end_turn",
+                       "usage": {"input_tokens": 1000, "output_tokens": 0},
+                       "content": [{"type": "text", "text": "none yet"}]}),
+            ]);
+            let post = |_: &Value| Ok(replies.borrow_mut().remove(0));
+            run(&charter, &desk, &post, &mut |_| {})
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.text, "none yet");
+        assert_eq!(out.tools, ["list_strategies"]);
+        // 2 calls x 1000 input tokens at $2/M, booked on the desk
+        assert_eq!(
+            store.budget("val-1").await.unwrap(),
+            Some((d("1").unwrap(), d("0.004").unwrap()))
         );
     }
 }
