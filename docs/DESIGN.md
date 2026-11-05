@@ -426,7 +426,7 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   1. **The evidence tool,** so the signers can read each strategy's criteria, reproduction hashes, stress results and deflated Sharpe. It comes with the date in each heartbeat.
   2. **Wave 2: the Strategist and Developer,** so ideas become strategies that code can test.
   3. **The recommendation:** the Head of Desk ranks the strategies that passed both signers and proposes one, with a capital amount inside the owner's caps.
-  4. **The approval pack** (step 7): one page with the recommendation, code-computed evidence, both sign-offs, dissent and risks, approved or rejected with Touch ID.
+  4. **The approval pack** (step 7, S47): shown and signed in `desk sign`: the recommendation, code-computed evidence and its hash, both sign-offs, dissent, risks and caps, approved or rejected with Touch ID.
   - **The owner's caps** (capital per strategy, daily loss, position size) are set once, loosened only with Touch ID, and enforced by the risk gate on every order.
 - **Part 5, the signers' dry run (2026-11-05).** One heartbeat each, by hand, while trial 12 ran.
   - **Both succeeded:** Validator $0.0071 and Stress Lead $0.0070, 2 turns each. Each ran as its own user through its sudo rule, the desk accepted its token, the reply model matched the pin, and each call was charged to the desk and reported to Paperclip priced.
@@ -477,7 +477,7 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
 4. Risk and execution, paper only: wrap `risk::gate` and the engine; add a drawdown auto-halt and a ticker allow-list.
 5. Paperclip company config, wave 1.
 6. Ops: reconciliation every 15 minutes, a halt that cancels orders within 5 s (tested with a mock broker), and the daily report.
-7. Dashboard: the pipeline board, the approval pack with its dissent section, halts, budgets, and audit verification.
+7. The approval pack in `desk sign`, and one read-only desk page in the console (pipeline, halts, budgets, audit result, keys), fed by a cached snapshot, with no npm (S47).
 
 The 30 November feedback report draws on whatever exists by then: trial 12, the stress battery, deflated Sharpe, the cost check.
 
