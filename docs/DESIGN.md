@@ -356,7 +356,7 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - **Still open:**
     - **All agents share one user,** so any agent's process can read every keys file. A compromised Paperclip could hand the Validator's desk token to a run that uses a free model. The OS doesn't separate agents; the charters and the runner do. Fix: a separate user for each signer, decided in part 4.
     - **The network check is a snapshot** 30 s after start. Once agents call Anthropic, only a per-user firewall rule (loopback and `api.anthropic.com`) would limit where keys could go.
-    - **Sign-up stays open** until the owner's login exists (Paperclip refuses the first account otherwise); part 4 closes it.
+    - **Sign-up stays open** until the owner's login exists (Paperclip refuses the first account otherwise); `sudo scripts/clip-close-signup.sh` then closes it.
     - **The tree hash protects against a changed build folder, not changed scripts.** Root runs `clip-setup.sh` from the repo, which the owner's user can edit. `desk-setup.sh` has the same pattern, and still logs into `bmvdesk`'s own folder.
     - **Upgrades:** a Paperclip version that moves Postgres to a new major version needs a dump and restore.
 
