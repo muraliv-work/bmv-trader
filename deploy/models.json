@@ -1,8 +1,8 @@
 {
   "models": {
-    "hod-1": { "provider": "anthropic", "model": "claude-haiku-5-5", "budget_usd": "2" },
-    "res-1": { "provider": "anthropic", "model": "claude-haiku-5-5", "budget_usd": "2" },
-    "val-1": { "provider": "anthropic", "model": "claude-sonnet-5-5", "budget_usd": "35" },
-    "stress-1": { "provider": "anthropic", "model": "claude-sonnet-5-5", "budget_usd": "25" }
+    "hod-1": { "provider": "anthropic", "model": "claude-haiku-5-5", "budget_usd": "1" },
+    "res-1": { "provider": "anthropic", "model": "claude-sonnet-5-5", "budget_usd": "3" },
+    "val-1": { "provider": "anthropic", "model": "claude-sonnet-5-5", "budget_usd": "5" },
+    "stress-1": { "provider": "anthropic", "model": "claude-sonnet-5-5", "budget_usd": "5" }
   }
 }
