@@ -2489,6 +2489,33 @@ fn llm_rotate() -> Result<(), String> {
 
 /// Tier 1 and Tier 2 health, always written to data/llm_health.json (a check that can't run
 /// is a failing check). Returns whether all checks pass.
+/// The older of the two Claude keys' rotation dates, which scripts/rotate-keys.sh records per key
+/// (S41): `{"engine": RFC 3339, "desk": RFC 3339}`.
+fn keys_age(path: &std::path::Path) -> Result<String, String> {
+    if !path.exists() {
+        return Err("never recorded: run scripts/rotate-keys.sh".into());
+    }
+    let dates: std::collections::BTreeMap<String, String> = history::read_json(path)?;
+    let mut oldest = i64::MIN;
+    for key in ["engine", "desk"] {
+        let t = dates.get(key).ok_or_else(|| {
+            format!("the {key} key was never rotated: run scripts/rotate-keys.sh")
+        })?;
+        let t = chrono::DateTime::parse_from_rfc3339(t)
+            .map_err(|e| format!("keys_rotated.json, {key}: {e}"))?;
+        let days = (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_days();
+        if days < 0 {
+            return Err(format!("keys_rotated.json, {key}: a date in the future"));
+        }
+        oldest = oldest.max(days);
+    }
+    if oldest <= 35 {
+        Ok(format!("{oldest} days ago"))
+    } else {
+        Err(format!("{oldest} days ago: run scripts/rotate-keys.sh"))
+    }
+}
+
 fn llm_health() -> Result<bool, String> {
     use bmv_trader::llm::{self, Check, Health};
     let home = config::home()?;
@@ -2522,11 +2549,13 @@ fn llm_health() -> Result<bool, String> {
     ));
     let today = et_now().date_naive().to_string();
     checks.push(Check::of(
-        "Claude (Tier 1) spend under the monthly cap",
+        "Claude spend (trial 10 and Tier 2) under the monthly cap",
         bmv_trader::desk::all_runs(&home).and_then(|runs| {
-            let (_, month) = bmv_trader::desk::spent(&runs, &today);
+            let (_, trial) = bmv_trader::desk::spent(&runs, &today);
+            let tier2 = llm::month_spend(&llm::spend_path(&home), None)?;
+            let month = trial + tier2;
             let line = format!(
-                "${month:.2} of ${:.0} this month",
+                "${month:.2} of ${:.0} this month (trial 10 ${trial:.2}, Tier 2 ${tier2:.2})",
                 bmv_trader::desk::MONTHLY_BUDGET_USD
             );
             if month < bmv_trader::desk::MONTHLY_BUDGET_USD {
@@ -2535,6 +2564,10 @@ fn llm_health() -> Result<bool, String> {
                 Err(line)
             }
         }),
+    ));
+    checks.push(Check::of(
+        "Claude keys rotated within 35 days",
+        keys_age(&home.join("data").join("keys_rotated.json")),
     ));
     let h = Health {
         when: chrono::Utc::now().to_rfc3339(),

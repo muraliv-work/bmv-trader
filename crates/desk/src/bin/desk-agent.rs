@@ -6,8 +6,9 @@
 //! - AGENTS: the owner's agents file (`desk::agent::Agents`), read with `models.json` from the same
 //!   folder, which names each agent's provider, model and budget. Neither may be writable by the
 //!   agent: owned by another user, and not group- or world-writable.
-//! - SECRETS: `{"desk_token": "...", "anthropic_key": "..."}` (or `"omniroute_key"` for the local
-//!   route), owned by the agent's user and readable by it only.
+//! - SECRETS: `{"desk_token": "...", "anthropic_key": "...", "omniroute_key": "..."}`, owned by the
+//!   agent's user and readable by it only. The run uses the key for the provider its `claude`
+//!   switch picks; holding both lets the switch flip without new keys (S41).
 //!
 //! Each call's usage is reported to Paperclip when its run variables are set.
 

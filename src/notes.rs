@@ -1,5 +1,5 @@
-//! Tier-2 notes (DESIGN §10, DECISION A13): plain-English notes for the owner, written by the
-//! local model from facts the code computed. They go to `data/notes/`, which no decision code
+//! Tier-2 notes (DESIGN §10, DECISIONS A13, S41): plain-English notes for the owner, written by
+//! the model the models file names for `notes` (Claude), from facts the code computed. They go to `data/notes/`, which no decision code
 //! reads. Each note is written once. If Tier 2 is down, the facts go to a separate `.facts.md`
 //! file, and a later run still tries for the worded note.
 
@@ -76,8 +76,8 @@ fn job(
     match ask(task, &facts) {
         Ok(Note(text)) => {
             let body = format!(
-                "# {title}\n\n*Written by the local model ({}); not checked by a person.*\n\n{text}\n\n{}",
-                llm::LOCAL_MODEL,
+                "# {title}\n\n*Written by {}; not checked by a person.*\n\n{text}\n\n{}",
+                llm::job_model(home, task).unwrap_or_else(|_| "an AI model".into()),
                 quoted(&facts)
             );
             match write(home, name, &body) {

@@ -106,11 +106,39 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.notes.pli
 - `notes` runs daily at 18:15 and writes any due notes. `desk-run` also tries right after it
   finishes.
 - The rotation regenerates the key and stores it in the Keychain over stdin, so it never appears in a
-  process list. It then applies the key's policy (only `bmv-local`, $0 a day, 30 requests a minute)
+  process list. It then applies the key's policy (only `bmv-free`, $0 a day, 30 requests a minute)
   before a test call.
+
 - If a step fails, the error and the exact manual fix are kept in `data/llm_rotate_error.json`, and
   health shows FAIL until a rotation succeeds.
 - **On the first manual `llm-rotate`, watch the output.** The regenerate output format and the policy
   flags are checked for real only then.
 - Notes written while Tier 2 is down are saved as `*.facts.md`, and a later run replaces them with the
   worded note.
+
+### Models and keys (DECISION S41)
+
+- **Which model each job uses** is set in `deploy/models.json`: flip a line's `claude` between `true`
+  (its Claude model) and `false` (its free OmniRoute route `bmv-free`).
+  - **Engine jobs** (`engine`) apply on their next run.
+  - **Desk agents** (`agents`) apply after `sudo scripts/clip-agents-setup.sh`.
+  - **The signers and the notes are locked to Claude.**
+- **Before the first run, set up `bmv-free` in the OmniRoute dashboard:**
+  1. add free cloud providers (for example the Gemini free tier, Groq, OpenRouter's free models)
+  2. make a combo named `bmv-free` with them in fallback order, and no Ollama
+  3. allow `bmv-free` on the desk agents' OmniRoute key
+  - **Until `bmv-free` exists, the daily rotation's test call fails.**
+- **Monthly:** run `scripts/rotate-keys.sh`. It walks through each key, and the reminder below prompts
+  you on the 1st:
+
+```sh
+cp deploy/com.bmv-trader.monthly.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.monthly.plist
+```
+
+- **Ollama is only for local replay trials:** `brew services start ollama` before one and
+  `brew services stop ollama` after. Nothing else needs it.
+- **Agent keys files written before S41** hold only one model key. Give one its OmniRoute key, so
+  its switch can flip to free, with `scripts/clip-key-swap.sh <agent> omniroute`, which keeps its
+  desk token. Signers never get one.
+

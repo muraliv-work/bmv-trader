@@ -371,6 +371,20 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - **`deploy/models.json`** holds each agent's provider, model and monthly budget, and nothing else. `deploy/agents.json` holds the rest. `Agents::parse` reads the pair: every agent must be in both, a model line in the agents file is refused, and then every rule above applies to the combined entry. `desk-agent` reads `models.json` from beside the agents file, with the same ownership checks, and `clip-agents-setup.sh` checks and installs both.
   - **Models and ceilings (S40):** Head of Desk on Haiku 5.5 ($1 a month), Researcher on Sonnet 5.5 ($3), Validator and Stress Lead on Sonnet 5.5 ($5 each). The Head of Desk and Researcher run as `bmvhod` and `bmvres`. Any agent on Claude must run as its own user, so no Anthropic key ever sits in `bmvclip`'s files.
   - **To change a model:** edit its line in `deploy/models.json`, then run `sudo scripts/clip-agents-setup.sh`. Moving an agent to a new user also needs a new token and keys file, and a rerun of the Paperclip sync.
+- **S41: one central models file, and monthly key rotation.**
+  - **`deploy/models.json`** has an `agents` section (read by `desk-agent`) and an `engine` section (read by `bmv_trader::llm`). Every line has a `claude` true/false switch, a `claude_model`, an optional `free_model` (the OmniRoute route) and a monthly `budget_usd`.
+    - **Locked to Claude:** the signers (by role, A5) and `notes` (account data).
+    - **Always ready:** a line's Claude model must have a price even while it's switched to free, so flipping to Claude always works.
+    - **Applying a change:** engine switches apply on the next run. Agent switches apply after `sudo scripts/clip-agents-setup.sh`.
+  - **Each agent's keys file holds both keys** (Claude and OmniRoute), so a switch needs no new keys.
+  - **`scripts/rotate-keys.sh`** (monthly, guided, each step skippable):
+    1. it renews the desk budgets
+    2. it rotates the engine's Claude key
+    3. it rotates the desk agents' Claude key (into every keys file via `scripts/clip-key-swap.sh`, keeping each desk token)
+    4. optionally, it rotates the agents' OmniRoute key
+    - **It proves each key** before it replaces the old one: a new key goes to a temporary Keychain item, is tested with a free call to the models list, and only then becomes the real one. A failed agent list stops the script, and a step that stopped halfway can be resumed. Each key's date goes in `data/keys_rotated.json`, and the health check uses the older one.
+    - **Old keys** are disabled by hand in the Console: Anthropic keys can't be created by API, and the script holds no Admin key.
+  - **Reminders:** the health check warns after 35 days, and `deploy/com.bmv-trader.monthly.plist` posts a notification on the 1st.
 - **Part 5, the signers' dry run (2026-11-05).** One heartbeat each, by hand, while trial 12 ran.
   - **Both succeeded:** Validator $0.0071 and Stress Lead $0.0070, 2 turns each. Each ran as its own user through its sudo rule, the desk accepted its token, the reply model matched the pin, and each call was charged to the desk and reported to Paperclip priced.
   - **Fail-closed checks seen on the way:** a missing keys file, and no desk budget that month. Both stopped the run before any paid call.
@@ -788,7 +802,11 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
 - **Free-model output never reaches the decision path.**
 - **Route per task, fixed in code (`src/llm.rs`):**
   - **Tier 1, Claude direct:** anything that can change a trade or a strategy. That is the analyst (both TradingAgents tiers), the risk reviewer, any text parsed into a verdict, strategist ideas and the Sunday review. It counts toward the **$100/month** cap.
-  - **Tier 2, OmniRoute** (Ollama first): chores that only describe facts the code computed. That is paperclip heartbeats, the wording of briefs and reports, journal narratives, and your news digest.
+  - **Tier 2** (S41): chores that only describe facts the code computed. Each job's model comes from the central models file `deploy/models.json` (`engine` section), switched by its `claude` flag:
+    - **`notes`** (briefs, digests, session and weekly notes) runs on **Claude Haiku 5.5, direct**, and is locked to Claude: it carries the owner's positions and P&L.
+    - **`lab_ideas`** (ranking formulas from public feature names) runs on the free OmniRoute route **`bmv-free`** (free cloud models with fallback; no Ollama). Flip `claude` to move it to its Claude model.
+    - **Claude Tier-2 calls are booked** in `data/tier2_spend.jsonl`. Under a lock, a call is refused if it could pass its job's `budget_usd` a month or, with trial 10's spend, the $100 cap. Its worst case is then reserved before sending, and settled to the real cost before its text is used. A call that fails after sending, or replies as an unpriced model, keeps the worst case. A ledger line that doesn't parse or add up refuses all calls until fixed.
+    - **Ollama runs only for local replay trials** (`brew services start ollama`, then `stop`).
   - **No fallback across tiers.** If Tier 1 is down, the analyst is off and candidates go ahead rules-only in shadow.
   - Proposals are accepted only with a `claude-direct` provenance that matches the Tier-1 call ledger.
 - **`bmv-trader llm-health`** runs from launchd at 06:00 ET. It checks:

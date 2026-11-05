@@ -1,8 +1,12 @@
 {
-  "models": {
-    "hod-1": { "provider": "anthropic", "model": "claude-haiku-5-5", "budget_usd": "1" },
-    "res-1": { "provider": "anthropic", "model": "claude-sonnet-5-5", "budget_usd": "3" },
-    "val-1": { "provider": "anthropic", "model": "claude-sonnet-5-5", "budget_usd": "5" },
-    "stress-1": { "provider": "anthropic", "model": "claude-sonnet-5-5", "budget_usd": "5" }
+  "agents": {
+    "hod-1":    { "claude": true, "claude_model": "claude-haiku-5-5",  "free_model": "bmv-free", "budget_usd": "1" },
+    "res-1":    { "claude": true, "claude_model": "claude-sonnet-5-5", "free_model": "bmv-free", "budget_usd": "3" },
+    "val-1":    { "claude": true, "claude_model": "claude-sonnet-5-5", "free_model": null,       "budget_usd": "5" },
+    "stress-1": { "claude": true, "claude_model": "claude-sonnet-5-5", "free_model": null,       "budget_usd": "5" }
+  },
+  "engine": {
+    "notes":     { "claude": true,  "claude_model": "claude-haiku-5-5", "free_model": null,       "budget_usd": "2" },
+    "lab_ideas": { "claude": false, "claude_model": "claude-haiku-5-5", "free_model": "bmv-free", "budget_usd": "1" }
   }
 }

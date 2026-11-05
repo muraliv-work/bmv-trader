@@ -236,7 +236,8 @@ pub fn read_analyses(home: &Path) -> Result<Vec<Analysis>, String> {
     Ok(latest(&read_lines(&analyses_path(home))?))
 }
 
-pub(crate) fn append(path: &Path, a: &Analysis) -> Result<(), String> {
+/// Appends one JSON line, crash-safe; also the Tier-2 spend ledger's writer.
+pub(crate) fn append<T: Serialize>(path: &Path, a: &T) -> Result<(), String> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
     }

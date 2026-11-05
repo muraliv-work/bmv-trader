@@ -150,25 +150,39 @@ const WAVE1: [Role; 4] = [
     Role::StressLead,
 ];
 
-/// One agent's line in the models file: the three things a model change touches.
+/// One agent's line in the central models file (S41): `claude` switches it between its Claude
+/// model (called directly) and its free model (an OmniRoute route).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Model {
-    provider: Provider,
-    model: String,
+    claude: bool,
+    claude_model: String,
+    /// None means it can only run on Claude (the signers).
+    free_model: Option<String>,
     budget_usd: String,
 }
 
+/// The central models file: `agents` is read here, `engine` by the engine (`bmv_trader::llm`).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Models {
-    models: BTreeMap<String, Model>,
+    agents: BTreeMap<String, Model>,
+    #[allow(dead_code)]
+    engine: Value,
 }
 
 /// The fields that live in the models file, never the agents file.
-const MODEL_FIELDS: [&str; 3] = ["provider", "model", "budget_usd"];
+const MODEL_FIELDS: [&str; 7] = [
+    "provider",
+    "model",
+    "budget_usd",
+    "claude",
+    "claude_model",
+    "free_model",
+    "engine",
+];
 
-/// The owner's two files, read together (S39): `deploy/models.json` says which provider, model and
+/// The owner's two files, read together (S39, S41): `deploy/models.json` says which model and
 /// monthly budget each agent uses, and `deploy/agents.json` its role, user, schedule, prompt and
 /// tools. Both are root-owned once installed, so no agent can change its own model.
 #[derive(Debug, Deserialize)]
@@ -194,14 +208,29 @@ impl Agents {
                 return Err(format!("agents file, {id}: {f} belongs in the models file"));
             }
             let m = models
-                .models
+                .agents
                 .get(id)
                 .ok_or_else(|| format!("models file has no line for {id}"))?;
-            entry.insert("provider".into(), json!(m.provider));
-            entry.insert("model".into(), json!(m.model));
+            // the Claude model must always be ready, so flipping the switch never breaks a run
+            if price(&m.claude_model, 0).is_none() {
+                return Err(format!(
+                    "models file, {id}: no price for {}, so no budget",
+                    m.claude_model
+                ));
+            }
+            let (provider, model) = if m.claude {
+                (Provider::Anthropic, m.claude_model.clone())
+            } else {
+                let free = m.free_model.clone().ok_or_else(|| {
+                    format!("models file, {id}: claude is false but there's no free_model")
+                })?;
+                (Provider::Omniroute, free)
+            };
+            entry.insert("provider".into(), json!(provider));
+            entry.insert("model".into(), json!(model));
             entry.insert("budget_usd".into(), json!(m.budget_usd));
         }
-        if let Some(id) = models.models.keys().find(|id| !entries.contains_key(*id)) {
+        if let Some(id) = models.agents.keys().find(|id| !entries.contains_key(*id)) {
             return Err(format!(
                 "models file names {id}, which the agents file doesn't have"
             ));
@@ -800,23 +829,38 @@ mod tests {
                       "task": "t", "tools": ["sign"]},
             "res-1": {"role": "researcher", "runs_as": "bmvclip", "schedule": "0 7 * * *",
                       "prompt": "p", "task": "t", "tools": ["list_strategies"]}}});
-        let models = json!({"models": {
-            "val-1": {"provider": "anthropic", "model": "claude-sonnet-5-5", "budget_usd": "35"},
-            "res-1": {"provider": "omniroute", "model": "bmv-local", "budget_usd": "0"}}});
+        let models = json!({"agents": {
+            "val-1": {"claude": true, "claude_model": "claude-sonnet-5-5", "free_model": null,
+                      "budget_usd": "35"},
+            "res-1": {"claude": false, "claude_model": "claude-haiku-5-5",
+                      "free_model": "bmv-free", "budget_usd": "0"}}, "engine": {}});
         assert!(Agents::parse(&base.to_string(), &models.to_string()).is_ok());
         // a model line goes to the models file, everything else to the agents file
         let with = |id: &str, k: &str, v: Value| {
             let (mut b, mut m) = (base.clone(), models.clone());
             if MODEL_FIELDS.contains(&k) {
-                m["models"][id][k] = v;
+                m["agents"][id][k] = v;
             } else {
                 b["agents"][id][k] = v;
             }
             Agents::parse(&b.to_string(), &m.to_string())
         };
         assert!(
-            with("res-1", "provider", json!("anthropic")).is_err(),
+            with("res-1", "claude", json!(true)).is_err(),
             "a Claude agent as bmvclip would put the key in Paperclip's files"
+        );
+        let mut res_own = base.clone();
+        res_own["agents"]["res-1"]["runs_as"] = json!("bmvres");
+        let mut res_claude = models.clone();
+        res_claude["agents"]["res-1"]["claude"] = json!(true);
+        let a = Agents::parse(&res_own.to_string(), &res_claude.to_string()).unwrap();
+        assert_eq!(
+            (
+                a.get("res-1").unwrap().provider,
+                a.get("res-1").unwrap().model.as_str()
+            ),
+            (Provider::Anthropic, "claude-haiku-5-5"),
+            "flipping claude to true uses its claude_model"
         );
         let mut extra = base.clone();
         extra["agents"]["res-1"]["model"] = json!("claude-haiku-5-5");
@@ -825,11 +869,11 @@ mod tests {
             "a model line in the agents file is refused"
         );
         let mut missing = models.clone();
-        missing["models"].as_object_mut().unwrap().remove("res-1");
+        missing["agents"].as_object_mut().unwrap().remove("res-1");
         assert!(Agents::parse(&base.to_string(), &missing.to_string()).is_err());
         let mut stray = models.clone();
-        stray["models"]["hod-1"] = json!({"provider": "anthropic", "model": "claude-haiku-5-5",
-                                          "budget_usd": "2"});
+        stray["agents"]["hod-1"] = json!({"claude": true, "claude_model": "claude-haiku-5-5",
+                                          "free_model": null, "budget_usd": "2"});
         assert!(
             Agents::parse(&base.to_string(), &stray.to_string()).is_err(),
             "a models line with no agent is refused"
@@ -839,8 +883,15 @@ mod tests {
             "a free model may not hold sign"
         );
         assert!(
-            with("val-1", "provider", json!("omniroute")).is_err(),
-            "a validator is a signer by role, even without the sign tool"
+            with("val-1", "claude", json!(false)).is_err(),
+            "claude false with no free_model is refused"
+        );
+        let mut val_free = models.clone();
+        val_free["agents"]["val-1"]["claude"] = json!(false);
+        val_free["agents"]["val-1"]["free_model"] = json!("bmv-free");
+        assert!(
+            Agents::parse(&base.to_string(), &val_free.to_string()).is_err(),
+            "a validator is a signer by role, so it can never be switched to a free model"
         );
         assert!(with("val-1", "tools", json!([])).is_ok());
         assert!(
@@ -863,10 +914,14 @@ mod tests {
         assert!(with("res-1", "schedule", json!("daily")).is_err());
         assert!(with("res-1", "runs_as", json!("Bmv Clip")).is_err());
         assert!(
-            with("val-1", "model", json!("claude-opus-9")).is_err(),
+            with("val-1", "claude_model", json!("claude-opus-9")).is_err(),
             "no price, no budget"
         );
-        assert!(with("val-1", "model", json!("claude-opus-5-5")).is_ok());
+        assert!(
+            with("res-1", "claude_model", json!("claude-opus-9")).is_err(),
+            "even while switched to free, its Claude model must be ready"
+        );
+        assert!(with("val-1", "claude_model", json!("claude-opus-5-5")).is_ok());
         assert!(
             with("val-1", "shell", json!(true)).is_err(),
             "unknown fields refused"
