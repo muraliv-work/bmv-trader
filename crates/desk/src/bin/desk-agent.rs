@@ -1,11 +1,11 @@
-//! `desk-agent AGENTS AGENT SECRETS`: one heartbeat of one desk agent (DESIGN §4c, S36, S38).
+//! `desk-agent AGENTS AGENT SECRETS`: one heartbeat of one desk agent (DESIGN §4c, S36, S38, S39).
 //! Paperclip's `process` adapter starts it; it runs `desk::agent::run` and prints what the agent
-//! said. `desk-agent --list AGENTS` checks the file and prints each agent's setup as JSON, for the
+//! said. `desk-agent --list AGENTS` checks the files and prints each agent's setup as JSON, for the
 //! setup scripts.
 //!
-//! - AGENTS: the owner's agents file (`desk::agent::Agents`), naming each agent's provider and
-//!   model. It must not be writable by the agent: owned by another user, and not group- or
-//!   world-writable.
+//! - AGENTS: the owner's agents file (`desk::agent::Agents`), read with `models.json` from the same
+//!   folder, which names each agent's provider, model and budget. Neither may be writable by the
+//!   agent: owned by another user, and not group- or world-writable.
 //! - SECRETS: `{"desk_token": "...", "anthropic_key": "..."}` (or `"omniroute_key"` for the local
 //!   route), owned by the agent's user and readable by it only.
 //!
@@ -77,10 +77,20 @@ fn loopback(url: &reqwest::Url) -> bool {
         && matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
 }
 
+/// The models file that goes with an agents file: `models.json` in the same folder.
+fn models_path(agents: &str) -> String {
+    std::path::Path::new(agents)
+        .with_file_name("models.json")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Each agent's setup, as the setup scripts need it; no prompts.
 fn list(path: &str) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    let a = Agents::parse(&text)?;
+    let models = models_path(path);
+    let mtext = std::fs::read_to_string(&models).map_err(|e| format!("{models}: {e}"))?;
+    let a = Agents::parse(&text, &mtext)?;
     let rows: Vec<Value> = a
         .agents
         .iter()
@@ -107,19 +117,24 @@ fn heartbeat(agents: &str, agent: &str, secrets: &str) -> Result<(), String> {
     let s: Secrets = serde_json::from_str(&text).map_err(|_| {
         format!("{secrets} isn't {{\"desk_token\", \"anthropic_key\" or \"omniroute_key\"}}")
     })?;
-    let (text, owner) = read(agents, |m| {
+    let owners_only = |m: &std::fs::Metadata| {
         if m.mode() & 0o022 != 0 {
             return Err("writable by others; it must be the owner's alone".into());
         }
         Ok(())
-    })?;
-    // the secrets file belongs to the agent's user; the agents file must not
-    if owner == me {
-        return Err(format!(
-            "{agents} belongs to the agent's own user, which could rewrite it"
-        ));
+    };
+    let models = models_path(agents);
+    let (text, owner) = read(agents, owners_only)?;
+    let (mtext, mowner) = read(&models, owners_only)?;
+    // the secrets file belongs to the agent's user; the agents and models files must not
+    for (path, o) in [(agents, owner), (models.as_str(), mowner)] {
+        if o == me {
+            return Err(format!(
+                "{path} belongs to the agent's own user, which could rewrite it"
+            ));
+        }
     }
-    let c = Agents::parse(&text)?.get(agent)?.charter(agent)?;
+    let c = Agents::parse(&text, &mtext)?.get(agent)?.charter(agent)?;
     let key = match c.provider {
         Provider::Anthropic => s
             .anthropic_key

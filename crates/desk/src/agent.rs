@@ -87,7 +87,8 @@ impl Charter {
 /// The user Paperclip and its non-signing agents run as (S36).
 pub const CLIP_USER: &str = "bmvclip";
 
-/// One agent in the owner's agents file: its charter, and how it is set up (S38).
+/// One agent, as the owner's two files describe it together: its charter, and how it is set up
+/// (S38, S39).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
@@ -149,9 +150,27 @@ const WAVE1: [Role; 4] = [
     Role::StressLead,
 ];
 
-/// The owner's agents file (`deploy/agents.json`): the one place that says which agent uses which
-/// provider and model, and how each is set up. Root-owned once installed, so no agent can change
-/// its own model.
+/// One agent's line in the models file: the three things a model change touches.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Model {
+    provider: Provider,
+    model: String,
+    budget_usd: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Models {
+    models: BTreeMap<String, Model>,
+}
+
+/// The fields that live in the models file, never the agents file.
+const MODEL_FIELDS: [&str; 3] = ["provider", "model", "budget_usd"];
+
+/// The owner's two files, read together (S39): `deploy/models.json` says which provider, model and
+/// monthly budget each agent uses, and `deploy/agents.json` its role, user, schedule, prompt and
+/// tools. Both are root-owned once installed, so no agent can change its own model.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Agents {
@@ -159,8 +178,35 @@ pub struct Agents {
 }
 
 impl Agents {
-    pub fn parse(text: &str) -> Result<Agents, String> {
-        let a: Agents = serde_json::from_str(text).map_err(|e| format!("agents file: {e}"))?;
+    pub fn parse(agents: &str, models: &str) -> Result<Agents, String> {
+        let mut setup: Value =
+            serde_json::from_str(agents).map_err(|e| format!("agents file: {e}"))?;
+        let models: Models =
+            serde_json::from_str(models).map_err(|e| format!("models file: {e}"))?;
+        let entries = setup["agents"]
+            .as_object_mut()
+            .ok_or("agents file: no \"agents\" object")?;
+        for (id, entry) in entries.iter_mut() {
+            let entry = entry
+                .as_object_mut()
+                .ok_or_else(|| format!("agents file, {id}: not an object"))?;
+            if let Some(f) = MODEL_FIELDS.iter().find(|f| entry.contains_key(**f)) {
+                return Err(format!("agents file, {id}: {f} belongs in the models file"));
+            }
+            let m = models
+                .models
+                .get(id)
+                .ok_or_else(|| format!("models file has no line for {id}"))?;
+            entry.insert("provider".into(), json!(m.provider));
+            entry.insert("model".into(), json!(m.model));
+            entry.insert("budget_usd".into(), json!(m.budget_usd));
+        }
+        if let Some(id) = models.models.keys().find(|id| !entries.contains_key(*id)) {
+            return Err(format!(
+                "models file names {id}, which the agents file doesn't have"
+            ));
+        }
+        let a: Agents = serde_json::from_value(setup).map_err(|e| format!("agents file: {e}"))?;
         for (id, s) in &a.agents {
             let at = |e: String| format!("agents file, {id}: {e}");
             s.charter(id).map_err(at)?;
@@ -180,6 +226,12 @@ impl Agents {
                 return Err(at(format!(
                     "runs_as {:?} isn't a bmv user name (bmv, then lowercase letters and digits)",
                     s.runs_as
+                )));
+            }
+            // S39: an Anthropic key never sits in Paperclip's own user's files
+            if s.provider == Provider::Anthropic && s.runs_as == CLIP_USER {
+                return Err(at(format!(
+                    "a Claude agent needs a user of its own, not {CLIP_USER}"
                 )));
             }
             if s.tools.iter().any(|t| t == "sign") && !s.signs() {
@@ -699,7 +751,11 @@ mod tests {
 
     #[test]
     fn the_agents_file_is_valid_and_keeps_signers_apart() {
-        let a = Agents::parse(include_str!("../../../deploy/agents.json")).unwrap();
+        let a = Agents::parse(
+            include_str!("../../../deploy/agents.json"),
+            include_str!("../../../deploy/models.json"),
+        )
+        .unwrap();
         for (id, s) in &a.agents {
             let c = s.charter(id).unwrap();
             if c.offers("sign") {
@@ -713,8 +769,14 @@ mod tests {
         }
         assert_eq!(
             a.get("res-1").unwrap().keys_path("res-1"),
-            "/usr/local/var/bmv-clip/keys/res-1.json"
+            "/usr/local/var/bmvres/keys.json"
         );
+        // S39: no Anthropic key in Paperclip's own user's files
+        for (id, s) in &a.agents {
+            if s.provider == Provider::Anthropic {
+                assert_ne!(s.runs_as, CLIP_USER, "{id}");
+            }
+        }
         assert!(a.get("nobody").is_err());
     }
 
@@ -734,18 +796,44 @@ mod tests {
     #[test]
     fn agents_file_rules() {
         let base = json!({"agents": {
-            "val-1": {"role": "validator", "runs_as": "bmvval", "budget_usd": "35", "schedule": null,
-                      "provider": "anthropic", "model": "claude-sonnet-5-5", "prompt": "p",
+            "val-1": {"role": "validator", "runs_as": "bmvval", "schedule": null, "prompt": "p",
                       "task": "t", "tools": ["sign"]},
-            "res-1": {"role": "researcher", "runs_as": "bmvclip", "budget_usd": "0",
-                      "schedule": "0 7 * * *", "provider": "omniroute", "model": "bmv-local",
+            "res-1": {"role": "researcher", "runs_as": "bmvclip", "schedule": "0 7 * * *",
                       "prompt": "p", "task": "t", "tools": ["list_strategies"]}}});
-        assert!(Agents::parse(&base.to_string()).is_ok());
+        let models = json!({"models": {
+            "val-1": {"provider": "anthropic", "model": "claude-sonnet-5-5", "budget_usd": "35"},
+            "res-1": {"provider": "omniroute", "model": "bmv-local", "budget_usd": "0"}}});
+        assert!(Agents::parse(&base.to_string(), &models.to_string()).is_ok());
+        // a model line goes to the models file, everything else to the agents file
         let with = |id: &str, k: &str, v: Value| {
-            let mut b = base.clone();
-            b["agents"][id][k] = v;
-            Agents::parse(&b.to_string())
+            let (mut b, mut m) = (base.clone(), models.clone());
+            if MODEL_FIELDS.contains(&k) {
+                m["models"][id][k] = v;
+            } else {
+                b["agents"][id][k] = v;
+            }
+            Agents::parse(&b.to_string(), &m.to_string())
         };
+        assert!(
+            with("res-1", "provider", json!("anthropic")).is_err(),
+            "a Claude agent as bmvclip would put the key in Paperclip's files"
+        );
+        let mut extra = base.clone();
+        extra["agents"]["res-1"]["model"] = json!("claude-haiku-5-5");
+        assert!(
+            Agents::parse(&extra.to_string(), &models.to_string()).is_err(),
+            "a model line in the agents file is refused"
+        );
+        let mut missing = models.clone();
+        missing["models"].as_object_mut().unwrap().remove("res-1");
+        assert!(Agents::parse(&base.to_string(), &missing.to_string()).is_err());
+        let mut stray = models.clone();
+        stray["models"]["hod-1"] = json!({"provider": "anthropic", "model": "claude-haiku-5-5",
+                                          "budget_usd": "2"});
+        assert!(
+            Agents::parse(&base.to_string(), &stray.to_string()).is_err(),
+            "a models line with no agent is refused"
+        );
         assert!(
             with("res-1", "tools", json!(["sign"])).is_err(),
             "a free model may not hold sign"
