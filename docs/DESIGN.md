@@ -329,9 +329,15 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - The LaunchDaemon `com.bmv.desk`.
 - **Still open:**
   - **The audit head isn't anchored outside the database.** Only `bmvdesk` and root can now write it, but either could rewrite the whole chain.
-  - **The server has no connection limit or slow-client timeout.** Due before agents connect in step 5.
   - **`BEGIN IMMEDIATE`** is needed if a second long-lived writer appears. Today only `desk init` writes alongside the server, and only once.
   - **Secure Enclave key rotation** isn't designed yet.
+
+### Step 5 plan: Paperclip wave 1 (S36, owner 2026-11-05)
+- **Runner:** Paperclip's `process` adapter starts our `desk-agent` on each heartbeat. It calls the model directly with only the role's desk tools (no shell, files or web), rejects a reply from any other model, charges the desk budget, and reports cost and a short note to Paperclip from code. Paperclip's own curl skill and Claude Code adapters are not used.
+- **Isolation:** Paperclip and the runner run as a hidden macOS user, `bmvclip`, in `authenticated` mode on 127.0.0.1 only. Paperclip is pinned at 2026.1023.0 with its lockfile; telemetry, announcements and update checks are off.
+- **Models and budget (per month):** Validator and Stress Lead on Sonnet 5.5 ($35, $25); Head of Desk on the local model with Haiku 5.5 for its daily summary ($5); Researcher on OmniRoute's free route ($0); $35 held for waves 2-3.
+- **Schedule:** the Validator and Stress Lead wake only when a strategy reaches their gate; Head of Desk daily at 16:30 ET; Researcher daily. Switched on after trial 12 ends.
+- **Part 1 as built: the server's limits.** At most 32 connections at once (the rest wait in the backlog). A request gets 5 s, then a 503 and its transaction rolls back. A connection that moves no bytes for 10 s is closed, and none lives past 15 s. Still open: a local process that keeps reconnecting can fill all 32 slots; the fix would be a reserved path (a Unix socket) for the owner and the engine.
 
 ### Step 3 as built: run hashes and the stress battery
 - **`bmv-trader stress-battery`** re-runs every finished trial twice through the same code as `trial-autopsy`.

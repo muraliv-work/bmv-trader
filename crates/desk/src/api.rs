@@ -18,8 +18,13 @@ use axum::{Json, Router};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::time::Instant;
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8790";
 
@@ -88,7 +93,14 @@ async fn loopback_only(req: Request, next: Next) -> Response {
         let body = Json(json!({"error": "the desk answers to 127.0.0.1 only"}));
         return (StatusCode::MISDIRECTED_REQUEST, body).into_response();
     }
-    next.run(req).await
+    // a stuck request is dropped (its transaction rolls back) well before the connection's idle limit
+    match tokio::time::timeout(HANDLER, next.run(req)).await {
+        Ok(reply) => reply,
+        Err(_) => {
+            let body = Json(json!({"error": "the desk took too long; nothing was changed"}));
+            (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+        }
+    }
 }
 
 async fn whoami(Ctx(s): Desk, h: HeaderMap) -> Reply {
@@ -297,7 +309,153 @@ pub fn router(store: Arc<Store>) -> Router {
 
 /// Serves the desk on a listener the caller bound (to 127.0.0.1 only).
 pub async fn serve(listener: tokio::net::TcpListener, store: Store) -> std::io::Result<()> {
-    axum::serve(listener, router(Arc::new(store))).await
+    let limited = Limited::new(listener, MAX_CONNECTIONS, IDLE, LIFETIME);
+    axum::serve(limited, router(Arc::new(store))).await
+}
+
+/// At most this many connections at once; the rest wait in the kernel's backlog.
+const MAX_CONNECTIONS: usize = 32;
+/// A request gets this long; every desk call is a small SQLite transaction.
+const HANDLER: Duration = Duration::from_secs(5);
+/// A connection that moves no bytes for this long is closed, so slow clients can't hold a slot.
+/// Longer than HANDLER, so a request in flight always gets its answer.
+const IDLE: Duration = Duration::from_secs(10);
+/// And no connection lives longer than this, so a client dripping bytes can't keep one either.
+/// shortcut: any local process can still fill all slots by reconnecting; a reserved path for the
+/// owner and the engine (e.g. a Unix socket) if that ever happens.
+const LIFETIME: Duration = Duration::from_secs(15);
+
+/// A listener that hands out a connection only while a slot is free, and limits each one in time.
+struct Limited {
+    inner: tokio::net::TcpListener,
+    slots: Arc<tokio::sync::Semaphore>,
+    idle: Duration,
+    lifetime: Duration,
+}
+
+impl Limited {
+    fn new(inner: tokio::net::TcpListener, max: usize, idle: Duration, lifetime: Duration) -> Self {
+        let slots = Arc::new(tokio::sync::Semaphore::new(max));
+        Limited {
+            inner,
+            slots,
+            idle,
+            lifetime,
+        }
+    }
+}
+
+impl axum::serve::Listener for Limited {
+    type Io = Guarded;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Guarded, std::net::SocketAddr) {
+        let slot = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed");
+        // axum's own accept retries on errors
+        let (io, addr) = axum::serve::Listener::accept(&mut self.inner).await;
+        let now = Instant::now();
+        let guarded = Guarded {
+            io,
+            timer: Box::pin(tokio::time::sleep_until(now + self.idle.min(self.lifetime))),
+            end: now + self.lifetime,
+            idle: self.idle,
+            _slot: slot,
+        };
+        (guarded, addr)
+    }
+
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
+/// A connection that fails once it has moved no bytes for `idle`, or outlived `end`.
+/// Dropping it frees its slot.
+struct Guarded {
+    io: tokio::net::TcpStream,
+    timer: Pin<Box<tokio::time::Sleep>>,
+    end: Instant,
+    idle: Duration,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Guarded {
+    fn moved(&mut self) {
+        let next = (Instant::now() + self.idle).min(self.end);
+        self.timer.as_mut().reset(next);
+    }
+
+    /// Checked whenever the connection would wait, and before each read or write.
+    fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+        Instant::now() >= self.end || self.timer.as_mut().poll(cx).is_ready()
+    }
+}
+
+fn timed_out<T>() -> Poll<std::io::Result<T>> {
+    Poll::Ready(Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "desk: idle or slow connection closed",
+    )))
+}
+
+impl tokio::io::AsyncRead for Guarded {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        if Instant::now() >= me.end {
+            return timed_out();
+        }
+        let before = buf.filled().len();
+        match Pin::new(&mut me.io).poll_read(cx, buf) {
+            Poll::Pending if me.expired(cx) => timed_out(),
+            Poll::Ready(Ok(())) if buf.filled().len() > before => {
+                me.moved();
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Guarded {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        if Instant::now() >= me.end {
+            return timed_out();
+        }
+        match Pin::new(&mut me.io).poll_write(cx, buf) {
+            Poll::Pending if me.expired(cx) => timed_out(),
+            Poll::Ready(Ok(n)) if n > 0 => {
+                me.moved();
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        match Pin::new(&mut me.io).poll_flush(cx) {
+            Poll::Pending if me.expired(cx) => timed_out(),
+            other => other,
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
 }
 
 /// A blocking client for the owner's `desk` command: plain HTTP/1.1 to the loopback server.
@@ -310,7 +468,6 @@ pub fn call(
     body: Option<&Value>,
 ) -> std::result::Result<Value, String> {
     use std::io::{Read, Write};
-    use std::time::Duration;
     if token.is_some_and(|t| !t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')) {
         return Err("that token isn't a desk token".into());
     }
@@ -387,6 +544,67 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// A one-slot server with short limits, for the connection tests.
+    async fn limited(idle_ms: u64, lifetime_ms: u64) -> String {
+        let store = Arc::new(Store::open("sqlite::memory:").await.unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let ms = Duration::from_millis;
+        let limited = Limited::new(listener, 1, ms(idle_ms), ms(lifetime_ms));
+        tokio::spawn(async move { axum::serve(limited, router(store)).await });
+        addr
+    }
+
+    /// Holds a connection, sending a byte every `drip_ms` (never, if 0), until the server
+    /// hangs up; returns how long that took.
+    fn hold(addr: &str, drip_ms: u64) -> std::time::Duration {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        let start = std::time::Instant::now();
+        let wait = if drip_ms == 0 { 5_000 } else { drip_ms };
+        s.set_read_timeout(Some(std::time::Duration::from_millis(wait)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            match s.read(&mut buf) {
+                Ok(0) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if s.write_all(b"G").is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        start.elapsed()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_client_is_closed_and_frees_its_slot() {
+        let addr = limited(300, 5_000).await;
+        let a = addr.clone();
+        let silent = tokio::task::spawn_blocking(move || hold(&a, 0));
+        // give the silent client the only slot first
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // this one waits for the slot, then is served
+        let served = blocking(&addr, "GET", "/v1/whoami", None, None).await;
+        let after = silent.await.unwrap();
+        assert!(after < std::time::Duration::from_secs(2), "{after:?}");
+        // no token: refused, but answered, so the second client got the slot
+        assert!(served.unwrap_err().contains("token"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dripping_client_is_closed_at_the_lifetime() {
+        // a byte every 100 ms beats the 300 ms idle limit, but not the 1 s lifetime
+        let addr = limited(300, 1_000).await;
+        let after = tokio::task::spawn_blocking(move || hold(&addr, 100))
+            .await
+            .unwrap();
+        let s = std::time::Duration::from_millis;
+        assert!(after >= s(900) && after < s(2_500), "{after:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
