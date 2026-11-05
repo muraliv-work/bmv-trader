@@ -409,6 +409,12 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - **`--notify`** (launchd `com.bmv-trader.keys`, 09:00) posts a macOS notification when any key is due within the window, overdue, missing, of unknown age, or its automatic rotation failed. The text is names only.
   - **`--renew`:** for each due key, it explains what the key is and what breaks without it, and lists where to get a new one. It takes a hidden paste and tests it with a free call: Anthropic's models list, or OpenRouter's key list for the management key. Only then does it save the key to the Keychain (through `security -i` on stdin), copy it into the agents' files that should hold it (`clip-key-swap.sh`), record the date, and say how to retire the old key. A wrong paste changes nothing.
   - **The daily health check** shows the same states for the hand-renewed keys. It replaces `scripts/rotate-keys.sh` and `data/keys_rotated.json`, whose dates are read once as a fallback.
+- **S45: the AI picks, the owner approves.** The build order to get there:
+  1. **The evidence tool,** so the signers can read each strategy's criteria, reproduction hashes, stress results and deflated Sharpe. It comes with the date in each heartbeat.
+  2. **Wave 2: the Strategist and Developer,** so ideas become strategies that code can test.
+  3. **The recommendation:** the Head of Desk ranks the strategies that passed both signers and proposes one, with a capital amount inside the owner's caps.
+  4. **The approval pack** (step 7): one page with the recommendation, code-computed evidence, both sign-offs, dissent and risks, approved or rejected with Touch ID.
+  - **The owner's caps** (capital per strategy, daily loss, position size) are set once, loosened only with Touch ID, and enforced by the risk gate on every order.
 - **Part 5, the signers' dry run (2026-11-05).** One heartbeat each, by hand, while trial 12 ran.
   - **Both succeeded:** Validator $0.0071 and Stress Lead $0.0070, 2 turns each. Each ran as its own user through its sudo rule, the desk accepted its token, the reply model matched the pin, and each call was charged to the desk and reported to Paperclip priced.
   - **Fail-closed checks seen on the way:** a missing keys file, and no desk budget that month. Both stopped the run before any paid call.
