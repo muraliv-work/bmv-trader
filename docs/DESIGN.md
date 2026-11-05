@@ -477,7 +477,7 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
 4. Risk and execution, paper only: wrap `risk::gate` and the engine; add a drawdown auto-halt and a ticker allow-list.
 5. Paperclip company config, wave 1.
 6. Ops: reconciliation every 15 minutes, a halt that cancels orders within 5 s (tested with a mock broker), and the daily report.
-7. The approval pack in `desk sign`, and one read-only desk page in the console (pipeline, halts, budgets, audit result, keys), fed by a cached snapshot, with no npm (S47).
+7. The approval pack in `desk sign` (after wave 2), and the console's read-only Desk page (built 2026-11-05): requests waiting for the owner, pipeline, halts, budgets, audit result and keys, read every 2 minutes with the `console-1` login, in Shadcn Admin's design patterns without its code or npm (S47).
 
 The 30 November feedback report draws on whatever exists by then: trial 12, the stress battery, deflated Sharpe, the cost check.
 

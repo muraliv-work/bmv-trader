@@ -22,9 +22,11 @@ pub enum Role {
     /// The engine's own code, not an agent: the only role that posts evidence (S46). No agents
     /// file may give it to an agent; the owner adds it once, for the engine's token.
     Engine,
+    /// The owner's console page (S47): reads the desk, and the API refuses it every write.
+    Console,
 }
 
-pub const ROLES: [Role; 13] = [
+pub const ROLES: [Role; 14] = [
     Role::Board,
     Role::HeadOfDesk,
     Role::Researcher,
@@ -38,6 +40,7 @@ pub const ROLES: [Role; 13] = [
     Role::Ops,
     Role::ProductOwner,
     Role::Engine,
+    Role::Console,
 ];
 
 impl Role {
@@ -56,6 +59,7 @@ impl Role {
             Role::Ops => "ops",
             Role::ProductOwner => "product_owner",
             Role::Engine => "engine",
+            Role::Console => "console",
         }
     }
 
@@ -100,6 +104,10 @@ pub enum Action {
     PostEvidence,
     /// Reading it: the signers, the Head of Desk, the owner, and the engine.
     ReadEvidence,
+    /// Every agent's month budget, not only the caller's own (S47).
+    ReadBudgets,
+    /// Walking the audit hash chain (S47).
+    VerifyAudit,
 }
 
 /// The policy table.
@@ -131,7 +139,11 @@ pub fn allowed(role: Role, action: Action) -> bool {
         FileReport => !matches!(role, Researcher | Developer | PlatformEngineer | Strategist),
         // numbers reach the desk only from code (S46)
         PostEvidence => matches!(role, Engine),
-        ReadEvidence => matches!(role, Validator | StressLead | HeadOfDesk | Board | Engine),
+        ReadEvidence => matches!(
+            role,
+            Validator | StressLead | HeadOfDesk | Board | Engine | Console
+        ),
+        ReadBudgets | VerifyAudit => matches!(role, Board | Console),
     }
 }
 
@@ -192,5 +204,15 @@ mod tests {
                 && !allowed(Role::Researcher, Action::ReadEvidence)
         );
         assert!(!Role::Engine.second_line());
+        // the console reads; every write is refused at the API (`api::console_reads_only`)
+        for r in ROLES {
+            assert_eq!(
+                allowed(r, Action::ReadBudgets) || allowed(r, Action::VerifyAudit),
+                matches!(r, Role::Board | Role::Console),
+                "{r:?} reads every budget or the audit chain"
+            );
+        }
+        assert!(allowed(Role::Console, Action::ReadEvidence));
+        assert!(!allowed(Role::Console, Action::PostEvidence));
     }
 }

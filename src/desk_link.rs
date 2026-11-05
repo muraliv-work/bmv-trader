@@ -131,6 +131,114 @@ impl Link {
     }
 }
 
+/// The console's read-only desk login (S47): Keychain `bmv-desk` / `console-1`, role `console`,
+/// which the desk refuses every write.
+pub struct Reader {
+    addr: std::net::SocketAddr,
+    token: String,
+    http: reqwest::blocking::Client,
+}
+
+impl Reader {
+    /// The login, checked with the desk: its token must be a `console` one, so a token filed under
+    /// the wrong role is refused here instead of quietly reading with more rights.
+    pub fn from_keychain() -> Result<Reader, String> {
+        let var = std::env::var("DESK_ADDR").unwrap_or_else(|_| "127.0.0.1:8790".into());
+        let addr = loopback(&var)?;
+        let token = crate::config::keychain_in("bmv-desk", "console-1")?.ok_or(
+            "no console token in the Keychain (bmv-desk / console-1); see deploy/README.md, Quant Desk console",
+        )?;
+        let http = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| e.to_string())?;
+        let r = Reader { addr, token, http };
+        let me = r.get("/v1/whoami")?;
+        if me["role"] != "console" {
+            return Err(format!(
+                "the token at bmv-desk / console-1 belongs to {} (role {}), not a console login; reissue it per deploy/README.md",
+                me["agent"].as_str().unwrap_or("?"),
+                me["role"].as_str().unwrap_or("?")
+            ));
+        }
+        Ok(r)
+    }
+
+    fn get(&self, path: &str) -> Result<Value, String> {
+        let resp = self
+            .http
+            .get(format!("http://{}{path}", self.addr))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| format!("desk {path}: {}", e.without_url()))?;
+        let status = resp.status();
+        let v: Value = resp
+            .json()
+            .map_err(|e| format!("desk {path}: {status}, {}", e.without_url()))?;
+        if status.is_success() {
+            Ok(v)
+        } else {
+            Err(format!(
+                "desk {path}: {status}, {}",
+                v["error"].as_str().unwrap_or("refused")
+            ))
+        }
+    }
+
+    /// Everything the console's desk page shows, in one reading.
+    pub fn snapshot(&self) -> Result<Value, String> {
+        let started = std::time::Instant::now();
+        snapshot(&|p| self.get(p), &|| started.elapsed() > READING_LIMIT)
+    }
+}
+
+/// One reading gives up after this, so a hung desk can't hold the page's reading for one timeout
+/// per strategy.
+const READING_LIMIT: Duration = Duration::from_secs(30);
+
+/// `DESK_ADDR` as a loopback socket address: a parsed address, not a prefix, so nothing like
+/// `127.0.0.1:80@elsewhere` gets the token.
+fn loopback(s: &str) -> Result<std::net::SocketAddr, String> {
+    s.parse::<std::net::SocketAddr>()
+        .ok()
+        .filter(|a| a.ip().is_loopback())
+        .ok_or_else(|| format!("DESK_ADDR {s:?}: the desk is reached on a loopback ip:port only"))
+}
+
+/// The desk page's reading, from the desk's GET routes. A broken audit chain or one strategy's
+/// unreadable evidence is shown on its own line, not as a failed reading; running out of time is.
+fn snapshot(
+    get: &dyn Fn(&str) -> Result<Value, String>,
+    out_of_time: &dyn Fn() -> bool,
+) -> Result<Value, String> {
+    let strategies = get("/v1/strategies")?;
+    let mut evidence = serde_json::Map::new();
+    for s in strategies
+        .as_array()
+        .ok_or("desk: strategies isn't a list")?
+    {
+        let id = s["id"].as_i64().ok_or("desk: a strategy has no id")?;
+        if out_of_time() {
+            return Err(format!(
+                "the desk reading took over {} s; showing the last one",
+                READING_LIMIT.as_secs()
+            ));
+        }
+        let e =
+            get(&format!("/v1/strategies/{id}/evidence")).unwrap_or_else(|e| json!({"error": e}));
+        evidence.insert(id.to_string(), e);
+    }
+    Ok(json!({
+        "strategies": strategies,
+        "evidence": evidence,
+        "requests": get("/v1/owner/requests")?,
+        "budgets": get("/v1/budgets")?,
+        "audit": get("/v1/audit/verify").unwrap_or_else(|e| json!({"error": e})),
+    }))
+}
+
 /// The go-ahead, from the desk's replies: the engine's agent must be Ops, the strategy must be in
 /// the state that allows trading in this mode, and every desk limit must be one the engine enforces.
 fn decide(
@@ -270,5 +378,42 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn the_console_snapshot_shows_a_broken_part_without_losing_the_rest() {
+        let get = |p: &str| -> Result<Value, String> {
+            match p {
+                "/v1/strategies" => {
+                    Ok(json!([{"id": 1, "name": "drift", "state": "idea", "version": 1}]))
+                }
+                "/v1/strategies/1/evidence" => Err("desk: no evidence".into()),
+                "/v1/owner/requests" | "/v1/budgets" => Ok(json!([])),
+                "/v1/audit/verify" => Err("audit chain broken at 7".into()),
+                _ => Err(format!("unexpected {p}")),
+            }
+        };
+        let s = snapshot(&get, &|| false).unwrap();
+        assert_eq!(s["strategies"][0]["name"], "drift");
+        assert_eq!(s["evidence"]["1"]["error"], "desk: no evidence");
+        assert_eq!(s["audit"]["error"], "audit chain broken at 7");
+        let down = |_: &str| -> Result<Value, String> { Err("can't reach the desk".into()) };
+        assert!(
+            snapshot(&down, &|| false).is_err(),
+            "no strategies, no reading"
+        );
+        assert!(
+            snapshot(&get, &|| true).unwrap_err().contains("took over"),
+            "a slow desk ends the reading"
+        );
+        assert!(loopback("127.0.0.1:8790").is_ok() && loopback("[::1]:8790").is_ok());
+        for bad in [
+            "10.0.0.2:8790",
+            "127.0.0.1:80@evil",
+            "localhost:8790",
+            "127.0.0.1",
+        ] {
+            assert!(loopback(bad).is_err(), "{bad}");
+        }
     }
 }

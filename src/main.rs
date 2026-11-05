@@ -440,7 +440,10 @@ fn watch() -> Result<(), String> {
 fn ui(port: usize) -> Result<(), String> {
     let mode = mode_name()?;
     let port = u16::try_from(port).map_err(|_| "--port out of range".to_string())?;
-    ui::serve(&connect()?, &config::home()?, &mode, port)
+    let home = config::home()?;
+    let keys =
+        || -> Result<String, String> { Ok(bmv_trader::keys::json(&key_rows(&home)?).to_string()) };
+    ui::serve(&connect()?, &home, &mode, port, &keys)
 }
 
 /// launchd runs this every 2 minutes (deploy/). Between closes it exits at once, without the
@@ -2554,28 +2557,14 @@ fn rotate_error_path(home: &Path) -> std::path::PathBuf {
 /// Every key in one place (S43): the table; `--notify` for launchd; `--renew` to walk through the
 /// due ones; `--record ID` to mark one renewed today.
 fn keys(renew: bool, notify: bool, record: Option<&str>) -> Result<(), String> {
-    use bmv_trader::keys::{self, Facts, Policy};
+    use bmv_trader::keys;
     let home = config::home()?;
     if let Some(id) = record {
         keys::record(&home, id, chrono::Utc::now())?;
         println!("{id}: recorded as renewed today");
         return Ok(());
     }
-    let policy = Policy::load(&home)?;
-    let present = |service: &'static str, account: &'static str| {
-        matches!(config::keychain_present(service, account), Ok(true))
-    };
-    let automatic = |id: &'static str| key_automatic(&home, id);
-    let facts = Facts {
-        present: &present,
-        automatic: &automatic,
-    };
-    let rows = keys::rows(
-        &policy,
-        &keys::read_dates(&home)?,
-        &facts,
-        chrono::Utc::now(),
-    );
+    let rows = key_rows(&home)?;
     if notify {
         if let Some(text) = keys::notice(&rows) {
             notify_owner("bmv-trader: keys", &text)?;
@@ -2592,7 +2581,12 @@ fn keys(renew: bool, notify: bool, record: Option<&str>) -> Result<(), String> {
     }
     let due: Vec<_> = rows
         .iter()
-        .filter(|r| r.state.needs_you() && matches!(r.def.store, keys::Store::Keychain { .. }))
+        // a Keychain that can't be asked is fixed by unlocking it, not by renewing every key
+        .filter(|r| {
+            r.state.needs_you()
+                && !matches!(r.state, keys::State::Unchecked(_))
+                && matches!(r.def.store, keys::Store::Keychain { .. })
+        })
         .collect();
     if due.is_empty() {
         println!("\nNothing to renew.");
@@ -2602,6 +2596,25 @@ fn keys(renew: bool, notify: bool, record: Option<&str>) -> Result<(), String> {
         renew_key(&home, r.def)?;
     }
     Ok(())
+}
+
+/// Every key's row, from the Keychain and the engine's own records (S43).
+fn key_rows(home: &Path) -> Result<Vec<bmv_trader::keys::Row>, String> {
+    use bmv_trader::keys::{self, Facts, Policy};
+    let policy = Policy::load(home)?;
+    let present =
+        |service: &'static str, account: &'static str| config::keychain_present(service, account);
+    let automatic = |id: &'static str| key_automatic(home, id);
+    let facts = Facts {
+        present: &present,
+        automatic: &automatic,
+    };
+    Ok(keys::rows(
+        &policy,
+        &keys::read_dates(home)?,
+        &facts,
+        chrono::Utc::now(),
+    ))
 }
 
 /// One automatic key's state, from its own records.
@@ -2972,9 +2985,7 @@ fn llm_health() -> Result<bool, String> {
         .and_then(|p| bmv_trader::keys::read_dates(&home).map(|d| (p, d)))
     {
         Ok((policy, dates)) => {
-            let present = |s: &'static str, a: &'static str| {
-                matches!(config::keychain_present(s, a), Ok(true))
-            };
+            let present = |s: &'static str, a: &'static str| config::keychain_present(s, a);
             let automatic = |_: &'static str| Ok(String::new());
             let facts = bmv_trader::keys::Facts {
                 present: &present,

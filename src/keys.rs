@@ -319,6 +319,8 @@ pub enum State {
     /// In the Keychain, but never renewed through this tracker: its age is unknown.
     Unknown,
     Missing,
+    /// The Keychain couldn't be asked (locked, timed out, `security` missing): not a missing key.
+    Unchecked(String),
     /// An optional key that isn't set up.
     NotUsed,
     Automatic(Result<String, String>),
@@ -334,6 +336,7 @@ impl State {
                 | State::Overdue { .. }
                 | State::Unknown
                 | State::Missing
+                | State::Unchecked(_)
                 | State::Automatic(Err(_))
         )
     }
@@ -345,6 +348,7 @@ impl State {
             State::Overdue { days } => format!("RENEW: {days} days overdue"),
             State::Unknown => "RENEW: date unknown".into(),
             State::Missing => "MISSING: not in the Keychain".into(),
+            State::Unchecked(e) => format!("UNKNOWN: can't check the Keychain ({e})"),
             State::NotUsed => "not set up (optional)".into(),
             State::Automatic(Ok(s)) => format!("automatic: {s}"),
             State::Automatic(Err(s)) => format!("PROBLEM: {s}"),
@@ -364,7 +368,7 @@ pub struct Row {
 /// What the owner's machine says about each key: whether its Keychain item exists, and the
 /// automatic keys' own states.
 pub struct Facts<'a> {
-    pub present: &'a dyn Fn(&'static str, &'static str) -> bool,
+    pub present: &'a dyn Fn(&'static str, &'static str) -> Result<bool, String>,
     pub automatic: &'a dyn Fn(&'static str) -> Result<String, String>,
 }
 
@@ -380,18 +384,18 @@ pub fn rows(
             let (renewed, due, state) = match d.store {
                 Store::Lasting => (None, None, State::Lasting),
                 Store::Automatic => (None, None, State::Automatic((facts.automatic)(d.id))),
-                Store::Keychain { service, account } => {
-                    if !(facts.present)(service, account) {
-                        (
-                            None,
-                            None,
-                            if d.optional {
-                                State::NotUsed
-                            } else {
-                                State::Missing
-                            },
-                        )
-                    } else {
+                Store::Keychain { service, account } => match (facts.present)(service, account) {
+                    Err(e) => (None, None, State::Unchecked(e)),
+                    Ok(false) => (
+                        None,
+                        None,
+                        if d.optional {
+                            State::NotUsed
+                        } else {
+                            State::Missing
+                        },
+                    ),
+                    Ok(true) => {
                         let every = d.every.and_then(|f| policy.every(f)).unwrap_or(30);
                         // a date in the future is as good as none: it could hide a due key
                         match dates
@@ -422,7 +426,7 @@ pub fn rows(
                             }
                         }
                     }
-                }
+                },
             };
             Row {
                 def: d,
@@ -446,6 +450,24 @@ pub fn table(rows: &[Row]) -> String {
         );
     }
     out
+}
+
+/// The table for the console's desk page (S47): names, dates and states only, never where a key
+/// is kept.
+pub fn json(rows: &[Row]) -> serde_json::Value {
+    rows.iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.def.id,
+                "name": r.def.name,
+                "breaks": r.def.breaks,
+                "renewed": r.renewed,
+                "due": r.due,
+                "state": r.state.label(),
+                "needs_you": r.state.needs_you(),
+            })
+        })
+        .collect()
 }
 
 /// The notification text when anything needs the owner, or None when all is well.
@@ -555,7 +577,7 @@ mod tests {
             "claude-desk".to_string(),
             "2026-10-01T00:00:00Z".to_string(),
         );
-        let present = |_: &'static str, a: &'static str| a != "omniroute-agents";
+        let present = |_: &'static str, a: &'static str| Ok(a != "omniroute-agents");
         let automatic = |id: &'static str| {
             if id == "omniroute-engine" {
                 Err("rotation failed".into())
@@ -616,13 +638,38 @@ mod tests {
         for id in ["claude-engine", "claude-desk", "openrouter-management"] {
             dates.insert(id.to_string(), "2026-11-10T00:00:00Z".to_string());
         }
-        let present = |_: &'static str, a: &'static str| a != "omniroute-agents";
+        let present = |_: &'static str, a: &'static str| Ok(a != "omniroute-agents");
         let automatic = |_: &'static str| Ok("fine".into());
         let facts = Facts {
             present: &present,
             automatic: &automatic,
         };
         assert!(notice(&rows(&p, &dates, &facts, t("2026-11-12T00:00:00Z"))).is_none());
+    }
+
+    #[test]
+    fn a_keychain_that_cant_be_asked_is_not_a_missing_key() {
+        let present = |_: &'static str, _: &'static str| Err("security timed out".to_string());
+        let automatic = |_: &'static str| Ok("fine".into());
+        let facts = Facts {
+            present: &present,
+            automatic: &automatic,
+        };
+        let rows = rows(
+            &policy(),
+            &BTreeMap::new(),
+            &facts,
+            t("2026-11-12T00:00:00Z"),
+        );
+        let s = state(&rows, "claude-engine");
+        assert_eq!(s, &State::Unchecked("security timed out".into()));
+        assert!(s.needs_you() && s.label().contains("can't check the Keychain"));
+        let j = json(&rows);
+        assert_eq!(j[0]["needs_you"], true);
+        assert!(
+            !j.to_string().contains("ANTHROPIC_API_KEY"),
+            "never where a key is kept"
+        );
     }
 
     #[test]

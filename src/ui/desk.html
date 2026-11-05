@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>bmv-trader desk</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/desk.js" defer></script>
+</head>
+<body class="desk">
+<header class="appbar">
+  <div class="inner">
+    <a class="brand" href="/"><span class="mark" aria-hidden="true"></span>bmv-trader</a>
+    <nav class="tabs" aria-label="Pages">
+      <a href="/" data-tab="overview">Overview</a>
+      <a href="/" data-tab="research">Research</a>
+      <a href="/desk" class="is-active" aria-current="page">Desk</a>
+      <a href="/services">Services</a>
+      <a href="/help">Help</a>
+    </nav>
+    <div class="pills">
+      <span id="state-pill" class="pill state" data-aspect="unknown"><span class="dot" aria-hidden="true"></span><span id="state-word">Checking</span></span>
+      <time id="clock" class="clock"></time>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="status" id="signal" data-aspect="unknown" aria-live="polite">
+    <div class="lamp" aria-hidden="true"></div>
+    <div class="aspect">
+      <h1 id="state">Checking</h1>
+      <p id="meta">Waiting for the first reading of the Quant Desk</p>
+    </div>
+  </section>
+  <p id="problem" class="banner" hidden></p>
+
+  <section class="card" aria-labelledby="h-requests">
+    <div class="card-head">
+      <h2 id="h-requests">Waiting for you</h2>
+      <span id="requests-count" class="badge"></span>
+      <p class="note">Each request is approved in Terminal with <code>desk sign &lt;id&gt;</code>. The Touch ID
+        prompt shows the same text as below; approve only if they match. This page can't approve anything.</p>
+    </div>
+    <ul id="requests" class="packs"></ul>
+  </section>
+
+  <section class="card" aria-labelledby="h-pipeline">
+    <div class="card-head">
+      <h2 id="h-pipeline">Pipeline</h2>
+      <label class="filter">Stage
+        <select id="stage"><option value="">All stages</option></select>
+      </label>
+      <p class="note">Every strategy the desk holds, from idea to live. Choose one to see its evidence, criteria and sign-offs.</p>
+    </div>
+    <div class="scroll"><table class="pipeline"><thead><tr>
+      <th><button type="button" class="sort" data-key="id">#</button></th>
+      <th><button type="button" class="sort" data-key="name">Strategy</button></th>
+      <th><button type="button" class="sort" data-key="rank">Stage</button></th>
+      <th class="n">Version</th>
+      <th>Criteria</th>
+    </tr></thead>
+    <tbody id="strategies"></tbody></table></div>
+  </section>
+
+  <div class="pair">
+    <section class="card" aria-labelledby="h-halts">
+      <div class="card-head"><h2 id="h-halts">Halts</h2><span id="halts-count" class="badge"></span></div>
+      <ul id="halts" class="night"></ul>
+    </section>
+    <section class="card" aria-labelledby="h-audit">
+      <div class="card-head">
+        <h2 id="h-audit">Audit trail</h2>
+        <p class="note">Every desk action is chained by hash; a change to any past entry breaks the chain.</p>
+      </div>
+      <p id="audit" class="audit"></p>
+    </section>
+  </div>
+
+  <section class="card" aria-labelledby="h-budgets">
+    <div class="card-head">
+      <h2 id="h-budgets">Agent budgets this month</h2>
+      <p class="note">An agent stops at its limit until the owner sets next month's budget.</p>
+    </div>
+    <ul id="budgets" class="budgets"></ul>
+  </section>
+
+  <section class="card" aria-labelledby="h-keys">
+    <div class="card-head">
+      <h2 id="h-keys">Keys</h2>
+      <span id="keys-count" class="badge"></span>
+      <p class="note">Renew any marked key with <code>scripts/keys.sh renew</code>.</p>
+    </div>
+    <p id="keys-note" class="note" role="status"></p>
+    <div class="scroll"><table class="keys"><thead><tr><th>Key</th><th>Renewed</th><th>Due</th><th>State</th><th>If it lapses</th></tr></thead>
+    <tbody id="keys"></tbody></table></div>
+  </section>
+</main>
+
+<dialog id="detail" class="drawer" aria-labelledby="detail-title">
+  <div class="drawer-head">
+    <h2 id="detail-title"></h2>
+    <button type="button" id="detail-close" class="quiet small">Close</button>
+  </div>
+  <div id="detail-body"></div>
+</dialog>
+</body>
+</html>

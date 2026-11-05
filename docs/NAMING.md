@@ -39,6 +39,7 @@ Owner's decision S44 (2026-11-05). `tests/naming.rs` checks the parts that can b
 | `run` | one execution of a job | trial |
 | `job` | a scheduled launchd task | cron, task |
 | `notes` | Tier-2 text for the owner (briefs, digests) | reports |
+| `console` | the local web page `bmv-trader ui` serves (Overview, Desk, Services, Help) | dashboard, admin; Anthropic's site is always "Anthropic Console" |
 
 Allowed abbreviations:
 - `hod` (Head of Desk), `res` (Researcher), `val` (Validator), `stress` (Stress Lead)
@@ -65,12 +66,13 @@ Allowed abbreviations:
 | **Repo config** | `deploy/<noun>.json`, snake_case fields | `deploy/models.json`, `deploy/agents.json` |
 | **Data files** | `data/<area>[_<noun>].<ext>`, snake_case; a folder per area once it has more than one file | `data/tier2_spend.jsonl`, `data/desk/analyses.jsonl` |
 | **Data file kinds** | `.jsonl` append-only log; `.json` current state; `.log` a job's output; `.lock` a lock | `free_keys.jsonl`, `keys.json`, `keys.log`, `free_keys.lock` |
-| **Keychain service** | `bmv-trader` for the engine and owner; `bmv-desk-models` for the desk agents' model keys | |
-| **Keychain account** | under `bmv-trader`: UPPER_SNAKE, the name it would have as an environment variable (`<PROVIDER>_<PURPOSE>_KEY`); under `bmv-desk-models`: `<provider>-<scope>` kebab | `OPENROUTER_MANAGEMENT_KEY`; `anthropic-desk` |
+| **Keychain service** | `bmv-trader` for the engine and owner; `bmv-desk-models` for the desk agents' model keys; `bmv-desk` for desk tokens the owner's own programs hold | |
+| **Keychain account** | under `bmv-trader`: UPPER_SNAKE, the name it would have as an environment variable (`<PROVIDER>_<PURPOSE>_KEY`); under `bmv-desk-models`: `<provider>-<scope>` kebab; under `bmv-desk`: the desk agent id | `OPENROUTER_MANAGEMENT_KEY`; `anthropic-desk`; `engine-1`, `console-1` |
 | **Key at a provider** | `bmv-<use>-<YYYY-MM>`, or `bmv-<use>-<YYYYMMDD-HHMM>` when made more than once a month | `bmv-engine-2026-12`, `bmv-free-20261105-1820` |
 | **Key tracker id** | `<provider>-<scope>` kebab | `claude-engine`, `openrouter-management` |
 | **Environment variable** | `BMV_<NOUN>`; a third party's own prefix is left alone | `BMV_HOME`, `BMV_NEW_KEY`; `PAPERCLIP_RUN_ID` |
-| **Desk agent id** | `<role abbreviation>-<n>` | `hod-1`, `res-1`, `val-1`, `stress-1` |
+| **Desk agent id** | `<role abbreviation>-<n>`; a program's own login is `<program>-<n>` | `hod-1`, `res-1`, `val-1`, `stress-1`; `engine-1`, `console-1` |
+| **Console route** | pages `/<page>` and their script `/<page>.js`; data `/api/<area>` or `/api/<area>/<noun>`, kebab segments | `/desk`, `/desk.js`, `/api/keys`, `/api/desk/snapshot` |
 | **Paperclip agent name** | `<Role Name> (<id>)` | `Validator (val-1)` |
 | **OmniRoute route** | `bmv-<tier>` | `bmv-free` |
 | **OmniRoute connection** | `<provider>-<tier>` | `openrouter-free` |
@@ -89,6 +91,7 @@ name, so it stays until a migration script replaces it.
 | `deploy/paperclip/` | uses the product's name, not `clip` | it's Paperclip's own package lock, named for the package |
 | `scripts/desk-wave1.sh` | names a rollout phase, not an action | its commands (`agents`, `tokens`, `budgets`) are in the owner's runbook; rename it when wave 2 changes it |
 | `com.bmv-trader.llm` runs `llm-daily` | the label names the job, the command its action | that's the rule: labels name jobs |
+| Console route `/api/desk` | it serves trial 10's progress, but `desk` now means the Quant Desk | the Overview page reads it; rename when trial 10's view is next changed |
 | `scripts/*.py` | Rust-first (`.claude/rules/rust-first.md`) | ported when next changed |
 
 ## Adding a name

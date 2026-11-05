@@ -180,3 +180,37 @@ fn the_key_tracker_ids_are_kebab() {
         }
     }
 }
+
+#[test]
+fn console_routes_are_kebab_segments() {
+    let ui = std::fs::read_to_string(root().join("src/ui.rs")).unwrap();
+    let table = ui
+        .split_once("pub const ROUTES")
+        .and_then(|(_, rest)| rest.split_once("];"))
+        .map(|(t, _)| t)
+        .expect("src/ui.rs: no ROUTES table");
+    let mut seen = 0;
+    for line in table.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("(\"")
+            && let Some((_, path)) = rest.split_once("\", \"")
+        {
+            let path = path.trim_end_matches("\"),");
+            for seg in path
+                .trim_start_matches('/')
+                .split('/')
+                .filter(|s| !s.is_empty())
+            {
+                let seg = seg
+                    .strip_suffix(".js")
+                    .or(seg.strip_suffix(".css"))
+                    .unwrap_or(seg);
+                assert!(kebab(seg), "src/ui.rs: route {path:?}: {seg:?} isn't kebab");
+            }
+            seen += 1;
+        }
+    }
+    assert!(
+        seen > 10,
+        "found only {seen} routes; has ROUTES changed shape?"
+    );
+}

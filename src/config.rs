@@ -44,16 +44,49 @@ pub(crate) fn keychain(account: &str) -> Result<Option<String>, String> {
     keychain_in(KEYCHAIN_SERVICE, account)
 }
 
-/// Whether a Keychain item exists, without reading its value.
+/// Whether a Keychain item exists, without reading its value. Only "not found" (exit 44) is false;
+/// a locked keychain, a denied prompt or a hang is an error, never "missing".
 pub fn keychain_present(service: &str, account: &str) -> Result<bool, String> {
-    let out = std::process::Command::new("/usr/bin/security")
+    use std::time::{Duration, Instant};
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    let mut child = std::process::Command::new("/usr/bin/security")
         .args(["find-generic-password", "-s", service, "-a", account])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
+        .spawn()
         .map_err(|e| format!("cannot run /usr/bin/security: {e}"))?;
-    Ok(out.success())
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "Keychain check for {account} timed out; is the keychain unlocked?"
+                ));
+            }
+            Err(e) => return Err(format!("Keychain check for {account} failed: {e}")),
+        }
+    };
+    present_reply(account, status.code())
+}
+
+fn present_reply(account: &str, code: Option<i32>) -> Result<bool, String> {
+    match code {
+        Some(0) => Ok(true),
+        Some(44) => Ok(false),
+        Some(c) => Err(format!(
+            "Keychain check for {account} failed (security exit {c})"
+        )),
+        None => Err(format!(
+            "Keychain check for {account} was stopped by a signal"
+        )),
+    }
 }
 
 /// The same, for an item under another service (the desk agents' keys use `bmv-desk-models`).
@@ -259,6 +292,15 @@ pub fn from_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_not_found_means_a_key_is_missing() {
+        assert_eq!(present_reply("k", Some(0)), Ok(true));
+        assert_eq!(present_reply("k", Some(44)), Ok(false));
+        // 36 and 51 are what a locked keychain or a denied prompt give: unknown, never missing
+        assert!(present_reply("k", Some(36)).is_err());
+        assert!(present_reply("k", None).is_err());
+    }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let pairs: Vec<(String, String)> = pairs

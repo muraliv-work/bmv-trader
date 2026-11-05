@@ -29,12 +29,17 @@ const APP_JS: &str = include_str!("ui/app.js");
 const APP_CSS: &str = include_str!("ui/app.css");
 const SERVICES: &str = include_str!("ui/services.html");
 const SERVICES_JS: &str = include_str!("ui/services.js");
+const DESK: &str = include_str!("ui/desk.html");
+const DESK_JS: &str = include_str!("ui/desk.js");
 /// lightweight-charts 5.1.0, standalone production build (Apache-2.0; src/ui/vendor/LICENSE).
 const CHART_JS: &str = include_str!("ui/vendor/lightweight-charts.js");
 /// The Services checks (Keychain, launchctl, loopback HTTP) run at most once per this.
 const SERVICES_SECS: u64 = 30;
 /// Trial 10 progress and the equity history are read at most once per this.
 const RESEARCH_SECS: u64 = 60;
+/// The Quant Desk and the key table are read at most once per this (S47): the audit walk is the
+/// whole chain, and the desk's connection slots are the agents'.
+const DESK_SECS: u64 = 120;
 
 /// The launchd jobs Run-now may start (DECISION S24): none of them can place an order.
 pub const RUNNABLE: [&str; 3] = ["desk", "notes", "llm"];
@@ -58,12 +63,14 @@ pub fn word(action: &str) -> &'static str {
 }
 
 /// Every route there is. A test pins it, so a new control can't slip in unreviewed.
-pub const ROUTES: [(&str, &str); 15] = [
+pub const ROUTES: [(&str, &str); 19] = [
     ("GET", "/"),
     ("GET", "/help"),
     ("GET", "/services"),
+    ("GET", "/desk"),
     ("GET", "/app.js"),
     ("GET", "/services.js"),
+    ("GET", "/desk.js"),
     ("GET", "/app.css"),
     ("GET", "/chart.js"),
     ("GET", "/api/state"),
@@ -71,6 +78,8 @@ pub const ROUTES: [(&str, &str); 15] = [
     ("GET", "/api/desk"),
     ("GET", "/api/equity"),
     ("GET", "/api/lessons"),
+    ("GET", "/api/desk/snapshot"),
+    ("GET", "/api/keys"),
     ("POST", "/api/stop"),
     ("POST", "/api/flatten"),
     ("POST", "/api/run"),
@@ -137,6 +146,10 @@ pub struct Ctx<'a> {
     pub equity: &'a (dyn Fn() -> Result<String, String> + Sync),
     /// `data/lessons.jsonl` as a JSON array (DESIGN §13d).
     pub lessons: &'a (dyn Fn() -> Result<String, String> + Sync),
+    /// The Quant Desk page's cached reading as JSON (`desk_reading`, S47).
+    pub quant: &'a (dyn Fn() -> Result<String, String> + Sync),
+    /// The key table as JSON (S43), cached with the desk reading.
+    pub keys: &'a (dyn Fn() -> Result<String, String> + Sync),
     /// Do one of `TARGETS`' actions; Ok is what to tell the user.
     pub service: &'a (dyn Fn(&str, &str) -> Result<String, String> + Sync),
 }
@@ -267,6 +280,8 @@ pub fn route(req: &Request, ctx: &Ctx) -> Response {
         "/services" => return Response::ok("text/html; charset=utf-8", SERVICES),
         "/app.js" => return Response::ok("text/javascript; charset=utf-8", APP_JS),
         "/services.js" => return Response::ok("text/javascript; charset=utf-8", SERVICES_JS),
+        "/desk" => return Response::ok("text/html; charset=utf-8", DESK),
+        "/desk.js" => return Response::ok("text/javascript; charset=utf-8", DESK_JS),
         "/app.css" => return Response::ok("text/css; charset=utf-8", APP_CSS),
         "/chart.js" => return Response::ok("text/javascript; charset=utf-8", CHART_JS),
         _ => {}
@@ -282,12 +297,15 @@ pub fn route(req: &Request, ctx: &Ctx) -> Response {
         );
     }
     match req.path.as_str() {
-        "/api/state" | "/api/services" | "/api/desk" | "/api/equity" | "/api/lessons" => {
+        "/api/state" | "/api/services" | "/api/desk" | "/api/equity" | "/api/lessons"
+        | "/api/desk/snapshot" | "/api/keys" => {
             let read = match req.path.as_str() {
                 "/api/state" => ctx.state,
                 "/api/services" => ctx.services,
                 "/api/desk" => ctx.desk,
                 "/api/lessons" => ctx.lessons,
+                "/api/desk/snapshot" => ctx.quant,
+                "/api/keys" => ctx.keys,
                 _ => ctx.equity,
             };
             match read() {
@@ -415,6 +433,25 @@ fn desk_json(home: &Path) -> Result<String, String> {
     let today = watch::today_et(chrono::Utc::now().timestamp());
     let p = desk::progress(home, &cal, &today)?;
     serde_json::to_string(&p).map_err(|e| format!("desk: {e}"))
+}
+
+/// The desk page's cache after one reading (the desk's, or the key table's): `checked` is when it
+/// was tried; `as_of` and `data` are the last reading that worked, so a source that's down shows
+/// its last known state and why.
+fn desk_reading(
+    prev: Option<&serde_json::Value>,
+    got: Result<serde_json::Value, String>,
+    now: &str,
+) -> serde_json::Value {
+    match got {
+        Ok(data) => serde_json::json!({"checked": now, "as_of": now, "error": null, "data": data}),
+        Err(e) => serde_json::json!({
+            "checked": now,
+            "as_of": prev.map_or(serde_json::Value::Null, |p| p["as_of"].clone()),
+            "error": e,
+            "data": prev.map_or(serde_json::Value::Null, |p| p["data"].clone()),
+        }),
+    }
 }
 
 /// The lessons file as one JSON array; small, so it's read per request.
@@ -612,7 +649,13 @@ fn handle(stream: TcpStream, ctx: &Ctx) {
 
 /// Serves until killed. Alpaca is read on its own thread and each connection gets a thread, so a
 /// slow client or a slow Alpaca never delays STOP.
-pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), String> {
+pub fn serve(
+    a: &Alpaca,
+    home: &Path,
+    mode: &str,
+    port: u16,
+    keys: &(dyn Fn() -> Result<String, String> + Sync),
+) -> Result<(), String> {
     let listener =
         TcpListener::bind((ADDR, port)).map_err(|e| format!("listen on {ADDR}:{port}: {e}"))?;
     let token = token()?;
@@ -638,6 +681,16 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
             .unwrap_or_else(|| Err("first reading not ready yet".to_string()))
     };
     let desk = || read(&desk_latest);
+    let quant_latest: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+    let keys_latest: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+    let cached = |m: &Mutex<Option<serde_json::Value>>| {
+        let l = m.lock().unwrap_or_else(|p| p.into_inner());
+        l.as_ref()
+            .map(|v| v.to_string())
+            .ok_or_else(|| "first reading not ready yet".to_string())
+    };
+    let quant = || cached(&quant_latest);
+    let keys_read = || cached(&keys_latest);
     let lessons = || lessons_json(home);
     let equity = || read(&equity_latest);
     let refresh = || dirty.store(true, Ordering::SeqCst);
@@ -658,6 +711,8 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
         desk: &desk,
         equity: &equity,
         lessons: &lessons,
+        quant: &quant,
+        keys: &keys_read,
         service: &service,
     };
     println!(
@@ -697,6 +752,38 @@ pub fn serve(a: &Alpaca, home: &Path, mode: &str, port: u16) -> Result<(), Strin
                 *equity_latest.lock().unwrap_or_else(|p| p.into_inner()) =
                     Some(equity_json(a, home));
                 std::thread::sleep(Duration::from_secs(RESEARCH_SECS));
+            }
+        });
+        // the Quant Desk page (S47): one reading per DESK_SECS, kept when the desk is down
+        s.spawn(|| {
+            // tried again every reading until it works, so adding the token needs no restart
+            let mut reader = None;
+            loop {
+                let got = match reader
+                    .take()
+                    .map_or_else(crate::desk_link::Reader::from_keychain, Ok)
+                {
+                    Ok(r) => {
+                        let got = r.snapshot();
+                        // a failed reading logs in again next time: a reissued token needs no restart
+                        if got.is_ok() {
+                            reader = Some(r);
+                        }
+                        got
+                    }
+                    Err(e) => Err(e),
+                };
+                let now = chrono::Utc::now().to_rfc3339();
+                let mut l = quant_latest.lock().unwrap_or_else(|p| p.into_inner());
+                *l = Some(desk_reading(l.as_ref(), got, &now));
+                drop(l);
+                let table = keys().and_then(|s| {
+                    serde_json::from_str(&s).map_err(|e| format!("the key table: {e}"))
+                });
+                let mut l = keys_latest.lock().unwrap_or_else(|p| p.into_inner());
+                *l = Some(desk_reading(l.as_ref(), table, &now));
+                drop(l);
+                std::thread::sleep(Duration::from_secs(DESK_SECS));
             }
         });
         for stream in listener.incoming() {
@@ -810,6 +897,8 @@ mod tests {
             desk: &desk,
             equity: &equity,
             lessons: &lessons,
+            quant: &desk,
+            keys: &lessons,
             service: &service,
         };
         let resp = route(r, &ctx);
@@ -831,8 +920,10 @@ mod tests {
                 "GET /",
                 "GET /help",
                 "GET /services",
+                "GET /desk",
                 "GET /app.js",
                 "GET /services.js",
+                "GET /desk.js",
                 "GET /app.css",
                 "GET /chart.js",
                 "GET /api/state",
@@ -840,11 +931,65 @@ mod tests {
                 "GET /api/desk",
                 "GET /api/equity",
                 "GET /api/lessons",
+                "GET /api/desk/snapshot",
+                "GET /api/keys",
                 "POST /api/stop",
                 "POST /api/flatten",
                 "POST /api/run"
             ]
         );
+    }
+
+    #[test]
+    fn the_desk_page_has_no_controls_and_its_data_needs_the_token() {
+        let page = call(&req("GET", "/desk", &[], "")).0;
+        assert_eq!(page.status, 200);
+        assert!(
+            !page.body.contains("<form"),
+            "no form: approvals stay in desk sign"
+        );
+        assert!(!page.body.contains("style=") && !page.body.contains("<script>"));
+        let js = call(&req("GET", "/desk.js", &[], "")).0;
+        assert_eq!(js.status, 200);
+        assert!(!js.body.contains("innerHTML") && !js.body.contains("insertAdjacentHTML"));
+        assert!(!js.body.contains("method:"), "every fetch is a GET");
+        let fetched: Vec<_> = js
+            .body
+            .match_indices("get(\"/api/")
+            .map(|(i, _)| js.body[i + 5..].split('"').next().unwrap())
+            .collect();
+        assert_eq!(fetched, ["/api/desk/snapshot", "/api/keys"]);
+        for path in ["/api/desk/snapshot", "/api/keys"] {
+            assert_eq!(call(&req("GET", path, &[], "")).0.status, 401);
+            assert_eq!(call(&req("POST", path, &[AUTH], "")).0.status, 405);
+        }
+        let (resp, _, calls) = call(&req("GET", "/api/desk/snapshot", &[AUTH], ""));
+        assert_eq!((resp.status, calls), (200, vec!["desk".to_string()]));
+        for page in ["/", "/help", "/services"] {
+            let body = call(&req("GET", page, &[], "")).0.body;
+            assert!(body.contains("href=\"/desk\""), "{page} links to Desk");
+        }
+    }
+
+    #[test]
+    fn a_desk_that_is_down_keeps_its_last_reading_and_says_why() {
+        let first = desk_reading(None, Err("no console token".into()), "t0");
+        assert_eq!(first["data"], serde_json::Value::Null);
+        assert_eq!(first["error"], "no console token");
+        let good = desk_reading(
+            Some(&first),
+            Ok(serde_json::json!({"strategies": []})),
+            "t1",
+        );
+        assert_eq!(
+            (good["as_of"].as_str(), good["error"].is_null()),
+            (Some("t1"), true)
+        );
+        let down = desk_reading(Some(&good), Err("can't reach the desk".into()), "t2");
+        assert_eq!(down["checked"], "t2");
+        assert_eq!(down["as_of"], "t1", "the last reading that worked");
+        assert_eq!(down["data"]["strategies"], serde_json::json!([]));
+        assert_eq!(down["error"], "can't reach the desk");
     }
 
     #[test]
@@ -1025,6 +1170,8 @@ mod tests {
             desk: &state,
             equity: &state,
             lessons: &state,
+            quant: &state,
+            keys: &state,
             service: &|_, _| Err("not in this test".into()),
         };
         let resp = route(r, &ctx);
@@ -1047,6 +1194,8 @@ mod tests {
             desk: &state,
             equity: &state,
             lessons: &state,
+            quant: &state,
+            keys: &state,
             service: &|_, _| Err("not in this test".into()),
         };
         for path in [
@@ -1055,6 +1204,8 @@ mod tests {
             "/api/desk",
             "/api/equity",
             "/api/lessons",
+            "/api/desk/snapshot",
+            "/api/keys",
         ] {
             assert_eq!(route(&req("GET", path, &[AUTH], ""), &ctx).status, 503);
         }

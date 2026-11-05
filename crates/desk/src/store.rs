@@ -400,6 +400,9 @@ impl Store {
         if role == Role::Engine {
             return Err(DeskError::Denied("the engine doesn't sign".into()));
         }
+        if role == Role::Console {
+            return Err(DeskError::Denied("the console only reads".into()));
+        }
         // one transaction: the version read here is the one every collected signature is for
         let version: i64 = sqlx::query_scalar("SELECT version FROM strategies WHERE id = ?")
             .bind(strategy)
@@ -604,6 +607,20 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         row.map(|(l, s)| Ok((dec(&l)?, dec(&s)?))).transpose()
+    }
+
+    /// Every agent's (limit, spent) this month, by agent id (S47).
+    pub async fn budgets(&self, agent_id: &str) -> Result<Vec<(String, Decimal, Decimal)>> {
+        self.authorize(agent_id, Action::ReadBudgets).await?;
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT agent_id, limit_usd, spent_usd FROM budgets WHERE month = ? ORDER BY agent_id",
+        )
+        .bind(month())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(a, l, s)| Ok((a, dec(&l)?, dec(&s)?)))
+            .collect()
     }
 
     /// Records what a model call actually cost, after it: always recorded, even past the limit,

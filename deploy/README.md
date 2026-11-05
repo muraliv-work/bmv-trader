@@ -152,6 +152,24 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.freekeys.
   its switch can flip to free, with `scripts/clip-key-swap.sh <agent> omniroute`, which keeps its
   desk token. Signers never get one.
 
+### Quant Desk console page (DECISION S47)
+
+The console's Desk page reads the desk as its own read-only login, `console-1`, role `console`. The desk refuses it every write. One-time setup, after the desk is rebuilt and restarted with S47:
+
+```sh
+/usr/local/libexec/bmv-desk/desk request '{"kind": "add_agent", "id": "console-1", "role": "console"}'
+/usr/local/libexec/bmv-desk/desk request '{"kind": "issue_token", "agent": "console-1"}'
+/usr/local/libexec/bmv-desk/desk pending
+```
+
+Approve both with `desk sign <id>` (add the agent first). Then store the token at the hidden prompt:
+
+```sh
+security add-generic-password -s bmv-desk -a console-1 -w
+```
+
+Restart `bmv-trader ui` and open Desk. It reads the desk every 2 minutes; until the token is there, it says so.
+
 ### Quant Desk evidence (DECISION S46)
 
 The engine posts code-computed evidence to the desk as its own identity, `engine-1`, role `engine`. One-time setup:

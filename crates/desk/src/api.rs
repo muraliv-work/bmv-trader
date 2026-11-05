@@ -103,6 +103,25 @@ async fn loopback_only(req: Request, next: Next) -> Response {
     }
 }
 
+/// The console's token reads only (S47): any request but a GET or HEAD is refused here, before a
+/// handler runs, so a write route added later is covered too. A token whose role can't be read
+/// is refused a write as well: the guard fails closed.
+async fn console_reads_only(Ctx(s): Desk, req: Request, next: Next) -> Response {
+    use axum::http::Method;
+    if matches!(*req.method(), Method::GET | Method::HEAD) {
+        return next.run(req).await;
+    }
+    // no token, or one the desk doesn't know: the handler refuses it with its own reason
+    let Ok(agent) = caller(&s, req.headers()).await else {
+        return next.run(req).await;
+    };
+    match s.role(&agent).await {
+        Ok(Role::Console) => denied("the console only reads").into_response(),
+        Ok(_) => next.run(req).await,
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
 async fn whoami(Ctx(s): Desk, h: HeaderMap) -> Reply {
     let agent = caller(&s, &h).await?;
     let role = s.role(&agent).await?;
@@ -341,8 +360,21 @@ async fn approve(
     Ok(Json(json!({"ok": true, "token": token})))
 }
 
+async fn budgets(Ctx(s): Desk, h: HeaderMap) -> Reply {
+    let agent = caller(&s, &h).await?;
+    let rows: Vec<Value> = s
+        .budgets(&agent)
+        .await?
+        .into_iter()
+        .map(|(a, l, sp)| json!({"agent": a, "limit_usd": l.to_string(), "spent_usd": sp.to_string()}))
+        .collect();
+    Ok(Json(json!(rows)))
+}
+
 async fn verify(Ctx(s): Desk, h: HeaderMap) -> Reply {
-    board(&s, &h).await?;
+    let agent = caller(&s, &h).await?;
+    s.authorize(&agent, crate::permissions::Action::VerifyAudit)
+        .await?;
     Ok(Json(json!({"entries": s.verify_audit().await?})))
 }
 
@@ -363,10 +395,15 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/v1/strategies/{id}/limits", get(limits).post(limit))
         .route("/v1/budget", get(budget))
         .route("/v1/budget/charge", post(charge))
+        .route("/v1/budgets", get(budgets))
         .route("/v1/owner/requests", get(pending).post(request))
         .route("/v1/owner/requests/{id}/approve", post(approve))
         .route("/v1/audit/verify", get(verify))
         .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            store.clone(),
+            console_reads_only,
+        ))
         .layer(middleware::from_fn(loopback_only))
         .with_state(store)
 }
@@ -772,6 +809,75 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("researcher")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_console_reads_everything_it_shows_and_writes_nothing() {
+        let (addr, store) = up().await;
+        store
+            .add_agent(
+                "board",
+                "console-1",
+                Role::Console,
+                Some(HumanProof::for_test()),
+            )
+            .await
+            .unwrap();
+        let console = store.issue_token("console-1").await.unwrap();
+        let res = store.issue_token("res-1").await.unwrap();
+        let made = blocking(
+            &addr,
+            "POST",
+            "/v1/strategies",
+            Some(res.clone()),
+            Some(json!({"name": "gap fade"})),
+        )
+        .await
+        .unwrap();
+        let id = made["id"].as_i64().unwrap();
+        for path in [
+            "/v1/strategies".to_string(),
+            format!("/v1/strategies/{id}/evidence"),
+            "/v1/owner/requests".into(),
+            "/v1/budgets".into(),
+            "/v1/audit/verify".into(),
+        ] {
+            let r = blocking(&addr, "GET", &path, Some(console.clone()), None).await;
+            assert!(r.is_ok(), "{path}: {r:?}");
+        }
+        // only the owner and the console see every budget and walk the chain
+        for path in ["/v1/budgets", "/v1/audit/verify"] {
+            assert!(
+                blocking(&addr, "GET", path, Some(res.clone()), None)
+                    .await
+                    .is_err()
+            );
+        }
+        for path in [
+            "/v1/strategies".to_string(),
+            format!("/v1/strategies/{id}/criteria"),
+            format!("/v1/strategies/{id}/versions"),
+            format!("/v1/strategies/{id}/backtests"),
+            format!("/v1/strategies/{id}/paper"),
+            format!("/v1/strategies/{id}/evidence"),
+            format!("/v1/strategies/{id}/sign"),
+            format!("/v1/strategies/{id}/halt"),
+            format!("/v1/strategies/{id}/limits"),
+            "/v1/budget/charge".into(),
+            "/v1/owner/requests".into(),
+            "/v1/owner/requests/x/approve".into(),
+        ] {
+            let e = blocking(&addr, "POST", &path, Some(console.clone()), Some(json!({})))
+                .await
+                .unwrap_err();
+            assert!(e.contains("the console only reads"), "{path}: {e}");
+        }
+        assert!(
+            store
+                .sign("console-1", id, State::HypothesisApproved)
+                .await
+                .is_err()
         );
     }
 
