@@ -8,9 +8,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The launchd jobs in deploy/: label, log, schedule (Mac local time, as in the plist), and
-/// whether the console may start it (`ui::RUNNABLE`).
-const JOBS: [(&str, &str, &str); 4] = [
+/// The launchd jobs in deploy/: label, log (empty: it writes none), schedule (Mac local time, as
+/// in the plist). Whether the console may start one is `ui::RUNNABLE`.
+const JOBS: [(&str, &str, &str); 7] = [
     (
         "com.bmv-trader.backstop",
         "data/backstop.log",
@@ -19,6 +19,15 @@ const JOBS: [(&str, &str, &str); 4] = [
     ("com.bmv-trader.desk", "data/desk/run.log", "weekdays 16:30"),
     ("com.bmv-trader.llm", "data/llm.log", "daily 05:30"),
     ("com.bmv-trader.notes", "data/notes/run.log", "daily 18:15"),
+    ("com.bmv-trader.keys", "data/keys.log", "daily 09:00"),
+    ("com.bmv-trader.freekeys", "data/free_keys.log", "every 6 h"),
+    ("com.bmv-trader.monthly", "", "the 1st, 09:00"),
+];
+/// The always-on system daemons (DESIGN §4c): name, loopback port, launchd label. Each answers
+/// any HTTP request; restarting one needs sudo, so the console only shows the command.
+const DAEMONS: [(&str, u16, &str); 2] = [
+    ("Quant Desk", 8790, "com.bmv.desk"),
+    ("Paperclip", 3100, "com.bmv.clip"),
 ];
 /// Keychain items by name; the bool is whether the item is required.
 const KEYS: [(&str, bool); 4] = [
@@ -98,6 +107,9 @@ pub fn check(home: &Path, console_port: u16) -> Report {
             )
         });
         out.push(job(label, log, schedule, installed, print));
+    }
+    for (name, port, label) in DAEMONS {
+        out.push(daemon(name, port, label, answers(port)));
     }
     out.push(ollama());
     out.push(omniroute(llm::omniroute_port(home)));
@@ -194,7 +206,14 @@ fn job(
                 .and_then(|n| n.trim().parse::<i32>().ok())
                 .is_some_and(|n| n != 0);
             let detail = format!("loaded, {state}, last exit {exit}; runs {schedule}");
-            let mut out = if failed {
+            let mut out = if failed && log.is_empty() {
+                c(
+                    &name,
+                    "warn",
+                    detail,
+                    &format!("launchctl print gui/$(id -u)/{label}"),
+                )
+            } else if failed {
                 c(&name, "warn", detail, &format!("tail -n 30 {log}"))
             } else if installed == Some(false) {
                 c(
@@ -217,6 +236,70 @@ fn job(
             out
         }
     }
+}
+
+/// Whether anything speaks HTTP on this loopback port. No token is sent: any reply, even a
+/// refusal, means the daemon is up.
+fn answers(port: u16) -> Result<u16, String> {
+    llm::client_within(HTTP_TIMEOUT)?
+        .get(format!("http://127.0.0.1:{port}/"))
+        .send()
+        .map(|r| r.status().as_u16())
+        .map_err(|e| e.without_url().to_string())
+}
+
+fn daemon(name: &str, port: u16, label: &str, reply: Result<u16, String>) -> Component {
+    match reply {
+        Ok(status) => c(
+            name,
+            "ok",
+            format!("answering on 127.0.0.1:{port} (HTTP {status})"),
+            "",
+        ),
+        Err(e) => c(
+            name,
+            "down",
+            format!("nothing answers on 127.0.0.1:{port}: {e}"),
+            &format!("sudo launchctl kickstart -k system/{label}"),
+        ),
+    }
+}
+
+/// Only these are started by `bmv-trader up`: parts meant to be always on that start without
+/// sudo and cost nothing. Never the engine, never a job's "run now" (the desk job spends Claude
+/// money), never Ollama (removed after trial 12).
+const ALWAYS_ON: [&str; 1] = ["omniroute"];
+
+/// What `up` starts from a report: the always-on parts that are down and offer "start".
+pub fn to_start(report: &Report) -> Vec<String> {
+    report
+        .components
+        .iter()
+        .filter(|c| {
+            c.status == "down"
+                && ALWAYS_ON.contains(&c.target.as_str())
+                && c.actions.contains(&"start")
+        })
+        .map(|c| c.target.clone())
+        .collect()
+}
+
+/// The report as a terminal table: every part's state, with the fix beside anything not ok.
+pub fn table(report: &Report) -> String {
+    let mut out = String::new();
+    for c in &report.components {
+        let word = match c.status {
+            "ok" => "ok",
+            "warn" => "CHECK",
+            "down" => "DOWN",
+            _ => "?",
+        };
+        out += &format!("{word:6} {:33} {}\n", c.name, c.detail);
+        if c.status != "ok" && !c.fix.is_empty() {
+            out += &format!("{:6} {:33} fix: {}\n", "", "", c.fix);
+        }
+    }
+    out
 }
 
 fn ollama() -> Component {
@@ -511,6 +594,53 @@ pub(crate) fn run(
 mod tests {
     use super::*;
 
+    fn part(
+        name: &str,
+        status: &'static str,
+        target: &str,
+        actions: Vec<&'static str>,
+    ) -> Component {
+        let mut out = c(name, status, String::new(), "fix it");
+        out.target = target.into();
+        out.actions = actions;
+        out
+    }
+
+    #[test]
+    fn up_starts_only_omniroute_when_it_is_down() {
+        let report = Report {
+            now: 0,
+            components: vec![
+                part("Engine (run)", "down", "", vec![]),
+                part("Ollama", "down", "ollama", vec!["start"]),
+                part("launchd desk", "ok", "desk", vec!["run", "restart"]),
+                part("launchd notes", "down", "notes", vec!["run", "restart"]),
+                part("OmniRoute API", "down", "omniroute", vec!["start"]),
+            ],
+        };
+        assert_eq!(to_start(&report), ["omniroute"]);
+        let up = Report {
+            now: 0,
+            components: vec![part("OmniRoute API", "ok", "omniroute", vec!["restart"])],
+        };
+        assert!(to_start(&up).is_empty(), "nothing restarts a running part");
+        let t = table(&report);
+        assert!(t.contains("DOWN   Ollama") && t.contains("fix: fix it"));
+    }
+
+    #[test]
+    fn a_daemon_is_up_when_it_answers_anything() {
+        let up = daemon("Quant Desk", 8790, "com.bmv.desk", Ok(403));
+        assert_eq!((up.status, up.fix.as_str()), ("ok", ""));
+        let down = daemon("Quant Desk", 8790, "com.bmv.desk", Err("refused".into()));
+        assert_eq!(down.status, "down");
+        assert_eq!(down.fix, "sudo launchctl kickstart -k system/com.bmv.desk");
+        assert!(
+            down.actions.is_empty(),
+            "the console never offers a sudo action"
+        );
+    }
+
     #[test]
     fn keychain_probe_can_only_answer_yes_or_no() {
         // the signature is the guarantee: no String, so no secret value can travel out
@@ -628,7 +758,10 @@ mod tests {
         std::fs::remove_dir_all(&home).unwrap();
         assert!(v["now"].is_i64());
         let comps = v["components"].as_array().unwrap();
-        assert_eq!(comps.len(), 2 + JOBS.len() + 2 + KEYS.len() + 1 + 3);
+        assert_eq!(
+            comps.len(),
+            2 + JOBS.len() + DAEMONS.len() + 2 + KEYS.len() + 1 + 3
+        );
         for comp in comps {
             let o = comp.as_object().unwrap();
             let mut keys: Vec<&str> = o.keys().map(String::as_str).collect();
@@ -661,21 +794,30 @@ mod tests {
     fn schedules_match_the_plists() {
         for (label, _, schedule) in JOBS {
             let plist = std::fs::read_to_string(format!("deploy/{label}.plist")).unwrap();
+            // layout-free: the plists differ in how they wrap a key and its value
+            let flat: String = plist.split_whitespace().collect();
             let int = |key: &str, n: &str| {
-                plist.contains(&format!("<key>{key}</key><integer>{n}</integer>"))
+                flat.contains(&format!("<key>{key}</key><integer>{n}</integer>"))
             };
-            let ok = match schedule.split_once(' ') {
-                Some(("every", "2 min")) => {
-                    plist.contains("<key>StartInterval</key>\n  <integer>120</integer>")
-                }
-                Some((days, hm)) => {
-                    let (h, m) = hm.split_once(':').unwrap();
-                    let h = h.trim_start_matches('0');
-                    int("Hour", h)
-                        && int("Minute", m)
-                        && (days == "daily") == !plist.contains("<key>Weekday</key>")
-                }
-                None => false,
+            let at = |hm: &str| {
+                // plists write 09:00 as Hour 9, Minute 0
+                let n = |s: &str| match s.trim_start_matches('0') {
+                    "" => "0".to_string(),
+                    v => v.to_string(),
+                };
+                let (h, m) = hm.split_once(':').unwrap();
+                int("Hour", &n(h)) && int("Minute", &n(m))
+            };
+            let ok = match schedule {
+                "every 2 min" => int("StartInterval", "120"),
+                "every 6 h" => int("StartInterval", "21600"),
+                s if s.starts_with("the 1st, ") => int("Day", "1") && at(&s[9..]),
+                s => match s.split_once(' ') {
+                    Some((days, hm)) => {
+                        at(hm) && (days == "daily") == !flat.contains("<key>Weekday</key>")
+                    }
+                    None => false,
+                },
             };
             assert!(ok, "{label}: {schedule} doesn't match its plist");
         }

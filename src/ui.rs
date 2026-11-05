@@ -380,7 +380,7 @@ fn run_job(req: &Request, ctx: &Ctx, host: &str) -> Response {
 
 /// Does one allowlisted action. launchd: `kickstart` (a running job is left alone) or
 /// `kickstart -k` (restart). OmniRoute: its own CLI, from ~/.omniroute with a cleared environment.
-fn service(target: &str, action: &str) -> Result<String, String> {
+pub fn service(target: &str, action: &str) -> Result<String, String> {
     if target == "omniroute" {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -655,6 +655,7 @@ pub fn serve(
     mode: &str,
     port: u16,
     keys: &(dyn Fn() -> Result<String, String> + Sync),
+    open: bool,
 ) -> Result<(), String> {
     let listener =
         TcpListener::bind((ADDR, port)).map_err(|e| format!("listen on {ADDR}:{port}: {e}"))?;
@@ -720,6 +721,16 @@ pub fn serve(
         ctx.token
     );
     println!("Keep this URL private: it is the key to STOP and flatten. Ctrl-C quits.");
+    if open {
+        // the token travels as an argument to `open`, on this Mac only, as when you click the URL
+        let url = format!("http://{ADDR}:{port}/#{}", ctx.token);
+        if let Err(e) = std::process::Command::new("/usr/bin/open")
+            .arg(&url)
+            .status()
+        {
+            eprintln!("couldn't open the browser ({e}); open the URL above");
+        }
+    }
     let active = AtomicUsize::new(0);
     std::thread::scope(|s| {
         s.spawn(|| {

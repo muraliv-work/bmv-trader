@@ -55,7 +55,7 @@ Allowed abbreviations:
 | **Rust items** | Rust API guidelines: `UpperCamel` types, `snake_case` functions and variables, `SCREAMING_SNAKE` constants | `Spend`, `month_spend`, `TIER2_MODEL` |
 | **Rust tests** | the behaviour as a sentence, in snake_case | `a_call_that_fails_after_sending_stays_booked_at_the_worst_case` |
 | **Binary** | `<crate>` or `<crate>-<role>` | `desk`, `desk-agent`, `desk-mcp`, `desk-sign` |
-| **Engine subcommand** | `<area>` or `<area>-<verb>`, kebab | `notes`, `keys`, `free-keys`, `desk-run`, `llm-rotate` |
+| **Engine subcommand** | `<area>` or `<area>-<verb>`, kebab; `up` is the one bare verb, for bringing the whole system up | `notes`, `keys`, `free-keys`, `desk-run`, `llm-rotate`, `up` |
 | **Flags** | `--kebab`; values after the flag, never bare positional words | `--record openrouter-management`, `--renew` |
 | **Script** | `scripts/<area>-<verb>.sh`; one-area entry points may be `<area>.sh`; sourced helpers are nouns | `clip-setup.sh`, `free-key-add.sh`, `keys.sh`, `hidden-user.sh` |
 | **Scripts run with sudo** | end in `-setup.sh` (or close a setup step, like `clip-close-signup.sh`), and show the `sudo` command in the header comment | `desk-setup.sh`, `clip-agents-setup.sh` |

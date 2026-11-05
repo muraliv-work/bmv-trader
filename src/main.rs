@@ -1,7 +1,7 @@
 use bmv_trader::backtest::{self, DayResult, FillModel};
 use bmv_trader::engine::{self, Entry, Settings};
 use bmv_trader::strategy::OrbParams;
-use bmv_trader::{broker, config, config::Mode, history, live, stats, ui, watch};
+use bmv_trader::{broker, config, config::Mode, history, live, services, stats, ui, watch};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::exit;
@@ -11,6 +11,7 @@ const USAGE: &str = "usage:
   bmv-trader status                       account, positions and open orders (read-only)
   bmv-trader watch                        live read-only monitor, refreshes every 5 s (Ctrl-C quits)
   bmv-trader ui       [--port 8765]       web console on 127.0.0.1: the watch view plus STOP and flatten
+  bmv-trader up       [--port 8765]       checks every part, starts OmniRoute if it's down, then opens the console
   bmv-trader run      [--symbols ...] [--trend] [--marketable]   one paper session (PAPER ONLY; live is P5)
   bmv-trader flatten                      close every position and confirm (any mode)
   bmv-trader backstop                     for launchd: near the close, flatten anything left (deploy/)
@@ -188,6 +189,7 @@ fn main() {
             Some("status") => status(),
             Some("watch") => watch(),
             Some("ui") => ui(args.num("--port", 8765, 1024..=65535)?),
+            Some("up") => up(args.num("--port", 8765, 1024..=65535)?),
             Some("flatten") => flatten(),
             Some("backstop") => backstop(),
             Some("run") => run(&args.symbols()?, args.has("--trend"), orb_params(&args)),
@@ -443,7 +445,54 @@ fn ui(port: usize) -> Result<(), String> {
     let home = config::home()?;
     let keys =
         || -> Result<String, String> { Ok(bmv_trader::keys::json(&key_rows(&home)?).to_string()) };
-    ui::serve(&connect()?, &home, &mode, port, &keys)
+    ui::serve(&connect()?, &home, &mode, port, &keys, false)
+}
+
+/// One command for a normal day: checks every part (the Services page's checks), starts only
+/// the always-on parts that are down (`services::to_start`), prints what's left to fix, then
+/// serves the console and opens it. Never starts the trading engine.
+fn up(port: usize) -> Result<(), String> {
+    let port = u16::try_from(port).map_err(|_| "--port out of range".to_string())?;
+    let home = config::home()?;
+    // a console already on this port holds its own login link; a second one can't take the port
+    if std::net::TcpListener::bind((ui::ADDR, port)).is_err() {
+        return Err(format!(
+            "a console is already running on {}:{port}: open the URL it printed, or stop it and run up again",
+            ui::ADDR
+        ));
+    }
+    println!("checking every part...");
+    let mut report = services::check(&home, port);
+    let starting = services::to_start(&report);
+    for target in &starting {
+        match ui::service(target, "start") {
+            Ok(m) => println!("started {target}: {m}"),
+            Err(e) => println!("couldn't start {target}: {e}"),
+        }
+    }
+    if !starting.is_empty() {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        report = services::check(&home, port);
+    }
+    // the console's own row describes a page that isn't up yet
+    report.components.retain(|c| c.name != "Web console");
+    print!("\n{}", services::table(&report));
+    let left = report
+        .components
+        .iter()
+        .filter(|c| c.status == "down")
+        .count();
+    println!(
+        "\n{}; the trading engine is never started here (cargo run --release -- run).\n",
+        if left == 0 {
+            "everything that should be up is up".to_string()
+        } else {
+            format!("{left} part(s) down: run the fix shown beside each")
+        }
+    );
+    let keys =
+        || -> Result<String, String> { Ok(bmv_trader::keys::json(&key_rows(&home)?).to_string()) };
+    ui::serve(&connect()?, &home, &mode_name()?, port, &keys, true)
 }
 
 /// launchd runs this every 2 minutes (deploy/). Between closes it exits at once, without the
