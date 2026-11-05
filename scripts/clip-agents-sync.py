@@ -63,6 +63,16 @@ def payload(a):
     }
 
 
+def budget(cid, scope, sid, cents):
+    """Paperclip's budget for one scope, with unpriced usage allowed. Paperclip records an
+    unpriced cost event for every process-adapter run (it can't see what one cost), and by
+    default any unpriced event is a hard stop. The desk is the budget authority and charges every
+    Claude call itself; desk-agent reports each one to Paperclip priced, so those still count."""
+    cli("budget", "policy:upsert", "-C", cid, "--payload-json", json.dumps({
+        "scopeType": scope, "scopeId": sid, "amount": cents, "hardStopEnabled": True,
+        "unpricedUsagePolicy": "allow"}))
+
+
 def schedule(rid, cron):
     """Gives the routine one schedule trigger on `cron`, New York time: made if missing (also
     after a run that stopped between making the routine and its trigger), updated if changed."""
@@ -103,6 +113,7 @@ def main():
                                   "budgetMonthlyCents": 10000}))
         print(f"made company {COMPANY}")
     cid = company["id"]
+    budget(cid, "company", cid, company.get("budgetMonthlyCents") or 10000)
 
     existing = {(x.get("metadata") or {}).get("bmvAgent"): x for x in cli("agent", "list", "-C", cid) or []}
     routines = {r.get("title"): r for r in cli("routine", "list", "-C", cid) or []}
@@ -115,6 +126,7 @@ def main():
         else:
             pid = cli("agent", "create", "-C", cid, "--payload-json", json.dumps(body))["id"]
             print(f"made {a['id']} ({body['name']})")
+        budget(cid, "agent", pid, body["budgetMonthlyCents"])
         if a["schedule"]:
             title = f"{a['id']} scheduled run"
             if title in routines:

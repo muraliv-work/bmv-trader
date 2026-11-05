@@ -42,11 +42,12 @@ read -r -s -p "Desk token for $AGENT (hidden): " TOKEN
 echo
 [[ $TOKEN =~ ^[A-Za-z0-9_-]{20,200}$ ]] || { echo "clip-keys: that doesn't look like a desk token" >&2; exit 1; }
 
-# the JSON is built from stdin and written by the agent's user, so neither key is in any argv
+# the JSON is built from stdin and written by the agent's user, so neither key is in any argv;
+# from /, because the agent's user can't see your working folder
 printf '%s\n%s\n' "$TOKEN" "$MODEL_KEY" | /usr/bin/python3 -I -c '
 import json, sys
 token, key = sys.stdin.read().splitlines()[:2]
 print(json.dumps({"desk_token": token, sys.argv[1]: key}))
-' "$FIELD" | sudo -u "$RUNS_AS" /bin/sh -c 'umask 077; set -C; rm -f "$1.new"; cat > "$1.new" && mv -f "$1.new" "$1"' clip-keys "$KEYS"
+' "$FIELD" | (cd / && sudo -u "$RUNS_AS" /bin/sh -c 'umask 077; set -C; rm -f "$1.new"; cat > "$1.new" && mv -f "$1.new" "$1"' clip-keys "$KEYS")
 unset TOKEN MODEL_KEY
 echo "wrote $KEYS (readable by $RUNS_AS only)"
