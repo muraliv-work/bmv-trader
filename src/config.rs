@@ -41,19 +41,29 @@ pub const KEYCHAIN_SERVICE: &str = "bmv-trader";
 /// One Keychain item, via Apple's own CLI (absolute path, so PATH can't swap it). Not found is
 /// None; any other failure, such as a locked keychain, a denied prompt or a hang, is an error.
 pub(crate) fn keychain(account: &str) -> Result<Option<String>, String> {
+    keychain_in(KEYCHAIN_SERVICE, account)
+}
+
+/// Whether a Keychain item exists, without reading its value.
+pub fn keychain_present(service: &str, account: &str) -> Result<bool, String> {
+    let out = std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", service, "-a", account])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("cannot run /usr/bin/security: {e}"))?;
+    Ok(out.success())
+}
+
+/// The same, for an item under another service (the desk agents' keys use `bmv-desk-models`).
+pub fn keychain_in(service: &str, account: &str) -> Result<Option<String>, String> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     // A locked keychain over SSH can wait forever on a prompt; startup must fail instead of hang.
     const TIMEOUT: Duration = Duration::from_secs(10);
     let mut child = Command::new("/usr/bin/security")
-        .args([
-            "find-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            account,
-            "-w",
-        ])
+        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

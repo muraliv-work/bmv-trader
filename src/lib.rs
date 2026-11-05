@@ -9,6 +9,7 @@ pub mod desk_link;
 pub mod engine;
 pub mod free_keys;
 pub mod history;
+pub mod keys;
 pub mod lab;
 pub mod live;
 pub mod llm;

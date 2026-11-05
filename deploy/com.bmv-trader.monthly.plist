@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Monthly reminder (DECISION S41): on the 1st at 09:00 Mac time, a notification to run scripts/rotate-keys.sh (new Claude keys, desk budgets). It only notifies; it touches no key. Install: deploy/README.md -->
+<!-- Monthly reminder (DECISIONS S41, S43): on the 1st at 09:00 Mac time, a notification to renew the desk budgets. Keys have their own daily tracker (com.bmv-trader.keys). Install: deploy/README.md -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -9,7 +9,7 @@
   <array>
     <string>/usr/bin/osascript</string>
     <string>-e</string>
-    <string>display notification "Rotate the Claude keys and renew the desk budgets: run scripts/rotate-keys.sh" with title "bmv-trader: monthly keys" sound name "default"</string>
+    <string>display notification "Renew the desk budgets for the new month: run scripts/desk-wave1.sh budgets, then desk sign each" with title "bmv-trader: monthly budgets" sound name "default"</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict><key>Day</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>

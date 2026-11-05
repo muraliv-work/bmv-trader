@@ -128,11 +128,11 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.notes.pli
   2. make a combo named `bmv-free` with them in fallback order, and no Ollama
   3. allow `bmv-free` on the desk agents' OmniRoute key
   - **Until `bmv-free` exists, the daily rotation's test call fails.**
-- **Monthly:** run `scripts/rotate-keys.sh`. It walks through each key, and the reminder below prompts
-  you on the 1st:
+- **Keys (S43):** `scripts/keys.sh` shows every key, its renewal date, due date and state. `scripts/keys.sh renew` walks through the due ones: what each is, where to get a new one, a hidden paste, a test, then saving it and updating everything that uses it. A notification at 09:00 says when any key is 10 days or less from due, and one on the 1st reminds you to renew the desk budgets:
 
 ```sh
-cp deploy/com.bmv-trader.monthly.plist ~/Library/LaunchAgents/
+cp deploy/com.bmv-trader.keys.plist deploy/com.bmv-trader.monthly.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.keys.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.monthly.plist
 ```
 

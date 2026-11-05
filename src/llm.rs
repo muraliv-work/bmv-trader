@@ -871,26 +871,30 @@ pub fn parse_new_key(stdout: &str) -> Result<String, String> {
 }
 
 /// The `security -i` command that stores `secret`; refuses anything that could break its quoting.
-fn keychain_line(account: &str, secret: &str) -> Result<String, String> {
+fn keychain_line_in(service: &str, account: &str, secret: &str) -> Result<String, String> {
     let safe = |s: &str| {
         !s.is_empty()
             && s.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     };
-    if !safe(secret) || !safe(account) {
+    if !safe(secret) || !safe(account) || !safe(service) {
         return Err("refusing to store a value outside [A-Za-z0-9_-]".into());
     }
     Ok(format!(
-        "add-generic-password -U -s {} -a {account} -w \"{secret}\"\n",
-        crate::config::KEYCHAIN_SERVICE
+        "add-generic-password -U -s {service} -a {account} -w \"{secret}\"\n"
     ))
 }
 
 /// Stores `secret` in the Keychain through `security -i` on stdin, so it never appears in a
 /// process list. Success is the exit status.
 fn keychain_store(account: &str, secret: &str) -> Result<(), String> {
+    keychain_store_in(crate::config::KEYCHAIN_SERVICE, account, secret)
+}
+
+/// The same, for an item under another service.
+pub fn keychain_store_in(service: &str, account: &str, secret: &str) -> Result<(), String> {
     use std::io::Write;
-    let line = keychain_line(account, secret)?;
+    let line = keychain_line_in(service, account, secret)?;
     let mut child = Command::new("/usr/bin/security")
         .arg("-i")
         .stdin(Stdio::piped())
@@ -1031,10 +1035,10 @@ mod tests {
 
     #[test]
     fn keychain_lines_refuse_anything_that_could_break_quoting() {
-        let ok = keychain_line("OMNIROUTE_API_KEY", "sk-abc-123").unwrap();
+        let ok = keychain_line_in("bmv-trader", "OMNIROUTE_API_KEY", "sk-abc-123").unwrap();
         assert!(ok.contains("-w \"sk-abc-123\"") && ok.ends_with('\n'));
         for bad in ["a\"b", "a\nb", "a\\b", "a b", "a$b", ""] {
-            assert!(keychain_line("X", bad).is_err(), "{bad:?}");
+            assert!(keychain_line_in("bmv-trader", "X", bad).is_err(), "{bad:?}");
         }
     }
 

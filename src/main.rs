@@ -39,6 +39,10 @@ const USAGE: &str = "usage:
   bmv-trader llm-health                   check Ollama, OmniRoute, a Tier-2 probe, key age and Claude spend
   bmv-trader llm-rotate                   regenerate the OmniRoute key, store it, re-apply its policy
   bmv-trader llm-daily                    for launchd: llm-rotate, then llm-health
+  bmv-trader keys                         every key the system holds: renewed, due, state (S43)
+  bmv-trader keys --renew                 walk through the keys that are due: what, where to get it, paste, test, save
+  bmv-trader keys --notify                for launchd: a notification when any key is 10 days or less from due
+  bmv-trader keys --record ID             mark a key as renewed today (one you just made by hand)
   bmv-trader free-keys                    rotate the free cloud models' OpenRouter key if due, retire old ones (S42)
   bmv-trader free-keys --record PROVIDER  log a key pasted with scripts/free-key-add.sh, for its expiry
   bmv-trader free-keys --connection PROVIDER  a pasted provider's OmniRoute connection, and new|existing
@@ -78,7 +82,9 @@ const VALUE_FLAGS: [&str; 15] = [
     "--record",
     "--connection",
 ];
-const SWITCHES: [&str; 7] = [
+const SWITCHES: [&str; 9] = [
+    "--renew",
+    "--notify",
     "--adjusted",
     "--scan",
     "--holdout",
@@ -225,6 +231,11 @@ fn main() {
             Some("notes") => notes(),
             Some("llm-health") => llm_health().map(|_| ()),
             Some("llm-rotate") => llm_rotate(),
+            Some("keys") => keys(
+                args.has("--renew"),
+                args.has("--notify"),
+                args.get("--record"),
+            ),
             Some("free-keys") => free_keys(args.get("--record"), args.get("--connection")),
             Some("llm-daily") => {
                 let rotated = llm_rotate();
@@ -2469,6 +2480,261 @@ fn rotate_error_path(home: &Path) -> std::path::PathBuf {
     home.join("data").join("llm_rotate_error.json")
 }
 
+/// Every key in one place (S43): the table; `--notify` for launchd; `--renew` to walk through the
+/// due ones; `--record ID` to mark one renewed today.
+fn keys(renew: bool, notify: bool, record: Option<&str>) -> Result<(), String> {
+    use bmv_trader::keys::{self, Facts, Policy};
+    let home = config::home()?;
+    if let Some(id) = record {
+        keys::record(&home, id, chrono::Utc::now())?;
+        println!("{id}: recorded as renewed today");
+        return Ok(());
+    }
+    let policy = Policy::load(&home)?;
+    let present = |service: &'static str, account: &'static str| {
+        matches!(config::keychain_present(service, account), Ok(true))
+    };
+    let automatic = |id: &'static str| key_automatic(&home, id);
+    let facts = Facts {
+        present: &present,
+        automatic: &automatic,
+    };
+    let rows = keys::rows(
+        &policy,
+        &keys::read_dates(&home)?,
+        &facts,
+        chrono::Utc::now(),
+    );
+    if notify {
+        if let Some(text) = keys::notice(&rows) {
+            notify_owner("bmv-trader: keys", &text)?;
+            println!("{text}");
+        }
+        return Ok(());
+    }
+    print!("{}", keys::table(&rows));
+    if !renew {
+        if keys::notice(&rows).is_some() {
+            println!("\nRun scripts/keys.sh renew to renew the ones marked RENEW or MISSING.");
+        }
+        return Ok(());
+    }
+    let due: Vec<_> = rows
+        .iter()
+        .filter(|r| r.state.needs_you() && matches!(r.def.store, keys::Store::Keychain { .. }))
+        .collect();
+    if due.is_empty() {
+        println!("\nNothing to renew.");
+        return Ok(());
+    }
+    for r in due {
+        renew_key(&home, r.def)?;
+    }
+    Ok(())
+}
+
+/// One automatic key's state, from its own records.
+fn key_automatic(home: &std::path::Path, id: &str) -> Result<String, String> {
+    match id {
+        "openrouter-model" => {
+            let cfg = bmv_trader::free_keys::Config::load(home)?;
+            let ev = bmv_trader::free_keys::read_log(&bmv_trader::free_keys::log_path(home))?;
+            bmv_trader::free_keys::health(&cfg, &ev, chrono::Utc::now())
+                .into_iter()
+                .find(|(l, _)| l == "free key: openrouter")
+                .map(|(_, r)| r)
+                .unwrap_or_else(|| Ok("not configured".into()))
+        }
+        "omniroute-engine" => match history::read_json::<String>(&rotated_path(home)) {
+            Ok(t) => {
+                let t = chrono::DateTime::parse_from_rfc3339(&t)
+                    .map_err(|e| format!("llm_rotated.json: {e}"))?;
+                let h = (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_hours();
+                if h <= 48 {
+                    Ok(format!("rotated {h} h ago"))
+                } else {
+                    Err(format!("last rotated {h} h ago"))
+                }
+            }
+            Err(_) => Err("never rotated: check the 05:30 llm job".into()),
+        },
+        _ => Ok("".into()),
+    }
+}
+
+/// A macOS notification; the text is names and dates only, never a key.
+fn notify_owner(title: &str, text: &str) -> Result<(), String> {
+    let quote = |s: &str| s.replace('\\', "").replace('"', "'");
+    let script = format!(
+        "display notification \"{}\" with title \"{}\" sound name \"default\"",
+        quote(text),
+        quote(title)
+    );
+    let ok = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .status()
+        .map_err(|e| format!("osascript: {e}"))?
+        .success();
+    if ok {
+        Ok(())
+    } else {
+        Err("the notification didn't show".into())
+    }
+}
+
+/// Reads one line from the terminal without echoing it.
+fn read_hidden(prompt: &str) -> Result<String, String> {
+    use std::io::Write;
+    let stty = |arg: &str| {
+        std::process::Command::new("/bin/stty")
+            .arg(arg)
+            .stdin(std::process::Stdio::inherit())
+            .status()
+    };
+    print!("{prompt}");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let _ = stty("-echo");
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    let _ = stty("echo");
+    println!();
+    read.map_err(|e| format!("reading the key: {e}"))?;
+    Ok(line.trim().to_string())
+}
+
+fn ask(question: &str) -> bool {
+    use std::io::Write;
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut a = String::new();
+    std::io::stdin().read_line(&mut a).is_ok() && matches!(a.trim(), "y" | "Y" | "yes")
+}
+
+/// Proves a pasted key before it is saved. The key goes only in a request header, to a fixed
+/// HTTPS host, with no proxy and no redirect.
+fn test_key(test: bmv_trader::keys::Test, key: &str) -> Result<(), String> {
+    use bmv_trader::keys::Test;
+    let http = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .https_only(true)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let status = match test {
+        Test::None => return Ok(()),
+        Test::Anthropic => http
+            .get("https://api.anthropic.com/v1/models?limit=1")
+            .header("x-api-key", key)
+            .header("anthropic-version", "2026-10-21")
+            .send(),
+        Test::OpenRouterManagement => http
+            .get("https://openrouter.ai/api/v1/keys?offset=0")
+            .bearer_auth(key)
+            .send(),
+    }
+    .map_err(|e| format!("the test call failed: {}", e.without_url()))?
+    .status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the provider answered {status}, so the key wasn't accepted"
+        ))
+    }
+}
+
+/// One due key: explain it, take a paste, test it, save it, update its users, record the date.
+fn renew_key(home: &std::path::Path, d: &'static bmv_trader::keys::Def) -> Result<(), String> {
+    use bmv_trader::keys::{After, Store};
+    let Store::Keychain { service, account } = d.store else {
+        return Ok(());
+    };
+    println!("\n=== {} ===", d.name);
+    println!("What it's for: {}.", d.purpose);
+    println!("If it lapses: {}.", d.breaks);
+    if !ask("Renew it now?") {
+        println!("Skipped.");
+        return Ok(());
+    }
+    println!("How to get a new one:");
+    for (i, step) in d.how.iter().enumerate() {
+        println!("  {}. {step}", i + 1);
+    }
+    let key = loop {
+        let k = read_hidden(
+            "Paste the new key (hidden), then Enter (if Ctrl-C leaves the terminal silent, type: stty sane): ",
+        )?;
+        if k.is_empty() {
+            println!("Nothing pasted; skipped.");
+            return Ok(());
+        }
+        if !bmv_trader::keys::plausible(&k) {
+            println!(
+                "That doesn't look like a key (letters, digits, - and _ only). Try again, or press Enter to skip."
+            );
+            continue;
+        }
+        // the engine and desk keys must differ: the desk's workspace has its own spending limit
+        if let Some((s, a)) = bmv_trader::keys::sibling(d.id)
+            && config::keychain_in(s, a).ok().flatten().as_deref() == Some(k.as_str())
+        {
+            println!(
+                "That's the other Claude key ({s} / {a}). Make the new one in the right workspace, or press Enter to skip."
+            );
+            continue;
+        }
+        match test_key(d.test, &k) {
+            Ok(()) => break k,
+            Err(e) => println!(
+                "{e}. Nothing was changed. Check you copied the whole key, or press Enter to skip."
+            ),
+        }
+    };
+    println!("  works: the provider accepted it");
+    bmv_trader::llm::keychain_store_in(service, account, &key)?;
+    drop(key);
+    println!("  saved in the Keychain as {service} / {account}");
+    if let After::AgentFiles(kind) = d.after {
+        let list = std::process::Command::new("/usr/local/libexec/bmv-desk/desk-agent")
+            .args(["--list", "/usr/local/etc/bmv-clip/agents.json"])
+            .output()
+            .map_err(|e| format!("desk-agent --list: {e}"))?;
+        if !list.status.success() {
+            return Err(format!(
+                "saved, but desk-agent couldn't list the agents: {}",
+                String::from_utf8_lossy(&list.stderr).trim()
+            ));
+        }
+        let agents = bmv_trader::keys::agents_for(&String::from_utf8_lossy(&list.stdout), kind)?;
+        println!(
+            "  putting it in {} agents' keys files (your Mac password may be asked for, for sudo):",
+            agents.len()
+        );
+        let mut failed = Vec::new();
+        for a in &agents {
+            let ok = std::process::Command::new(home.join("scripts/clip-key-swap.sh"))
+                .args([a.as_str(), kind])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                failed.push(a.clone());
+            }
+        }
+        if !failed.is_empty() {
+            return Err(format!(
+                "saved, but {} still have the old key; fix the error above, then run scripts/clip-key-swap.sh <agent> {kind} for each. \
+                 Don't retire the old key yet.",
+                failed.join(", ")
+            ));
+        }
+    }
+    bmv_trader::keys::record(home, d.id, chrono::Utc::now())?;
+    println!("  recorded. Last step: {}", d.old);
+    Ok(())
+}
+
 /// The free cloud models' key lifecycle (S42): with no argument, one OpenRouter pass; with
 /// `--record PROVIDER`, logs a pasted key; with `--connection PROVIDER`, prints that provider's
 /// OmniRoute connection and whether OmniRoute has it yet (for scripts/free-key-add.sh).
@@ -2565,33 +2831,6 @@ fn llm_rotate() -> Result<(), String> {
 
 /// Tier 1 and Tier 2 health, always written to data/llm_health.json (a check that can't run
 /// is a failing check). Returns whether all checks pass.
-/// The older of the two Claude keys' rotation dates, which scripts/rotate-keys.sh records per key
-/// (S41): `{"engine": RFC 3339, "desk": RFC 3339}`.
-fn keys_age(path: &std::path::Path) -> Result<String, String> {
-    if !path.exists() {
-        return Err("never recorded: run scripts/rotate-keys.sh".into());
-    }
-    let dates: std::collections::BTreeMap<String, String> = history::read_json(path)?;
-    let mut oldest = i64::MIN;
-    for key in ["engine", "desk"] {
-        let t = dates.get(key).ok_or_else(|| {
-            format!("the {key} key was never rotated: run scripts/rotate-keys.sh")
-        })?;
-        let t = chrono::DateTime::parse_from_rfc3339(t)
-            .map_err(|e| format!("keys_rotated.json, {key}: {e}"))?;
-        let days = (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_days();
-        if days < 0 {
-            return Err(format!("keys_rotated.json, {key}: a date in the future"));
-        }
-        oldest = oldest.max(days);
-    }
-    if oldest <= 35 {
-        Ok(format!("{oldest} days ago"))
-    } else {
-        Err(format!("{oldest} days ago: run scripts/rotate-keys.sh"))
-    }
-}
-
 fn llm_health() -> Result<bool, String> {
     use bmv_trader::llm::{self, Check, Health};
     let home = config::home()?;
@@ -2657,10 +2896,32 @@ fn llm_health() -> Result<bool, String> {
         }
         Err(e) => checks.push(Check::of("free keys config", Err(e))),
     }
-    checks.push(Check::of(
-        "Claude keys rotated within 35 days",
-        keys_age(&home.join("data").join("keys_rotated.json")),
-    ));
+    // the key tracker's view of the keys renewed by hand (S43); automatic ones have their own lines
+    match bmv_trader::keys::Policy::load(&home)
+        .and_then(|p| bmv_trader::keys::read_dates(&home).map(|d| (p, d)))
+    {
+        Ok((policy, dates)) => {
+            let present = |s: &'static str, a: &'static str| {
+                matches!(config::keychain_present(s, a), Ok(true))
+            };
+            let automatic = |_: &'static str| Ok(String::new());
+            let facts = bmv_trader::keys::Facts {
+                present: &present,
+                automatic: &automatic,
+            };
+            for r in bmv_trader::keys::rows(&policy, &dates, &facts, chrono::Utc::now()) {
+                if let bmv_trader::keys::Store::Keychain { .. } = r.def.store {
+                    let line = if r.state.needs_you() {
+                        Err(r.state.label())
+                    } else {
+                        Ok(r.state.label())
+                    };
+                    checks.push(Check::of(&format!("key: {}", r.def.name), line));
+                }
+            }
+        }
+        Err(e) => checks.push(Check::of("key tracker", Err(e))),
+    }
     let h = Health {
         when: chrono::Utc::now().to_rfc3339(),
         checks,

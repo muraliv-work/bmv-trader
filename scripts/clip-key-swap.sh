@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Replaces one model key in an agent's keys file, keeping its desk token (DESIGN §4c, S41). Used by
-# scripts/rotate-keys.sh after a new key is in the Keychain; run as you:
+# `bmv-trader keys --renew` (scripts/keys.sh renew) after a new key is in the Keychain; run as you:
 #
 #   scripts/clip-key-swap.sh <agent> anthropic   # from bmv-desk-models / anthropic-desk
 #   scripts/clip-key-swap.sh <agent> omniroute   # from bmv-desk-models / omniroute-agents

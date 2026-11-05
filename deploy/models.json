@@ -14,5 +14,11 @@
     "providers": {
       "openrouter": { "connection": "openrouter-free", "auto": true, "credit_limit_usd": 0.01 }
     }
+  },
+  "keys": {
+    "warn_days": 10,
+    "claude_every_days": 30,
+    "openrouter_management_every_days": 90,
+    "omniroute_agents_every_days": 90
   }
 }

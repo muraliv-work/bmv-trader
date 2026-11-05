@@ -377,7 +377,7 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
     - **Always ready:** a line's Claude model must have a price even while it's switched to free, so flipping to Claude always works.
     - **Applying a change:** engine switches apply on the next run. Agent switches apply after `sudo scripts/clip-agents-setup.sh`.
   - **Each agent's keys file holds both keys** (Claude and OmniRoute), so a switch needs no new keys.
-  - **`scripts/rotate-keys.sh`** (monthly, guided, each step skippable):
+  - **`scripts/rotate-keys.sh`** (monthly, guided, each step skippable; replaced by the S43 key tracker):
     1. it renews the desk budgets
     2. it rotates the engine's Claude key
     3. it rotates the desk agents' Claude key (into every keys file via `scripts/clip-key-swap.sh`, keeping each desk token)
@@ -403,6 +403,12 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
     - After a refused handover, the connection is tested again, so a dead key in OmniRoute can't go unnoticed.
     - OmniRoute's own output never goes into the log, in case it echoes part of a key.
   - **Still open:** OpenRouter refuses a $0 credit limit, so keys are capped at $0.01. If the account ever holds credit (for example for the 1,000-a-day free tier), that cent is the most a leaked key could spend. OmniRoute's own usage and quota numbers aren't in the health check yet.
+- **S43: every key in one place.** `bmv-trader keys` (`scripts/keys.sh`, logic in `src/keys.rs`) lists every key the system holds: what it's for, where it lives, when it was renewed, when it's due, and its state.
+  - **Dates:** keys renewed by hand are dated in `data/keys.json`. Automatic ones report from their own logs. Desk tokens and Alpaca keys are listed as "no expiry".
+  - **Intervals:** set in `deploy/models.json` (`keys`): Claude keys 30 days, the OpenRouter management key and the OmniRoute agents key 90 days, warning 10 days ahead.
+  - **`--notify`** (launchd `com.bmv-trader.keys`, 09:00) posts a macOS notification when any key is due within the window, overdue, missing, of unknown age, or its automatic rotation failed. The text is names only.
+  - **`--renew`:** for each due key, it explains what the key is and what breaks without it, and lists where to get a new one. It takes a hidden paste and tests it with a free call: Anthropic's models list, or OpenRouter's key list for the management key. Only then does it save the key to the Keychain (through `security -i` on stdin), copy it into the agents' files that should hold it (`clip-key-swap.sh`), record the date, and say how to retire the old key. A wrong paste changes nothing.
+  - **The daily health check** shows the same states for the hand-renewed keys. It replaces `scripts/rotate-keys.sh` and `data/keys_rotated.json`, whose dates are read once as a fallback.
 - **Part 5, the signers' dry run (2026-11-05).** One heartbeat each, by hand, while trial 12 ran.
   - **Both succeeded:** Validator $0.0071 and Stress Lead $0.0070, 2 turns each. Each ran as its own user through its sudo rule, the desk accepted its token, the reply model matched the pin, and each call was charged to the desk and reported to Paperclip priced.
   - **Fail-closed checks seen on the way:** a missing keys file, and no desk budget that month. Both stopped the run before any paid call.

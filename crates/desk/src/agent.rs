@@ -173,6 +173,9 @@ struct Models {
     #[allow(dead_code)]
     #[serde(default)]
     free_keys: Option<Value>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    keys: Option<Value>,
 }
 
 /// The fields that live in the models file, never the agents file.
