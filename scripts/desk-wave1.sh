@@ -20,7 +20,9 @@ ROUND=${1:-}
     { echo "usage: scripts/desk-wave1.sh agents | tokens | budgets" >&2; exit 1; }
 
 # the requests, built from the installed file so they match what the agents will run with
-REQUESTS=$("$DESK_AGENT" --list "$AGENTS" | /usr/bin/python3 -I -c '
+[[ -e $AGENTS ]] || { echo "desk-wave1: $AGENTS isn't installed; run sudo scripts/clip-agents-setup.sh first" >&2; exit 1; }
+LIST=$("$DESK_AGENT" --list "$AGENTS")
+REQUESTS=$(echo "$LIST" | /usr/bin/python3 -I -c '
 import json, sys
 from decimal import Decimal
 rnd = sys.argv[1]

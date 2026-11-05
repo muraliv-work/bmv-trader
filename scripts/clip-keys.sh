@@ -18,6 +18,7 @@ AGENTS=/usr/local/etc/bmv-clip/agents.json
 [[ $EUID -ne 0 ]] || { echo "clip-keys: run as yourself, not root (the keys are in your Keychain)" >&2; exit 1; }
 AGENT=${1:?usage: scripts/clip-keys.sh <agent>}
 
+[[ -e $AGENTS ]] || { echo "clip-keys: $AGENTS isn't installed; run sudo scripts/clip-agents-setup.sh first" >&2; exit 1; }
 LIST=$("$DESK_AGENT" --list "$AGENTS")
 ROW=$(echo "$LIST" | /usr/bin/python3 -I -c '
 import json, sys

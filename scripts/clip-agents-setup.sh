@@ -16,7 +16,8 @@ set -euo pipefail
 CLIP_USER=bmvclip
 DESK_AGENT=/usr/local/libexec/bmv-desk/desk-agent
 AGENTS=/usr/local/etc/bmv-clip/agents.json
-SUDOERS=/etc/sudoers.d/bmv-clip
+# /etc is a link to /private/etc on macOS; the checks below refuse links, so use the real path
+SUDOERS=/private/etc/sudoers.d/bmv-clip
 RUN_VARS="PAPERCLIP_API_URL PAPERCLIP_API_KEY PAPERCLIP_RUN_ID PAPERCLIP_AGENT_ID PAPERCLIP_COMPANY_ID"
 
 [[ $(uname) == Darwin ]] || { echo "clip-agents-setup: macOS only" >&2; exit 1; }
@@ -31,7 +32,7 @@ dscl . -read "/Users/$CLIP_USER" UniqueID >/dev/null 2>&1 ||
 
 # shellcheck source=hidden-user.sh
 source "$HERE/hidden-user.sh"
-root_only_parents /usr /usr/local /usr/local/var /usr/local/etc /usr/local/etc/bmv-clip /etc /etc/sudoers.d ||
+root_only_parents /usr /usr/local /usr/local/var /usr/local/etc /usr/local/etc/bmv-clip /private /private/etc /private/etc/sudoers.d ||
     { echo "clip-agents-setup: refusing" >&2; exit 1; }
 
 # copied first, so what is checked is what gets installed
