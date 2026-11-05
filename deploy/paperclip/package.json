@@ -1,0 +1,5 @@
+{
+  "name": "bmv-clip",
+  "private": true,
+  "dependencies": { "paperclipai": "2026.1023.0" }
+}

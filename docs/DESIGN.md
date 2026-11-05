@@ -346,6 +346,19 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - A reply from another model, an early stop (`max_tokens`, a refusal), a malformed reply, or running out of turns fails the run (exit 1), so Paperclip shows it as failed.
   - Each call's usage goes to Paperclip's cost events, only on a plain-HTTP loopback URL. The client follows no redirects and uses no proxy.
   - **Still open:** the desk can't tell which model made a `sign` call, so A5 rests on the runner and the charter (a signer's token must only ever be in a signer's secrets). A call that fails after it was sent isn't charged. Two runs of one agent at once could overspend by one call each; Paperclip runs one at a time per agent.
+- **Part 3 as built: the `bmvclip` user and Paperclip (S37).**
+  - `scripts/clip-build.sh` (as the owner) fetches Node 24.16.0 from nodejs.org, checked against a pinned SHA-256, and installs Paperclip 2026.1023.0 exactly as `deploy/paperclip/package-lock.json` pins it, with every install script off. It prints one hash of the whole tree.
+  - `sudo scripts/clip-setup.sh` copies the build into a root-only staging folder, shows the same hash, and installs it root-owned in `/usr/local/libexec/bmv-clip`. Any symlink leading out of the tree, and any setuid or setgid file, is refused (`scripts/tree-hash.py`). The new tree is swapped in whole, so an interrupted run leaves the old install or the new one.
+  - **Database:** Paperclip's built-in one has the fixed password `paperclip`. So `bmvclip` runs the same Postgres itself on 127.0.0.1:54330, with no Unix socket and a random password in a file only it can read.
+  - **Paperclip:** `authenticated` and private, on 127.0.0.1:3100. Telemetry, announcements and update checks are off, and secrets strict mode is on. It runs only through `/usr/local/libexec/bmv-clip/clip`, which fixes its environment.
+  - **Files:** charters in `/usr/local/etc/bmv-clip` (root's) and keys files in `/usr/local/var/bmv-clip/keys` (`bmvclip`'s alone). Root makes only the top data folder; everything inside it is made as `bmvclip`, so a link `bmvclip` plants there can't steer a root write on a rerun. Logs are `bmvclip`'s files in the root-owned `/usr/local/var/log/bmv-clip`. `desk-setup.sh` now installs `desk-agent` too.
+  - **Network check:** after the first start, the script stops Paperclip if anything `bmvclip` runs has a socket off loopback.
+  - **Still open:**
+    - **All agents share one user,** so any agent's process can read every keys file. A compromised Paperclip could hand the Validator's desk token to a run that uses a free model. The OS doesn't separate agents; the charters and the runner do. Fix: a separate user for each signer, decided in part 4.
+    - **The network check is a snapshot** 30 s after start. Once agents call Anthropic, only a per-user firewall rule (loopback and `api.anthropic.com`) would limit where keys could go.
+    - **Sign-up stays open** until the owner's login exists (Paperclip refuses the first account otherwise); part 4 closes it.
+    - **The tree hash protects against a changed build folder, not changed scripts.** Root runs `clip-setup.sh` from the repo, which the owner's user can edit. `desk-setup.sh` has the same pattern, and still logs into `bmvdesk`'s own folder.
+    - **Upgrades:** a Paperclip version that moves Postgres to a new major version needs a dump and restore.
 
 ### Step 3 as built: run hashes and the stress battery
 - **`bmv-trader stress-battery`** re-runs every finished trial twice through the same code as `trial-autopsy`.
