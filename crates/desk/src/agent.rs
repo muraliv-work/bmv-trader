@@ -163,19 +163,12 @@ struct Model {
 }
 
 /// The central models file: `agents` is read here, `engine` by the engine (`bmv_trader::llm`).
+/// The desk reads only the `agents` section. The file's other sections (`engine`, `free_keys`,
+/// `keys`, ...) belong to the engine, which checks them strictly; ignoring them here means a new
+/// engine setting can never stop the agents. Each agent line is still strict (`Model`).
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Models {
     agents: BTreeMap<String, Model>,
-    // read and checked by the engine (`bmv_trader::llm`, `bmv_trader::free_keys`), not here
-    #[allow(dead_code)]
-    engine: Value,
-    #[allow(dead_code)]
-    #[serde(default)]
-    free_keys: Option<Value>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    keys: Option<Value>,
 }
 
 /// The fields that live in the models file, never the agents file.
@@ -840,7 +833,8 @@ mod tests {
             "val-1": {"claude": true, "claude_model": "claude-sonnet-5-5", "free_model": null,
                       "budget_usd": "35"},
             "res-1": {"claude": false, "claude_model": "claude-haiku-5-5",
-                      "free_model": "bmv-free", "budget_usd": "0"}}, "engine": {}});
+                      "free_model": "bmv-free", "budget_usd": "0"}},
+            "engine": {}, "a_future_engine_section": {"anything": 1}});
         assert!(Agents::parse(&base.to_string(), &models.to_string()).is_ok());
         // a model line goes to the models file, everything else to the agents file
         let with = |id: &str, k: &str, v: Value| {
