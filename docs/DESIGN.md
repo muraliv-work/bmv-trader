@@ -413,7 +413,9 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - **Both succeeded:** Validator $0.0071 and Stress Lead $0.0070, 2 turns each. Each ran as its own user through its sudo rule, the desk accepted its token, the reply model matched the pin, and each call was charged to the desk and reported to Paperclip priced.
   - **Fail-closed checks seen on the way:** a missing keys file, and no desk budget that month. Both stopped the run before any paid call.
   - **Gap they found: the signers can't see the evidence.** No desk tool returns a strategy's pre-registered criteria, reproduction hashes, stress results or deflated Sharpe, so neither could ever sign properly. A read-only evidence tool for the second line comes before any real gate.
-  - **Still to run:** the Head of Desk and the Researcher, after trial 12 frees the GPU.
+  - **Head of Desk and Researcher (S39/S40, on Claude):** both passed. The Researcher (Sonnet, $0.0086, 3 turns) registered the desk's first idea, post-earnings drift conditioned on analyst estimate dispersion. The Head of Desk (Haiku, $0.0006) wrote an accurate close report. A wrong token in a keys file failed safely at the desk's login check, before any spend.
+  - **The dry run's total was $0.023 for all four agents.**
+  - **Seen:** the agents aren't told today's date, so the close report says "date not supplied". Next change: the runner adds the date to each task.
   - **Accepted risk: free-model text reaches the signers.** The local Researcher writes strategy names and hypotheses that the Validator then reads through `list_strategies`. The defences are that tool results are capped at 20,000 characters, the prompts treat desk data as untrusted, and a gate also needs its evidence from the store (deterministic runs and hashes). But a signer could still be talked into signing something the evidence allows. Review before the first real gate.
   - **Still open:** desk budgets need renewing each month. The OmniRoute agents' key must also allow any Gemini route an agent is switched to. Nothing here has run against the live Paperclip yet; part 5's dry run is the first.
 
