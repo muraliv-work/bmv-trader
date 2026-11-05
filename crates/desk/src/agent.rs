@@ -4,9 +4,11 @@
 //! is charged to the agent's desk budget, and free or local models are never offered `sign` (A5).
 
 use crate::mcp::{self, DeskCall};
+use crate::permissions::Role;
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 /// One agent's charter: written by the owner, never by the agent.
@@ -38,7 +40,7 @@ fn default_max_turns() -> u32 {
     8
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
     /// Claude, called directly: paid, model checked, may sign.
@@ -50,6 +52,11 @@ pub enum Provider {
 impl Charter {
     pub fn parse(text: &str) -> Result<Charter, String> {
         let c: Charter = serde_json::from_str(text).map_err(|e| format!("charter: {e}"))?;
+        c.check()
+    }
+
+    fn check(self) -> Result<Charter, String> {
+        let c = self;
         if c.agent.is_empty()
             || !c
                 .agent
@@ -77,10 +84,155 @@ impl Charter {
     }
 }
 
+/// The user Paperclip and its non-signing agents run as (S36).
+pub const CLIP_USER: &str = "bmvclip";
+
+/// One agent in the owner's agents file: its charter, and how it is set up (S38).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Spec {
+    pub role: Role,
+    /// The macOS user it runs as. Each signer has its own.
+    pub runs_as: String,
+    /// Its desk budget each month, as a decimal string (0 for a free model).
+    pub budget_usd: String,
+    /// When Paperclip wakes it: a cron line in New York time; none means on demand.
+    pub schedule: Option<String>,
+    pub provider: Provider,
+    pub model: String,
+    pub prompt: String,
+    pub task: String,
+    pub tools: Vec<String>,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_max_turns")]
+    pub max_turns: u32,
+}
+
+impl Spec {
+    pub fn charter(&self, id: &str) -> Result<Charter, String> {
+        Charter {
+            agent: id.into(),
+            provider: self.provider,
+            model: self.model.clone(),
+            prompt: self.prompt.clone(),
+            task: self.task.clone(),
+            tools: self.tools.clone(),
+            max_tokens: self.max_tokens,
+            max_turns: self.max_turns,
+        }
+        .check()
+    }
+
+    /// Where its keys file lives: in its own user's folder, readable by that user only.
+    pub fn keys_path(&self, id: &str) -> String {
+        if self.runs_as == CLIP_USER {
+            format!("/usr/local/var/bmv-clip/keys/{id}.json")
+        } else {
+            format!("/usr/local/var/{}/keys.json", self.runs_as)
+        }
+    }
+
+    /// A signer by role, not by tool list: the desk lets any second-line token sign, whether or
+    /// not its charter offers `sign`, so the token itself must be kept like a signer's.
+    pub fn signs(&self) -> bool {
+        self.role.second_line()
+    }
+}
+
+/// The roles the agents file and its setup scripts know how to run (wave 1, S36); the others
+/// need their own review of who may sign what before they get a row here.
+const WAVE1: [Role; 4] = [
+    Role::HeadOfDesk,
+    Role::Researcher,
+    Role::Validator,
+    Role::StressLead,
+];
+
+/// The owner's agents file (`deploy/agents.json`): the one place that says which agent uses which
+/// provider and model, and how each is set up. Root-owned once installed, so no agent can change
+/// its own model.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Agents {
+    pub agents: BTreeMap<String, Spec>,
+}
+
+impl Agents {
+    pub fn parse(text: &str) -> Result<Agents, String> {
+        let a: Agents = serde_json::from_str(text).map_err(|e| format!("agents file: {e}"))?;
+        for (id, s) in &a.agents {
+            let at = |e: String| format!("agents file, {id}: {e}");
+            s.charter(id).map_err(at)?;
+            if !WAVE1.contains(&s.role) {
+                return Err(at(format!(
+                    "role {} isn't set up yet (wave 1 only)",
+                    s.role.as_str()
+                )));
+            }
+            // our own hidden users only, never an existing system account like `nobody`
+            if !s.runs_as.starts_with("bmv")
+                || !s
+                    .runs_as
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            {
+                return Err(at(format!(
+                    "runs_as {:?} isn't a bmv user name (bmv, then lowercase letters and digits)",
+                    s.runs_as
+                )));
+            }
+            if s.tools.iter().any(|t| t == "sign") && !s.signs() {
+                return Err(at(format!("a {} doesn't sign", s.role.as_str())));
+            }
+            match Decimal::from_str(&s.budget_usd) {
+                Ok(b) if !b.is_sign_negative() => {}
+                _ => {
+                    return Err(at(format!(
+                        "budget_usd {:?} isn't a decimal >= 0",
+                        s.budget_usd
+                    )));
+                }
+            }
+            if let Some(cron) = &s.schedule
+                && cron.split_whitespace().count() != 5
+            {
+                return Err(at(format!("schedule {cron:?} isn't a 5-field cron line")));
+            }
+            if s.signs() {
+                // A5: a second-line token can sign by plain HTTP, so only Claude may hold one
+                if s.provider != Provider::Anthropic {
+                    return Err(at(format!("a {} must run on Claude", s.role.as_str())));
+                }
+                // S38: a signer's keys are its own user's alone
+                if s.runs_as == CLIP_USER
+                    || a.agents
+                        .iter()
+                        .any(|(o, t)| o != id && t.runs_as == s.runs_as)
+                {
+                    return Err(at(format!(
+                        "a signer needs a user of its own, not {}",
+                        s.runs_as
+                    )));
+                }
+            }
+        }
+        Ok(a)
+    }
+
+    pub fn get(&self, id: &str) -> Result<&Spec, String> {
+        self.agents
+            .get(id)
+            .ok_or_else(|| format!("agents file has no agent {id}"))
+    }
+}
+
 /// USD per million tokens (input, output). `input` picks Haiku's long-prompt tier.
 fn price(model: &str, input: u64) -> Option<(Decimal, Decimal)> {
     let d = |s| Decimal::from_str(s).ok();
     match model {
+        "claude-fable-5-1" => Some((d("10")?, d("50")?)),
+        "claude-opus-5-5" => Some((d("4")?, d("20")?)),
         "claude-sonnet-5-5" => Some((d("2")?, d("10")?)),
         "claude-haiku-5-5" if input > 100_000 => Some((d("0.50")?, d("2.50")?)),
         "claude-haiku-5-5" => Some((d("0.10")?, d("0.50")?)),
@@ -541,6 +693,94 @@ mod tests {
         assert!(with("max_turns", json!(500)).is_err());
         assert!(
             with("shell", json!(true)).is_err(),
+            "unknown fields refused"
+        );
+    }
+
+    #[test]
+    fn the_agents_file_is_valid_and_keeps_signers_apart() {
+        let a = Agents::parse(include_str!("../../../deploy/agents.json")).unwrap();
+        for (id, s) in &a.agents {
+            let c = s.charter(id).unwrap();
+            if c.offers("sign") {
+                assert_eq!(s.provider, Provider::Anthropic, "{id}");
+                assert_ne!(s.runs_as, CLIP_USER, "{id}");
+                assert!(
+                    s.keys_path(id)
+                        .starts_with(&format!("/usr/local/var/{}/", s.runs_as))
+                );
+            }
+        }
+        assert_eq!(
+            a.get("res-1").unwrap().keys_path("res-1"),
+            "/usr/local/var/bmv-clip/keys/res-1.json"
+        );
+        assert!(a.get("nobody").is_err());
+    }
+
+    #[test]
+    fn desk_wave1_requests_are_owner_actions() {
+        // the exact shapes scripts/desk-wave1.sh files
+        for r in [
+            json!({"kind": "add_agent", "id": "val-1", "role": "validator"}),
+            json!({"kind": "issue_token", "agent": "val-1"}),
+            json!({"kind": "set_budget", "agent": "val-1", "limit_usd": "35"}),
+        ] {
+            serde_json::from_value::<crate::owner::OwnerAction>(r.clone())
+                .unwrap_or_else(|e| panic!("{r}: {e}"));
+        }
+    }
+
+    #[test]
+    fn agents_file_rules() {
+        let base = json!({"agents": {
+            "val-1": {"role": "validator", "runs_as": "bmvval", "budget_usd": "35", "schedule": null,
+                      "provider": "anthropic", "model": "claude-sonnet-5-5", "prompt": "p",
+                      "task": "t", "tools": ["sign"]},
+            "res-1": {"role": "researcher", "runs_as": "bmvclip", "budget_usd": "0",
+                      "schedule": "0 7 * * *", "provider": "omniroute", "model": "bmv-local",
+                      "prompt": "p", "task": "t", "tools": ["list_strategies"]}}});
+        assert!(Agents::parse(&base.to_string()).is_ok());
+        let with = |id: &str, k: &str, v: Value| {
+            let mut b = base.clone();
+            b["agents"][id][k] = v;
+            Agents::parse(&b.to_string())
+        };
+        assert!(
+            with("res-1", "tools", json!(["sign"])).is_err(),
+            "a free model may not hold sign"
+        );
+        assert!(
+            with("val-1", "provider", json!("omniroute")).is_err(),
+            "a validator is a signer by role, even without the sign tool"
+        );
+        assert!(with("val-1", "tools", json!([])).is_ok());
+        assert!(
+            with("res-1", "role", json!("strategist")).is_err(),
+            "wave 1 roles only"
+        );
+        assert!(
+            with("res-1", "runs_as", json!("nobody")).is_err(),
+            "only bmv users"
+        );
+        assert!(
+            with("val-1", "runs_as", json!("bmvclip")).is_err(),
+            "a signer has its own user"
+        );
+        assert!(
+            with("res-1", "runs_as", json!("bmvval")).is_err(),
+            "nobody shares a signer's user"
+        );
+        assert!(with("val-1", "budget_usd", json!("-1")).is_err());
+        assert!(with("res-1", "schedule", json!("daily")).is_err());
+        assert!(with("res-1", "runs_as", json!("Bmv Clip")).is_err());
+        assert!(
+            with("val-1", "model", json!("claude-opus-9")).is_err(),
+            "no price, no budget"
+        );
+        assert!(with("val-1", "model", json!("claude-opus-5-5")).is_ok());
+        assert!(
+            with("val-1", "shell", json!(true)).is_err(),
             "unknown fields refused"
         );
     }

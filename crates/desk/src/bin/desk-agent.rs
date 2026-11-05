@@ -1,14 +1,17 @@
-//! `desk-agent CHARTER SECRETS`: one heartbeat of one desk agent (DESIGN §4c, S36). Paperclip's
-//! `process` adapter starts it; it runs `desk::agent::run` and prints what the agent said.
+//! `desk-agent AGENTS AGENT SECRETS`: one heartbeat of one desk agent (DESIGN §4c, S36, S38).
+//! Paperclip's `process` adapter starts it; it runs `desk::agent::run` and prints what the agent
+//! said. `desk-agent --list AGENTS` checks the file and prints each agent's setup as JSON, for the
+//! setup scripts.
 //!
-//! - CHARTER: the owner's JSON charter for the agent (`desk::agent::Charter`). It must not be
-//!   writable by the agent: owned by another user, and not group- or world-writable.
+//! - AGENTS: the owner's agents file (`desk::agent::Agents`), naming each agent's provider and
+//!   model. It must not be writable by the agent: owned by another user, and not group- or
+//!   world-writable.
 //! - SECRETS: `{"desk_token": "...", "anthropic_key": "..."}` (or `"omniroute_key"` for the local
 //!   route), owned by the agent's user and readable by it only.
 //!
 //! Each call's usage is reported to Paperclip when its run variables are set.
 
-use desk::agent::{self, Charter, Provider, Usage};
+use desk::agent::{self, Agents, Provider, Usage};
 use desk::api::{self, DEFAULT_ADDR};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,11 +33,12 @@ struct Secrets {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [charter, secrets] = args.as_slice() else {
-        eprintln!("usage: desk-agent CHARTER SECRETS");
-        return ExitCode::FAILURE;
+    let result = match args.as_slice() {
+        [flag, agents] if flag == "--list" => list(agents),
+        [agents, agent, secrets] => heartbeat(agents, agent, secrets),
+        _ => Err("usage: desk-agent AGENTS AGENT SECRETS | desk-agent --list AGENTS".into()),
     };
-    match heartbeat(charter, secrets) {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("desk-agent: {e}");
@@ -43,13 +47,21 @@ fn main() -> ExitCode {
     }
 }
 
-/// Reads a file once, checking the opened file itself (no gap between check and read).
+/// Reads a file once, checking the opened file itself (no gap between check and read). The path
+/// must be a regular file, not a link, and the file opened must be the one the path names.
 fn read(
     path: &str,
     check: impl Fn(&std::fs::Metadata) -> Result<(), String>,
 ) -> Result<(String, u32), String> {
+    let link = std::fs::symlink_metadata(path).map_err(|e| format!("{path}: {e}"))?;
+    if !link.file_type().is_file() {
+        return Err(format!("{path}: not a regular file"));
+    }
     let mut f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let meta = f.metadata().map_err(|e| format!("{path}: {e}"))?;
+    if (meta.dev(), meta.ino()) != (link.dev(), link.ino()) {
+        return Err(format!("{path}: changed while it was opened"));
+    }
     check(&meta).map_err(|e| format!("{path}: {e}"))?;
     let mut text = String::new();
     f.read_to_string(&mut text)
@@ -65,7 +77,24 @@ fn loopback(url: &reqwest::Url) -> bool {
         && matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
 }
 
-fn heartbeat(charter: &str, secrets: &str) -> Result<(), String> {
+/// Each agent's setup, as the setup scripts need it; no prompts.
+fn list(path: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let a = Agents::parse(&text)?;
+    let rows: Vec<Value> = a
+        .agents
+        .iter()
+        .map(|(id, s)| {
+            json!({"id": id, "role": s.role, "runs_as": s.runs_as, "provider": s.provider,
+                   "model": s.model, "budget_usd": s.budget_usd, "schedule": s.schedule,
+                   "keys": s.keys_path(id), "signs": s.signs()})
+        })
+        .collect();
+    println!("{}", Value::Array(rows));
+    Ok(())
+}
+
+fn heartbeat(agents: &str, agent: &str, secrets: &str) -> Result<(), String> {
     let (text, me) = read(secrets, |m| {
         if m.mode() & 0o077 != 0 {
             return Err(format!(
@@ -78,19 +107,19 @@ fn heartbeat(charter: &str, secrets: &str) -> Result<(), String> {
     let s: Secrets = serde_json::from_str(&text).map_err(|_| {
         format!("{secrets} isn't {{\"desk_token\", \"anthropic_key\" or \"omniroute_key\"}}")
     })?;
-    let (text, owner) = read(charter, |m| {
+    let (text, owner) = read(agents, |m| {
         if m.mode() & 0o022 != 0 {
             return Err("writable by others; it must be the owner's alone".into());
         }
         Ok(())
     })?;
-    // the secrets file belongs to the agent's user; the charter must not
+    // the secrets file belongs to the agent's user; the agents file must not
     if owner == me {
         return Err(format!(
-            "{charter} belongs to the agent's own user, which could rewrite it"
+            "{agents} belongs to the agent's own user, which could rewrite it"
         ));
     }
-    let c = Charter::parse(&text)?;
+    let c = Agents::parse(&text)?.get(agent)?.charter(agent)?;
     let key = match c.provider {
         Provider::Anthropic => s
             .anthropic_key
