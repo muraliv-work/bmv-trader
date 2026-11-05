@@ -12,10 +12,7 @@
   "free_keys": {
     "rotate_every_hours": 168,
     "providers": {
-      "openrouter": { "connection": "openrouter-free", "auto": true, "credit_limit_usd": 0 },
-      "groq":       { "connection": "groq-free",       "auto": false, "expires_days": 90 },
-      "gemini":     { "connection": "gemini-free",     "auto": false, "expires_days": 90 },
-      "cerebras":   { "connection": "cerebras-free",   "auto": false, "expires_days": 90 }
+      "openrouter": { "connection": "openrouter-free", "auto": true, "credit_limit_usd": 0 }
     }
   }
 }
