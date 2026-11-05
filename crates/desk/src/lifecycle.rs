@@ -184,6 +184,7 @@ pub fn rule(from: State, to: State, halted: Option<(State, HaltReason)>) -> Opti
     if matches!(to, SpecFrozen | Implemented) && j < i && i < 10 {
         return r(
             Kind::Back,
+            // the engine too: its non-reproducing official run is an automatic fail (S46)
             &[
                 Validator,
                 StressLead,
@@ -191,6 +192,7 @@ pub fn rule(from: State, to: State, halted: Option<(State, HaltReason)>) -> Opti
                 Compliance,
                 ProductOwner,
                 Strategist,
+                Engine,
             ],
             false,
         );

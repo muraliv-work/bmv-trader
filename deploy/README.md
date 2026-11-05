@@ -152,3 +152,21 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.freekeys.
   its switch can flip to free, with `scripts/clip-key-swap.sh <agent> omniroute`, which keeps its
   desk token. Signers never get one.
 
+### Quant Desk evidence (DECISION S46)
+
+The engine posts code-computed evidence to the desk as its own identity, `engine-1`, role `engine`. One-time setup:
+
+```sh
+/usr/local/libexec/bmv-desk/desk request '{"kind": "add_agent", "id": "engine-1", "role": "engine"}'
+/usr/local/libexec/bmv-desk/desk request '{"kind": "issue_token", "agent": "engine-1"}'
+/usr/local/libexec/bmv-desk/desk pending
+```
+
+Approve both with `desk sign <id>` (add the agent first). Then store the token at the hidden prompt:
+
+```sh
+security add-generic-password -s bmv-desk -a engine-1 -w
+```
+
+Post a trial's stress result to a strategy with `target/release/bmv-trader desk-evidence --strategy N --trial T`. The trial needs a recent `bmv-trader stress-battery` run, which records the deflated Sharpe.
+

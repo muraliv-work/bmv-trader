@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod api;
 pub mod audit;
+pub mod evidence;
 pub mod lifecycle;
 pub mod mcp;
 pub mod owner;

@@ -170,6 +170,60 @@ pub fn verdict(checks: &[Check]) -> bool {
     !checks.is_empty() && checks.iter().all(|c| c.passed == Some(true))
 }
 
+/// One stress-battery result (a line of `data/stress.jsonl`) as desk evidence (DECISION S46): the
+/// numbers a strategy's criteria name, flat under `metrics`, plus the battery's own checks and
+/// verdict. Refuses a result written before the battery recorded its deflated Sharpe.
+pub fn desk_evidence(row: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let num = |v: &serde_json::Value, what: &str| {
+        v.as_f64()
+            .filter(|x| x.is_finite())
+            .ok_or_else(|| format!("stress result has no {what}"))
+    };
+    let dsr = num(
+        &row["deflated_sharpe"],
+        "deflated Sharpe; rerun bmv-trader stress-battery",
+    )?;
+    let mc = &row["monte_carlo"];
+    let cost_x2 = row["cost_shocks"]
+        .as_array()
+        .and_then(|a| a.iter().find(|c| c["x"].as_f64() == Some(COST_SHOCK)))
+        .map(|c| num(&c["expectancy"], "expectancy at double costs"))
+        .ok_or("stress result has no cost shock at x2")??;
+    let years = row["years"]
+        .as_array()
+        .ok_or("stress result has no years")?;
+    let positive = years
+        .iter()
+        .filter(|y| y["mean"].as_f64().is_some_and(|m| m > 0.0))
+        .count();
+    let reproduces = row["checks"]
+        .as_array()
+        .and_then(|c| c.iter().find(|c| c["test"] == "reproduces"))
+        .and_then(|c| c["passed"].as_bool())
+        .ok_or("stress result has no reproduction check")?;
+    Ok(json!({
+        "source": "stress-battery",
+        "trial": row["trial"],
+        "name": row["name"],
+        "period": row["period"],
+        "units": row["units"],
+        "verdict": row["verdict"],
+        "checks": row["checks"],
+        "metrics": {
+            "trades": num(&row["trades"], "trade count")?,
+            "expectancy": num(&row["expectancy"], "expectancy")?,
+            "monte_carlo_p5": num(&mc["p5_mean"], "Monte Carlo 5th percentile")?,
+            "monte_carlo_p_negative": num(&mc["p_negative"], "Monte Carlo share below 0")?,
+            "monte_carlo_p95_drawdown": num(&mc["p95_drawdown"], "Monte Carlo drawdown")?,
+            "cost_x2_expectancy": cost_x2,
+            "years_positive_share": if years.is_empty() { 0.0 } else { positive as f64 / years.len() as f64 },
+            "deflated_sharpe": dsr,
+            "reproduces": if reproduces { 1.0 } else { 0.0 },
+        },
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +298,27 @@ mod tests {
         assert!(!verdict(&[c(Some(true)), c(None)]));
         assert!(!verdict(&[c(Some(false))]));
         assert!(!verdict(&[]));
+    }
+
+    #[test]
+    fn a_stress_result_becomes_desk_evidence() {
+        let row = serde_json::json!({
+            "trial": 9, "name": "swing", "period": "2017..2025", "units": "R", "verdict": "FAIL",
+            "trades": 1249, "expectancy": -0.0003, "deflated_sharpe": 0.0,
+            "monte_carlo": {"p5_mean": -0.047, "p_negative": 0.5, "p95_drawdown": 40.0},
+            "cost_shocks": [{"x": 2.0, "expectancy": -0.075}, {"x": 3.0, "expectancy": -0.15}],
+            "years": [{"name": "2017", "n": 10, "mean": 0.1}, {"name": "2018", "n": 10, "mean": -0.2}],
+            "checks": [{"test": "reproduces", "passed": true, "detail": ""}]});
+        let e = desk_evidence(&row).unwrap();
+        let m = &e["metrics"];
+        assert_eq!(m["cost_x2_expectancy"], -0.075);
+        assert_eq!(m["years_positive_share"], 0.5);
+        assert_eq!(m["reproduces"], 1.0);
+        let mut old = row.clone();
+        old.as_object_mut().unwrap().remove("deflated_sharpe");
+        assert!(
+            desk_evidence(&old).unwrap_err().contains("rerun"),
+            "an old result says how to fix it"
+        );
     }
 }

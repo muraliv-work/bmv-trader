@@ -13,14 +13,15 @@ use crate::lifecycle::{self, HaltReason, Kind, PaperEvidence, Signature, State};
 use crate::permissions::{self, Action, HumanProof, Role};
 use crate::{DeskError, Result};
 use rust_decimal::Decimal;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{Sqlite, Transaction};
 use std::str::FromStr;
 
 /// Tables whose rows are history: never updated, never deleted.
-const APPEND_ONLY: [&str; 10] = [
+const APPEND_ONLY: [&str; 11] = [
+    "evidence",
     "signatures",
     "owner_key",
     "audit_log",
@@ -48,6 +49,10 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
   id INTEGER PRIMARY KEY, strategy_id INTEGER NOT NULL REFERENCES strategies(id), version INTEGER NOT NULL,
   agent_id TEXT NOT NULL REFERENCES agents(id), official INTEGER NOT NULL,
   inputs_hash TEXT NOT NULL, results_hash TEXT NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS evidence (
+  id INTEGER PRIMARY KEY, strategy_id INTEGER NOT NULL REFERENCES strategies(id), version INTEGER NOT NULL,
+  agent_id TEXT NOT NULL REFERENCES agents(id), inputs_hash TEXT NOT NULL, results_hash TEXT NOT NULL,
+  body TEXT NOT NULL, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS state_transitions (
   id INTEGER PRIMARY KEY, strategy_id INTEGER NOT NULL REFERENCES strategies(id), from_state TEXT NOT NULL,
   to_state TEXT NOT NULL, version INTEGER NOT NULL, at TEXT NOT NULL);
@@ -391,6 +396,10 @@ impl Store {
                 "the owner signs through an owner request (Touch ID)".into(),
             ));
         }
+        // the engine never signs by hand; its one fail back is the automatic one (S46)
+        if role == Role::Engine {
+            return Err(DeskError::Denied("the engine doesn't sign".into()));
+        }
         // one transaction: the version read here is the one every collected signature is for
         let version: i64 = sqlx::query_scalar("SELECT version FROM strategies WHERE id = ?")
             .bind(strategy)
@@ -669,6 +678,13 @@ impl Store {
         criteria: &str,
     ) -> Result<()> {
         self.authorize(strategist, Action::EditSpec).await?;
+        // criteria are read by the signers' models; keep them short
+        if criteria.len() > crate::evidence::MAX_CRITERIA {
+            return Err(DeskError::Denied(format!(
+                "criteria are over {} characters",
+                crate::evidence::MAX_CRITERIA
+            )));
+        }
         let mut tx = self.pool.begin().await?;
         let state = state_in(&mut tx, strategy).await?;
         if !matches!(state, State::Idea | State::HypothesisApproved) {
@@ -766,6 +782,125 @@ impl Store {
         Ok(version)
     }
 
+    /// Records the engine's code-computed evidence for the strategy's current version (S46): the
+    /// desk hashes the body itself, records it as an official backtest (so a non-reproducing one
+    /// fails back exactly as `record_backtest` does), and keeps the body. Returns whether it
+    /// reproduces. Only `Role::Engine` may post.
+    pub async fn post_evidence(
+        &self,
+        agent_id: &str,
+        strategy: i64,
+        inputs_hash: &str,
+        body: &Value,
+    ) -> Result<bool> {
+        plain("inputs hash", inputs_hash)?;
+        self.authorize(agent_id, Action::PostEvidence).await?;
+        crate::evidence::validate(body).map_err(DeskError::Denied)?;
+        let results_hash = crate::evidence::hash(body);
+        // one transaction: the run and its body land together, on the version the run was for,
+        // even when a non-reproducing run fails the strategy back to a new version
+        let mut tx = self.pool.begin().await?;
+        let (reproduces, version) = record_backtest_in(
+            &mut tx,
+            agent_id,
+            strategy,
+            true,
+            inputs_hash,
+            &results_hash,
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO evidence (strategy_id, version, agent_id, inputs_hash, results_hash, body, at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(strategy)
+        .bind(version)
+        .bind(agent_id)
+        .bind(inputs_hash)
+        .bind(&results_hash)
+        .bind(crate::evidence::canonical(body))
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+        append(
+            &mut tx,
+            agent_id,
+            "post_evidence",
+            json!({"strategy": strategy, "version": version, "inputs": inputs_hash, "results": results_hash, "reproduces": reproduces}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(reproduces)
+    }
+
+    /// What a signer needs for a strategy: its state, version and criteria, the latest evidence
+    /// for the current version, each criterion checked against it in code, and the signatures
+    /// already on the next step. Only roles with `ReadEvidence`.
+    pub async fn evidence(&self, agent_id: &str, strategy: i64) -> Result<Value> {
+        self.authorize(agent_id, Action::ReadEvidence).await?;
+        let mut tx = self.pool.begin().await?;
+        let (name, state, version, criteria): (String, String, i64, Option<String>) =
+            sqlx::query_as("SELECT name, state, version, criteria FROM strategies WHERE id = ?")
+                .bind(strategy)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| DeskError::NotFound(format!("strategy {strategy}")))?;
+        let latest: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT inputs_hash, results_hash, body, at FROM evidence
+             WHERE strategy_id = ? AND version = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(strategy)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let signed: Vec<(String, String)> = sqlx::query_as(
+            "SELECT to_state, agent_id FROM signatures WHERE strategy_id = ? AND version = ? ORDER BY at",
+        )
+        .bind(strategy)
+        .bind(version)
+        .fetch_all(&mut *tx)
+        .await?;
+        let evidence = match latest {
+            None => None,
+            Some((inputs, results, body, at)) => {
+                let body: Value = serde_json::from_str(&body)
+                    .map_err(|e| DeskError::Corrupt(format!("stored evidence: {e}")))?;
+                let outcomes = criteria.as_deref().and_then(|c| {
+                    body.get("metrics")
+                        .and_then(Value::as_object)
+                        .and_then(|m| crate::evidence::evaluate(c, m))
+                });
+                // only fields the engine writes reach a signer: no free text from anyone else
+                let shown: serde_json::Map<String, Value> = body
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter(|(k, _)| crate::evidence::SHOWN.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                Some(json!({
+                    "inputs_hash": inputs,
+                    "results_hash": results,
+                    "recorded": at,
+                    "checkable": outcomes.is_some(),
+                    "criteria_checks": outcomes,
+                    // false, not null, when the criteria can't be checked: never a reason to sign
+                    "all_criteria_pass": outcomes.as_deref().is_some_and(crate::evidence::all_pass),
+                    "body": shown,
+                }))
+            }
+        };
+        Ok(json!({
+            "strategy": strategy,
+            "name": name,
+            "state": state,
+            "version": version,
+            "criteria": criteria,
+            "evidence": evidence,
+            "signatures_this_version": signed.into_iter().map(|(to, by)| json!({"to": to, "by": by})).collect::<Vec<_>>(),
+        }))
+    }
+
     /// Records a backtest of the current version by its input and result hashes. Developers and
     /// Researchers run development backtests; only the Validator runs official ones.
     /// Records a backtest run. Returns false when it doesn't reproduce: an earlier run of this
@@ -789,7 +924,32 @@ impl Store {
         };
         self.authorize(agent_id, action).await?;
         let mut tx = self.pool.begin().await?;
-        let version = version_in(&mut tx, strategy).await?;
+        let (reproduces, _) = record_backtest_in(
+            &mut tx,
+            agent_id,
+            strategy,
+            official,
+            inputs_hash,
+            results_hash,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(reproduces)
+    }
+}
+
+/// `record_backtest`'s work inside the caller's transaction. Returns whether it reproduces and
+/// the version the run was for (before any fail back bumps it).
+async fn record_backtest_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent_id: &str,
+    strategy: i64,
+    official: bool,
+    inputs_hash: &str,
+    results_hash: &str,
+) -> Result<(bool, i64)> {
+    {
+        let version = version_in(tx, strategy).await?;
         let differing: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM backtest_runs WHERE strategy_id = ? AND version = ? AND inputs_hash = ? AND results_hash <> ?",
         )
@@ -797,7 +957,7 @@ impl Store {
         .bind(version)
         .bind(inputs_hash)
         .bind(results_hash)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         let reproduces = differing == 0;
         sqlx::query(
@@ -811,10 +971,10 @@ impl Store {
         .bind(inputs_hash)
         .bind(results_hash)
         .bind(now())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         append(
-            &mut tx,
+            tx,
             agent_id,
             "record_backtest",
             json!({"strategy": strategy, "version": version, "official": official, "inputs": inputs_hash, "results": results_hash, "reproduces": reproduces}),
@@ -823,7 +983,7 @@ impl Store {
         if official && !reproduces {
             let state: String = sqlx::query_scalar("SELECT state FROM strategies WHERE id = ?")
                 .bind(strategy)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?;
             let state = State::parse(&state)
                 .ok_or_else(|| DeskError::Corrupt(format!("stored state {state:?}")))?;
@@ -837,20 +997,21 @@ impl Store {
                     agent_id: agent_id.into(),
                     proof: None,
                 }];
-                transition_in(&mut tx, strategy, State::SpecFrozen, back).await?;
+                transition_in(tx, strategy, State::SpecFrozen, back).await?;
             }
             append(
-                &mut tx,
+                tx,
                 agent_id,
                 "reproduction_fail",
                 json!({"strategy": strategy, "version": version, "inputs": inputs_hash}),
             )
             .await?;
         }
-        tx.commit().await?;
-        Ok(reproduces)
+        Ok((reproduces, version))
     }
+}
 
+impl Store {
     /// Ops records the paper results the PAPER_REVIEWED gate reads (never the caller's numbers).
     pub async fn record_paper(
         &self,
@@ -1783,6 +1944,133 @@ mod tests {
             s.authorize("val-1", Action::RunOfficialBacktest).await,
             Err(DeskError::Budget(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn only_the_engine_posts_evidence_and_the_desk_checks_the_criteria() {
+        let s = desk().await;
+        s.add_agent("board", "engine-1", Role::Engine, Some(proof()))
+            .await
+            .unwrap();
+        s.add_agent("board", "hod-1", Role::HeadOfDesk, Some(proof()))
+            .await
+            .unwrap();
+        let id = s.create_strategy("res-1", "drift").await.unwrap();
+        s.transition(id, State::HypothesisApproved, by("strat-1"))
+            .await
+            .unwrap();
+        let criteria = r#"{"checks": [{"metric": "deflated_sharpe", "min": 0.95}, {"metric": "expectancy", "min": 0.02}]}"#;
+        s.set_criteria("strat-1", id, criteria).await.unwrap();
+        s.transition(id, State::SpecFrozen, by("po-1"))
+            .await
+            .unwrap();
+        s.submit_version("dev-1", id, "sha256:abc").await.unwrap();
+        s.transition(id, State::Implemented, by("strat-1"))
+            .await
+            .unwrap();
+        let body = json!({"metrics": {"deflated_sharpe": 0.97, "expectancy": 0.01}, "source": "stress-battery"});
+
+        // no agent can post numbers, the Validator included
+        for agent in ["val-1", "stress-1", "hod-1", "dev-1"] {
+            assert!(
+                s.post_evidence(agent, id, "in", &body).await.is_err(),
+                "{agent}"
+            );
+        }
+        assert!(
+            s.post_evidence("engine-1", id, "in", &body).await.unwrap(),
+            "reproduces"
+        );
+
+        let v = s.evidence("val-1", id).await.unwrap();
+        let e = &v["evidence"];
+        assert_eq!(
+            e["results_hash"],
+            crate::evidence::hash(&body),
+            "the desk's own hash"
+        );
+        assert_eq!(e["criteria_checks"][0]["passed"], true);
+        assert_eq!(
+            e["criteria_checks"][1]["passed"], false,
+            "expectancy under the bar"
+        );
+        assert_eq!(e["all_criteria_pass"], false);
+        assert!(
+            s.evidence("hod-1", id).await.is_ok(),
+            "the Head of Desk reads it"
+        );
+        assert!(
+            s.evidence("res-1", id).await.is_err(),
+            "the Researcher doesn't"
+        );
+
+        // the same inputs with different numbers don't reproduce: an automatic fail back
+        let other = json!({"metrics": {"deflated_sharpe": 0.5, "expectancy": 0.01}});
+        assert!(!s.post_evidence("engine-1", id, "in", &other).await.unwrap());
+        assert_eq!(s.state(id).await.unwrap(), State::SpecFrozen);
+        // the failed run's body stays on the version it was for; the new version has none yet
+        let per_version: Vec<(i64,)> =
+            sqlx::query_as("SELECT version FROM evidence WHERE strategy_id = ? ORDER BY id")
+                .bind(id)
+                .fetch_all(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(per_version, [(1,), (1,)]);
+        let after = s.evidence("val-1", id).await.unwrap();
+        assert_eq!(after["version"], 2);
+        assert!(
+            after["evidence"].is_null(),
+            "nothing yet for the new version"
+        );
+        // the engine never signs by hand, not even a step back
+        assert!(denied(
+            s.sign("engine-1", id, State::Implemented).await,
+            "doesn't sign"
+        ));
+        assert!(
+            s.set_criteria(
+                "strat-1",
+                id,
+                &"x".repeat(crate::evidence::MAX_CRITERIA + 1)
+            )
+            .await
+            .is_err(),
+            "criteria are capped"
+        );
+        assert!(
+            s.post_evidence("engine-1", id, "in", &json!({"metrics": {}}))
+                .await
+                .is_err(),
+            "a body with no numbers is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_database_gets_the_evidence_table_and_its_guards() {
+        let path = std::env::temp_dir().join(format!("bmv-desk-migrate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let url = format!("sqlite://{}", path.display());
+        let s = Store::open(&url).await.unwrap();
+        // a database from before S46: no evidence table, no guards on it
+        sqlx::query("DROP TABLE evidence")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        drop(s);
+        let s = Store::open(&url).await.unwrap();
+        let found: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE tbl_name = 'evidence' ORDER BY name",
+        )
+        .fetch_all(&s.pool)
+        .await
+        .unwrap();
+        assert!(found.iter().any(|(n,)| n == "evidence"), "{found:?}");
+        assert!(
+            found.len() >= 3,
+            "the table and its no-update and no-delete guards: {found:?}"
+        );
+        drop(s);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

@@ -114,6 +114,15 @@ const TOOLS: &[Tool] = &[
         ],
     },
     Tool {
+        name: "strategy_evidence",
+        about: "A strategy's state, version and pre-registered criteria, its latest code-computed \
+                evidence (backtest, stress battery, deflated Sharpe, reproduction hashes), each \
+                criterion checked against it by the desk, and who has signed this version. Read-only.",
+        method: "GET",
+        path: "/v1/strategies/{strategy}/evidence",
+        args: &[STRATEGY],
+    },
+    Tool {
         name: "strategy_limits",
         about: "A strategy's risk limits, each at its latest version.",
         method: "GET",

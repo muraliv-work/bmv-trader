@@ -39,6 +39,7 @@ const USAGE: &str = "usage:
   bmv-trader llm-health                   check Ollama, OmniRoute, a Tier-2 probe, key age and Claude spend
   bmv-trader llm-rotate                   regenerate the OmniRoute key, store it, re-apply its policy
   bmv-trader llm-daily                    for launchd: llm-rotate, then llm-health
+  bmv-trader desk-evidence --strategy N --trial T  post a trial's stress-battery result to a desk strategy (S46)
   bmv-trader keys                         every key the system holds: renewed, due, state (S43)
   bmv-trader keys --renew                 walk through the keys that are due: what, where to get it, paste, test, save
   bmv-trader keys --notify                for launchd: a notification when any key is 10 days or less from due
@@ -205,6 +206,7 @@ fn main() {
             Some("retro-power") => retro_power(),
             Some("trial-autopsy") => trial_autopsy(),
             Some("stress-battery") => stress_battery(),
+            Some("desk-evidence") => desk_evidence(args.get("--strategy"), args.get("--trial")),
             Some("retro-sample") => retro_sample(),
             Some("retro-speed") => retro_speed(args.num("--count", 3, 1..=20)?),
             Some("retro-run") => retro_run(args.num("--hours", 8, 1..=72)?),
@@ -1773,6 +1775,74 @@ fn orb_neighbours(p: &OrbParams) -> Vec<(String, OrbParams)> {
     out
 }
 
+/// Posts one trial's stress-battery result to the desk as a strategy's evidence (S46), as the
+/// engine's own desk identity (Keychain `bmv-desk` / `engine-1`). The desk hashes it and checks the
+/// strategy's criteria against it; no agent types a number.
+fn desk_evidence(strategy: Option<&str>, trial: Option<&str>) -> Result<(), String> {
+    let strategy: i64 = strategy
+        .and_then(|s| s.parse().ok())
+        .ok_or("usage: bmv-trader desk-evidence --strategy N --trial T")?;
+    let trial: u64 = trial
+        .and_then(|s| s.parse().ok())
+        .ok_or("usage: bmv-trader desk-evidence --strategy N --trial T")?;
+    let home = config::home()?;
+    let path = home.join("data/stress.jsonl");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // the last line for the trial is its latest result
+    let row: serde_json::Value = text
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|r| r["trial"].as_u64() == Some(trial))
+        .ok_or_else(|| {
+            format!("no stress result for trial {trial}; run bmv-trader stress-battery")
+        })?;
+    let inputs = row["inputs_hash"]
+        .as_str()
+        .ok_or("the stress result has no inputs hash")?
+        .to_string();
+    let body = bmv_trader::stress::desk_evidence(&row)?;
+    let token = config::keychain_in("bmv-desk", "engine-1")?.ok_or(
+        "no engine token in the Keychain (bmv-desk / engine-1); see deploy/README.md, Quant Desk evidence",
+    )?;
+    let http = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let addr = std::env::var("DESK_ADDR").unwrap_or_else(|_| "127.0.0.1:8790".into());
+    if !addr.starts_with("127.0.0.1:") {
+        return Err(format!(
+            "DESK_ADDR {addr:?}: the desk is reached on loopback only"
+        ));
+    }
+    let resp = http
+        .post(format!("http://{addr}/v1/strategies/{strategy}/evidence"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"inputs_hash": inputs, "body": body}))
+        .send()
+        .map_err(|e| format!("the desk: {}", e.without_url()))?;
+    let status = resp.status();
+    let reply: serde_json::Value = resp.json().map_err(|e| {
+        format!(
+            "the desk's reply ({status}) isn't JSON: {}",
+            e.without_url()
+        )
+    })?;
+    if !status.is_success() {
+        return Err(format!(
+            "the desk refused it ({status}): {}",
+            reply["error"].as_str().unwrap_or("no reason given")
+        ));
+    }
+    println!(
+        "posted trial {trial}'s evidence to strategy {strategy}: reproduces {}, results hash {}, state {}",
+        reply["reproduces"], reply["results_hash"], reply["state"]
+    );
+    Ok(())
+}
+
 /// `bmv-trader stress-battery` (build step 3, DESIGN §4c): every finished trial reproduced twice,
 /// with input and result hashes, then put through the owner's stress tests and judged on the bars
 /// in `stress.rs`. Written to data/stress.jsonl. Nothing here trades or calls a model.
@@ -1998,6 +2068,7 @@ fn stress_battery() -> Result<(), String> {
         let mut v = d.value;
         v["units"] = d.units.into();
         v["checks"] = serde_json::to_value(&d.checks).map_err(|e| e.to_string())?;
+        v["deflated_sharpe"] = dsr.into();
         v["verdict"] = if pass { "PASS" } else { "FAIL" }.into();
         out.push(v);
     }

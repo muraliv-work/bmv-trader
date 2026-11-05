@@ -409,6 +409,19 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - **`--notify`** (launchd `com.bmv-trader.keys`, 09:00) posts a macOS notification when any key is due within the window, overdue, missing, of unknown age, or its automatic rotation failed. The text is names only.
   - **`--renew`:** for each due key, it explains what the key is and what breaks without it, and lists where to get a new one. It takes a hidden paste and tests it with a free call: Anthropic's models list, or OpenRouter's key list for the management key. Only then does it save the key to the Keychain (through `security -i` on stdin), copy it into the agents' files that should hold it (`clip-key-swap.sh`), record the date, and say how to retire the old key. A wrong paste changes nothing.
   - **The daily health check** shows the same states for the hand-renewed keys. It replaces `scripts/rotate-keys.sh` and `data/keys_rotated.json`, whose dates are read once as a fallback.
+- **S46: the evidence tool (built).**
+  - **The `engine` role** (`Role::Engine`) is the only one with `PostEvidence`. No agents file may give it (wave-1 roles only), and the owner adds it once, for `engine-1`.
+  - **`POST /v1/strategies/{id}/evidence`** takes `{inputs_hash, body}`. The body is a JSON object with a `metrics` object of finite numbers, at most 48 KB. The desk:
+    - computes the results hash (SHA-256 of the canonical JSON) and records the post as an official backtest (`record_backtest`)
+    - stores the body in the append-only `evidence` table
+    - does all of it in one transaction, so the run and its body land on the version the run was for, even when a non-reproducing post fails the strategy back to a new version
+    - the engine is allowed only that automatic fail-back: it can't sign through `/sign`, forward or back
+  - **`GET` (`strategy_evidence`)** returns the strategy's state, version and criteria, the latest evidence for the current version, and who has signed.
+    - When the criteria read `{"checks": [{"metric", "min"|"max"}]}`, it also returns each criterion checked against the metrics. `checkable` says whether it could check them, and `all_criteria_pass` is false, never null, when it couldn't.
+    - Only the fields the engine writes are returned (source, trial, name, period, units, verdict, checks, metrics), so no other text reaches a signer. Criteria are capped at 4,096 characters, and a stored body that can't be read is an error.
+    - Readers are the Validator, Stress Lead, Head of Desk, owner and engine.
+  - **`bmv-trader desk-evidence --strategy N --trial T`** turns a `data/stress.jsonl` result into evidence (`stress::desk_evidence`). Its metrics are expectancy, trades, Monte Carlo (5th percentile, share below zero, 95th-percentile drawdown), expectancy at double costs, share of positive years, deflated Sharpe and reproduction. The stress battery now records the deflated Sharpe as a number.
+  - **Still open:** the engine's Keychain item is readable by anything running as the owner. It could be limited to the `bmv-trader` binary with a Keychain access-control list. The desk doesn't require a minimum set of criteria; the Product Owner's sign-off at the frozen spec is the control.
 - **S45: the AI picks, the owner approves.** The build order to get there:
   1. **The evidence tool,** so the signers can read each strategy's criteria, reproduction hashes, stress results and deflated Sharpe. It comes with the date in each heartbeat.
   2. **Wave 2: the Strategist and Developer,** so ideas become strategies that code can test.

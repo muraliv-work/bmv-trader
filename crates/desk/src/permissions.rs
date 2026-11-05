@@ -19,9 +19,12 @@ pub enum Role {
     Compliance,
     Ops,
     ProductOwner,
+    /// The engine's own code, not an agent: the only role that posts evidence (S46). No agents
+    /// file may give it to an agent; the owner adds it once, for the engine's token.
+    Engine,
 }
 
-pub const ROLES: [Role; 12] = [
+pub const ROLES: [Role; 13] = [
     Role::Board,
     Role::HeadOfDesk,
     Role::Researcher,
@@ -34,6 +37,7 @@ pub const ROLES: [Role; 12] = [
     Role::Compliance,
     Role::Ops,
     Role::ProductOwner,
+    Role::Engine,
 ];
 
 impl Role {
@@ -51,6 +55,7 @@ impl Role {
             Role::Compliance => "compliance",
             Role::Ops => "ops",
             Role::ProductOwner => "product_owner",
+            Role::Engine => "engine",
         }
     }
 
@@ -91,6 +96,10 @@ pub enum Action {
     LoosenLimit,
     FileReport,
     Halt,
+    /// Posting a strategy's code-computed evidence (S46).
+    PostEvidence,
+    /// Reading it: the signers, the Head of Desk, the owner, and the engine.
+    ReadEvidence,
 }
 
 /// The policy table.
@@ -105,7 +114,8 @@ pub fn allowed(role: Role, action: Action) -> bool {
         SubmitStrategyVersion => matches!(role, Developer),
         SubmitPlatformChange => matches!(role, PlatformEngineer),
         RunDevBacktest => matches!(role, Researcher | Developer),
-        RunOfficialBacktest => matches!(role, Validator),
+        // the engine runs official backtests from code; the Validator keeps the right it had
+        RunOfficialBacktest => matches!(role, Validator | Engine),
         RunStress => matches!(role, StressLead),
         ReadResearchData => matches!(
             role,
@@ -119,6 +129,9 @@ pub fn allowed(role: Role, action: Action) -> bool {
         TightenLimit => matches!(role, RiskManager | Board),
         LoosenLimit => matches!(role, Board),
         FileReport => !matches!(role, Researcher | Developer | PlatformEngineer | Strategist),
+        // numbers reach the desk only from code (S46)
+        PostEvidence => matches!(role, Engine),
+        ReadEvidence => matches!(role, Validator | StressLead | HeadOfDesk | Board | Engine),
     }
 }
 
@@ -167,5 +180,17 @@ mod tests {
         assert!(!allowed(Role::Developer, Action::RunOfficialBacktest));
         assert!(!allowed(Role::Validator, Action::SubmitStrategyVersion));
         assert!(Role::Validator.second_line() && !Role::HeadOfDesk.second_line());
+        for r in ROLES {
+            assert_eq!(
+                allowed(r, Action::PostEvidence),
+                r == Role::Engine,
+                "{r:?} posts evidence"
+            );
+        }
+        assert!(
+            allowed(Role::Validator, Action::ReadEvidence)
+                && !allowed(Role::Researcher, Action::ReadEvidence)
+        );
+        assert!(!Role::Engine.second_line());
     }
 }

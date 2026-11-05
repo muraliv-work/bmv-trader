@@ -190,6 +190,34 @@ async fn backtest(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Evidence {
+    inputs_hash: String,
+    body: Value,
+}
+
+/// The engine posts code-computed evidence; the desk hashes it (S46).
+async fn post_evidence(
+    Ctx(s): Desk,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    Json(b): Json<Evidence>,
+) -> Reply {
+    let agent = caller(&s, &h).await?;
+    let reproduces = s.post_evidence(&agent, id, &b.inputs_hash, &b.body).await?;
+    Ok(Json(json!({
+        "reproduces": reproduces,
+        "results_hash": crate::evidence::hash(&b.body),
+        "state": s.state(id).await?.as_str(),
+    })))
+}
+
+async fn evidence(Ctx(s): Desk, h: HeaderMap, Path(id): Path<i64>) -> Reply {
+    let agent = caller(&s, &h).await?;
+    Ok(Json(s.evidence(&agent, id).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Paper {
     days: u32,
     trades: u32,
@@ -326,6 +354,10 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/v1/strategies/{id}/versions", post(version))
         .route("/v1/strategies/{id}/backtests", post(backtest))
         .route("/v1/strategies/{id}/paper", post(paper))
+        .route(
+            "/v1/strategies/{id}/evidence",
+            get(evidence).post(post_evidence),
+        )
         .route("/v1/strategies/{id}/sign", post(sign))
         .route("/v1/strategies/{id}/halt", post(halt))
         .route("/v1/strategies/{id}/limits", get(limits).post(limit))

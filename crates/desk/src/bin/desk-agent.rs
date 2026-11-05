@@ -135,7 +135,13 @@ fn heartbeat(agents: &str, agent: &str, secrets: &str) -> Result<(), String> {
             ));
         }
     }
-    let c = Agents::parse(&text, &mtext)?.get(agent)?.charter(agent)?;
+    let mut c = Agents::parse(&text, &mtext)?.get(agent)?.charter(agent)?;
+    // the model has no clock: each heartbeat is told when it is
+    c.task = format!(
+        "It is {} UTC.\n\n{}",
+        chrono::Utc::now().format("%A %Y-%m-%d %H:%M"),
+        c.task
+    );
     let key = match c.provider {
         Provider::Anthropic => s
             .anthropic_key
