@@ -481,7 +481,7 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
 
 The 30 November feedback report draws on whatever exists by then: trial 12, the stress battery, deflated Sharpe, the cost check.
 
-### Options (S48, planned; built after step 6)
+### Options (S48, parked by R14 until a stock signal passes Level B; designed, built after step 6)
 Buy-only long calls and puts on Alpaca paper. Alpaca takes contract orders on the same Orders API (whole contracts, `day` or `gtc`, no extended hours, no bracket orders), reports them in the same Positions API, and reports expiry, exercise and assignment as non-trade activities, which on paper appear the next day. The engine is built for a long stock bracket today, so each phase below has the owner's go-ahead.
 1. **Types** (`src/contract.rs`): an `OccSymbol` parser (underlying, expiry, call or put, strike) with its own validator. The stock validators (`broker::valid_symbol`, `history::valid_symbol`, `Candidate::long`) stay stock-only. The ×100 multiplier lives in one function, `premium_usd(price, contracts)`, which every caller uses; a test pins it, since a missed multiplier under-sizes risk 100-fold.
 2. **Risk** (`src/risk.rs`): a contract gate where risk is the full premium, never entry minus stop. Premium within `max_risk_per_trade`, open premium within a new `max_open_premium_usd` (which `Limits::tightened` accepts, so the desk can only lower it), and the shared position limit and daily loss halt. `cluster_of` keys on the underlying.
@@ -1038,6 +1038,23 @@ More AI authority is earned one level at a time. Each level is enabled only afte
 - The final holdout: at least 30 trades with positive expectancy, run once for the finalist and logged as a trial.
 
 **Why Claude isn't backtested:** its training data may already contain how those past days turned out (look-ahead bias). Its value is measured forward only.
+
+### Stop rule and exit levels (R13, R14, 2026-11-06)
+
+- **R13** (DECISION.md) restores R9's test for every new trial, with a deadline: a new kind of data **and** a passing power check, before any data or code. Stop 1 is 2026-11-30: with no strategy past Level B, the owner's money defaults to SPY and bmv-trader is a paper-only lab. Stop 2 ends research at 20 logged trials or 2027-06-30. Forward tests end by 2027-12-31.
+- **Level B (R14):** the P1 gate's research bars above, **plus** CAGR and Sharpe above SPY's buy-and-hold over the same dates at 1% risk per trade, plus the stress battery and the S33 screen. For a trial pre-registered from now on, the final holdout bar is met only by the forward test, because S33 leaves no unseen history.
+- **Level C, the forward test:** the one-sided 95% lower bound of forward mean R is above 0 (day-block bootstrap, as in the P1 gate), and it beats SPY on the same 1%-risk basis with drawdown no worse than SPY's.
+- **Power check.** One trade's R varies by about ±1.26 (from trial 13's interval). At 80% power and one-sided 95%, the forward trades needed are N = ((1.645 + 0.842) × 1.26 / edge)². The hoped-for edge may be no bigger than the backtest's.
+
+| True edge per trade | Forward trades needed |
+|---|---|
+| 0.074R (trial 13) | about 1,790 |
+| 0.2R | about 245 |
+| 0.3R | about 110 |
+| 0.44R | about 50 |
+| 0.5R | about 39 |
+
+  At about 50 trades a year, only an edge of about 0.44R or more can pass by 2027-12-31. If the count can't be reached at the strategy's own trade rate by then, the trial isn't run.
 
 ## 13b. Trial 6: gap-and-go on scanned gappers (pre-registered 2026-11-03, before any data)
 
