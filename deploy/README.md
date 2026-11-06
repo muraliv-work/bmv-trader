@@ -124,6 +124,11 @@ logged first. A missed run, an unexplained mismatch, or an empty account sets th
 the session the record started in partway is skipped. If a run's line can't be written, the run
 exits 1 and pings `reconcile/fail` even with nothing to halt.
 
+The rest of `desk-report` (step 3e): positions and open orders, STOP and its reason, reconcile
+halts this month, the trial count and `data/trials.jsonl`'s SHA-256, backups (none while D2 isn't
+done), and sleeps that overlapped market hours over the last 14 days, from `pmset -g log` (each sleep entry until the next wake, so a Mac asleep at the open counts; a dark wake that goes back to sleep counts again). The backup line says "none" until D2 is set up; it reads nothing yet. A part that can't be
+read prints `UNREADABLE` and the report exits 1; the other parts still print.
+
 Before every drill, log its window, which starts now: `target/release/bmv-trader drill-start --check
 <halt|mismatch|stop-check|dead-man|stop> --minutes N` (at most 120). It appends to
 `data/reconcile/drill_windows.jsonl`. A window can't be logged after the drill has started. Windows

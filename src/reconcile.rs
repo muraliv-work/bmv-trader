@@ -260,12 +260,66 @@ pub fn missed_runs(
         .sum())
 }
 
+/// The Mac's sleeps that overlapped a session (Level A item 10), from `pmset -g log`: each
+/// "Sleep" entry lasts until the next "Wake" or "DarkWake", so a sleep that began before the open
+/// and ran into it counts. Returns each such sleep's start. A log with no dated entries at all is
+/// an error, never "no sleeps": its format may have changed.
+pub fn sleeps_in_sessions(log: &str, sessions: &[Session]) -> Result<Vec<i64>, String> {
+    let entries: Vec<(i64, &str)> = log
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            let stamp = format!("{} {} {}", w.next()?, w.next()?, w.next()?);
+            let at = chrono::DateTime::parse_from_str(&stamp, "%Y-%m-%d %H:%M:%S %z").ok()?;
+            // "Wake Requests" lines schedule a wake; they aren't one
+            let kind = match (w.next()?, w.next()) {
+                ("Wake", Some("Requests")) => "Wake Requests",
+                (k, _) => k,
+            };
+            Some((at.timestamp(), kind))
+        })
+        .collect();
+    if entries.is_empty() {
+        return Err("pmset -g log has no dated entries".into());
+    }
+    Ok(entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, kind))| *kind == "Sleep")
+        .filter_map(|(i, (from, _))| {
+            let to = entries[i + 1..]
+                .iter()
+                .find(|(_, k)| matches!(*k, "Wake" | "DarkWake"))
+                .map_or(i64::MAX, |(t, _)| *t);
+            sessions
+                .iter()
+                .any(|s| s.open < to && *from < s.close)
+                .then_some(*from)
+        })
+        .collect())
+}
+
+/// How many runs halted in `month` ("YYYY-MM"), by New York time.
+pub fn halts_in_month(runs: &[Run], month: &str) -> usize {
+    runs.iter()
+        .filter(|r| r.halt.is_some())
+        .filter(|r| {
+            chrono::DateTime::from_timestamp(r.at, 0).is_some_and(|d| {
+                d.with_timezone(&chrono_tz::America::New_York)
+                    .format("%Y-%m")
+                    .to_string()
+                    == month
+            })
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // 2026-11-16, a Monday: 9:30 to 16:00 ET is 14:30 to 21:00 UTC
-    const OPEN: i64 = 1_763_303_400;
+    const OPEN: i64 = 1_794_839_400;
     const CLOSE: i64 = OPEN + 390 * 60;
 
     fn day(n: i64) -> Session {
@@ -432,6 +486,46 @@ mod tests {
         assert_eq!(session(&s, &runs, &[], LATER), Verdict::Clean);
     }
 
+    #[test]
+    fn a_sleep_counts_if_it_overlaps_a_session_until_its_wake() {
+        let s = day(0); // 2026-11-16, 8:30 to 15:00 Central
+        let log = "\
+2026-11-16 06:00:00 -0600 Sleep               \tEntering Sleep state due to 'Idle Sleep'
+2026-11-16 07:00:00 -0600 Wake                \tWake from Normal Sleep
+2026-11-16 08:00:00 -0600 Sleep               \tEntering Sleep state due to 'Idle Sleep'
+2026-11-16 08:10:00 -0600 Wake Requests       \t[*process=dasd]
+2026-11-16 09:05:00 -0600 DarkWake            \tDarkWake from Deep Idle
+2026-11-16 10:15:00 -0600 Sleep               \tEntering Sleep state due to 'Low Power Sleep'
+2026-11-16 10:20:00 -0600 Wake                \tWake from Normal Sleep
+2026-11-16 16:00:00 -0600 Sleep               \tEntering Sleep state due to 'Idle Sleep'
+garbage line";
+        let at = |h: i64, m: i64| s.open - 150 * 60 + (h - 6) * 3600 + m * 60; // 6:00 Central
+        // 6:00 woke before the open; 8:00 slept into it; 10:15 in it; 16:00 after the close
+        assert_eq!(
+            sleeps_in_sessions(log, std::slice::from_ref(&s)).unwrap(),
+            [at(8, 0), at(10, 15)]
+        );
+        assert!(sleeps_in_sessions(log, &[]).unwrap().is_empty());
+        assert!(sleeps_in_sessions("no dates here\n", &[s]).is_err());
+    }
+
+    #[test]
+    fn halts_are_counted_by_new_york_month() {
+        // 2026-12-01 04:30 UTC is still 2026-11-30 in New York
+        let run = |at, halt: bool| Run {
+            at,
+            drills: 1,
+            mismatches: vec![],
+            halt: halt.then(|| "halt in 300 ms".to_string()),
+        };
+        let runs = [
+            run(1_796_099_400, true),
+            run(1_796_099_400, false),
+            run(1_796_200_000, true),
+        ];
+        assert_eq!(halts_in_month(&runs, "2026-11"), 1);
+        assert_eq!(halts_in_month(&runs, "2026-12"), 1);
+    }
     #[test]
     fn the_logs_append_and_a_bad_line_is_an_error() {
         let d = std::env::temp_dir().join(format!("bmv-rec-{}", std::process::id()));

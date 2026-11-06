@@ -257,8 +257,14 @@ fn main() {
             Some("desk-run") => desk_run(),
             Some("desk-report") => {
                 let (home, dir) = (config::home()?, data_dir()?);
-                desk_report(&home, &live_calendar(&dir)?)?;
-                reconcile_report(&home)
+                // every part prints, even after one fails; any failure fails the report
+                let trial = live_calendar(&dir)
+                    .and_then(|cal| desk_report(&home, &cal))
+                    .inspect_err(|e| println!("trial 10: UNREADABLE: {e}"));
+                let reconciled =
+                    reconcile_report(&home).inspect_err(|e| println!("reconcile: UNREADABLE: {e}"));
+                let health = health_report(&home);
+                trial.and(reconciled).and(health)
             }
             Some("desk-verdict") => desk_verdict(),
             Some("desk-analyse") => {
@@ -698,6 +704,128 @@ fn reconcile_report(home: &Path) -> Result<(), String> {
         }
     );
     Ok(())
+}
+
+/// The rest of Level A's daily report (R13 step 3e): the account, STOP and this month's halts,
+/// the trial log, backups, and sleep in market hours. A part that can't be read says so, and then
+/// the report fails: an unread part is never shown as fine.
+fn health_report(home: &Path) -> Result<(), String> {
+    use bmv_trader::reconcile;
+    use bmv_trader::safety::{self, KillSwitch};
+    let mut unread = vec![];
+    let mut show = |name: &str, r: Result<String, String>| match r {
+        Ok(s) => println!("{name}: {s}"),
+        Err(e) => {
+            println!("{name}: UNREADABLE: {e}");
+            unread.push(name.to_string());
+        }
+    };
+    let a = connect();
+    show(
+        "account",
+        a.as_ref().map_err(Clone::clone).and_then(|a| {
+            let held: Vec<String> = a
+                .positions()?
+                .iter()
+                .map(|p| format!("{} {}", p.qty, p.symbol))
+                .collect();
+            let orders = live::open_orders(a)?;
+            Ok(format!(
+                "{} position(s){}{}; {} open order(s)",
+                held.len(),
+                if held.is_empty() { "" } else { ": " },
+                held.join(", "),
+                orders.len()
+            ))
+        }),
+    );
+    let stop = safety::stop_path(home);
+    show(
+        "STOP",
+        Ok(match safety::kill_switch(&stop) {
+            KillSwitch::Clear => "clear".to_string(),
+            KillSwitch::Engaged(why) => format!(
+                "ENGAGED ({}); only you clear it, with rm data/STOP",
+                std::fs::read_to_string(&stop)
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or(why)
+            ),
+        }),
+    );
+    let month = et_now().format("%Y-%m").to_string();
+    show(
+        "halts",
+        reconcile::read::<reconcile::Run>(&reconcile::runs_path(home)).map(|runs| {
+            format!(
+                "{} reconcile halt(s) in {month}",
+                reconcile::halts_in_month(&runs, &month)
+            )
+        }),
+    );
+    let log = home.join("data/trials.jsonl");
+    show(
+        "trials",
+        logged_trials(&log).and_then(|t| {
+            if t.is_empty() && !log.exists() {
+                return Ok("0 logged (no data/trials.jsonl yet)".into());
+            }
+            Ok(format!(
+                "{} logged; data/trials.jsonl sha256 {}",
+                t.len(),
+                bmv_trader::retro::sha256(&log)?
+            ))
+        }),
+    );
+    // D2 (backups) was declined on 2026-11-06; this line changes when a backup exists
+    show(
+        "backup",
+        Ok("none set up (D2 not done): the trial log and the desk database have one copy".into()),
+    );
+    show(
+        "sleep",
+        a.as_ref().map_err(Clone::clone).and_then(|a| {
+            let since = (et_now() - chrono::Duration::days(14))
+                .format("%Y-%m-%d")
+                .to_string();
+            let today = et_now().format("%Y-%m-%d").to_string();
+            let rows: Vec<bmv_trader::history::CalendarRow> = a.get(
+                broker::Api::Trading,
+                &format!("/v2/calendar?start={since}&end={today}"),
+            )?;
+            let sessions = bmv_trader::history::parse_calendar(&rows)?;
+            let out = std::process::Command::new("/usr/bin/pmset")
+                .args(["-g", "log"])
+                .output()
+                .map_err(|e| format!("pmset: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("pmset exited {}", out.status));
+            }
+            let at =
+                reconcile::sleeps_in_sessions(&String::from_utf8_lossy(&out.stdout), &sessions)?;
+            let when: Vec<String> = at
+                .iter()
+                .filter_map(|t| chrono::DateTime::from_timestamp(*t, 0))
+                .map(|d| {
+                    d.with_timezone(&chrono_tz::America::New_York)
+                        .format("%m-%d %H:%M ET")
+                        .to_string()
+                })
+                .collect();
+            Ok(format!(
+                "{} sleep(s) in market hours over the last 14 days{}{}",
+                at.len(),
+                if at.is_empty() { "" } else { ": " },
+                when.join(", ")
+            ))
+        }),
+    );
+    if unread.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("the report couldn't read: {}", unread.join(", ")))
+    }
 }
 
 /// Logs a drill window before the owner starts a drill (R13 step 3e, Level A): from now, for
