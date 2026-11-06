@@ -64,6 +64,14 @@ pub struct Order {
     pub filled_avg_price: Option<Price>,
     #[serde(default)]
     pub legs: Option<Vec<Order>>,
+    /// "market", "limit", "stop", ...; reconciliation checks a drill's stop by it.
+    #[serde(default, rename = "type")]
+    pub order_type: Option<String>,
+    #[serde(default)]
+    pub time_in_force: Option<String>,
+    /// "simple", "bracket", "oco" or "oto".
+    #[serde(default)]
+    pub order_class: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

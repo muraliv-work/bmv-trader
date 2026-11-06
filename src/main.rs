@@ -15,6 +15,7 @@ const USAGE: &str = "usage:
   bmv-trader run      [--symbols ...] [--trend] [--marketable]   one paper session (PAPER ONLY; live is P5)
   bmv-trader flatten                      close every position and confirm (any mode)
   bmv-trader backstop                     for launchd: near the close, flatten anything left (deploy/)
+  bmv-trader desk-reconcile               for launchd: check the account holds only the drills and their stops (exit 1 on a mismatch)
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
   bmv-trader universe                     list every US stock, active and delisted (for the scan)
   bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD [--adjusted | --raw-sip]   daily bars for the universe
@@ -194,6 +195,7 @@ fn main() {
             Some("up") => up(args.num("--port", 8765, 1024..=65535)?),
             Some("flatten") => flatten(),
             Some("backstop") => backstop(),
+            Some("desk-reconcile") => desk_reconcile(),
             Some("run") => run(&args.symbols()?, args.has("--trend"), orb_params(&args)),
             Some("fetch") => {
                 let (from, to) = args.dates()?;
@@ -534,6 +536,29 @@ fn backstop() -> Result<(), String> {
     });
     let msg = live::backstop(&connect()?, now, &keep)?;
     println!("{} {msg}", chrono::Utc::now().to_rfc3339());
+    Ok(())
+}
+
+/// launchd runs this every 15 minutes from 9:00 to 15:45 ET (deploy/, R13 step 3b), through
+/// scripts/reconcile.sh, which pings healthchecks after it. Report only: the halt is step 3c.
+/// It checks whether the market is open or not: positions and GTC stops live at any hour.
+/// A mismatch, a bad drill file or a failed read exits 1, so the ping goes to reconcile/fail.
+fn desk_reconcile() -> Result<(), String> {
+    let a = connect()?;
+    let stamp = chrono::Utc::now().to_rfc3339();
+    let keep = live::drills(&config::home()?)?;
+    let found = live::mismatches(&keep, &a.positions()?, &live::open_orders(&a)?);
+    if !found.is_empty() {
+        return Err(format!(
+            "{stamp} reconcile: {} mismatch(es): {}",
+            found.len(),
+            found.join("; ")
+        ));
+    }
+    println!(
+        "{stamp} reconciled: {} drill(s) and nothing else",
+        keep.len()
+    );
     Ok(())
 }
 

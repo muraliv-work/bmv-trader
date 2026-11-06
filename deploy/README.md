@@ -79,6 +79,31 @@ cp deploy/com.bmv-trader.desk.plist ~/Library/LaunchAgents/
 launchctl bootout gui/$(id -u)/com.bmv-trader.desk; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.desk.plist
 ```
 
+# Reconciliation every 15 minutes (launchd, R13 step 3b)
+
+`scripts/reconcile.sh` runs `bmv-trader desk-reconcile` from `target/release` at 8:00–14:45 Mac
+time (9:00–15:45 ET), every day, market open or not (positions and GTC stops live at any hour). It
+checks that the account holds only the drills in `data/drill.json`, each with one working,
+standalone GTC sell stop for its full qty, and no other order. It only reports: nothing is
+cancelled or closed. Then it pings the healthchecks.io check `reconcile`, or `reconcile/fail` on a
+mismatch or an error, with the run's output as the ping body, so the email says what was wrong.
+The log is `data/reconcile.log`.
+
+The `reconcile` check on healthchecks.io: schedule `*/15 8-14 * * 1-5`, time zone
+`America/Chicago`, grace 10 minutes. Weekend pings are harmless. The Mac must stay on US Central
+time; the plist's hours are Mac time.
+
+```sh
+cargo build --release      # trial 10 has its pinned copy; trial 12 runs from target/lessons
+cp deploy/com.bmv-trader.reconcile.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.reconcile.plist
+launchctl kickstart -k gui/$(id -u)/com.bmv-trader.reconcile   # run once now
+tail -3 data/reconcile.log
+```
+
+Then un-pause the `reconcile` check on healthchecks.io and confirm its page shows that ping: a
+wrong key or slug only shows up as a missed ping.
+
 # Tier 2: local Ollama through OmniRoute (DECISION A13, S22)
 
 Low-risk notes for you (desk brief, analyst digest, session summary, Sunday digest) come from a

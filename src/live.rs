@@ -931,6 +931,61 @@ fn describe(p: &[&Position], o: &[&Order]) -> String {
     )
 }
 
+/// Reconciliation (DESIGN §12, R13 step 3b). Nothing trades but the owner's drills, so every
+/// position must be a drill at exactly its qty, each drill holds exactly one working, standalone
+/// GTC sell stop for its full qty, and no other order is open. One line per problem; empty means
+/// clean. The stop's price is the owner's choice and isn't checked.
+pub fn mismatches(keep: &[Drill], positions: &[Position], orders: &[Order]) -> Vec<String> {
+    let is_stop = |o: &Order, d: &Drill| {
+        o.symbol == d.symbol
+            && o.side == "sell"
+            && o.order_type.as_deref() == Some("stop")
+            && o.time_in_force.as_deref() == Some("gtc")
+            && o.legs.is_none()
+            && matches!(o.order_class.as_deref(), None | Some("" | "simple"))
+            && matches!(o.status.as_str(), "new" | "accepted" | "held")
+            && i64::from(o.qty) == d.qty
+    };
+    let mut out = vec![];
+    for p in positions {
+        match keep.iter().find(|d| d.symbol == p.symbol) {
+            Some(d) if d.qty == p.qty => {}
+            Some(d) => out.push(format!("{} {}: the drill is {}", p.qty, p.symbol, d.qty)),
+            None => out.push(format!("{} {}: not a drill position", p.qty, p.symbol)),
+        }
+    }
+    for d in keep {
+        if !positions.iter().any(|p| p.symbol == d.symbol) {
+            out.push(format!("drill {} {}: no position", d.qty, d.symbol));
+        }
+        match orders.iter().filter(|o| is_stop(o, d)).count() {
+            1 => {}
+            n => out.push(format!(
+                "drill {} {}: {n} standalone GTC sell stops for {}, expected 1",
+                d.qty, d.symbol, d.qty
+            )),
+        }
+    }
+    for o in orders
+        .iter()
+        .filter(|o| !keep.iter().any(|d| is_stop(o, d)))
+    {
+        out.push(format!(
+            "order {} ({} {} {}, {} {} {}, class {}, legs {}): not a drill stop",
+            o.client_order_id,
+            o.side,
+            o.qty,
+            o.symbol,
+            o.order_type.as_deref().unwrap_or("no type"),
+            o.time_in_force.as_deref().unwrap_or("no tif"),
+            o.status,
+            o.order_class.as_deref().unwrap_or("none"),
+            o.legs.is_some()
+        ));
+    }
+    out
+}
+
 /// Every symbol the run would watch must be on the allow-list.
 pub fn check_watchlist(watch: &[String], allowed: &BTreeSet<String>) -> Result<(), String> {
     let off: Vec<&str> = watch
@@ -1330,6 +1385,9 @@ mod tests {
             filled_qty: filled,
             filled_avg_price: avg.map(p),
             legs: None,
+            order_type: None,
+            time_in_force: None,
+            order_class: None,
         }
     }
 
@@ -1350,6 +1408,9 @@ mod tests {
             filled_qty: o.filled_qty,
             filled_avg_price: o.filled_avg_price,
             legs: o.legs.as_ref().map(|l| l.iter().map(copy).collect()),
+            order_type: o.order_type.clone(),
+            time_in_force: o.time_in_force.clone(),
+            order_class: o.order_class.clone(),
         }
     }
 
@@ -2439,6 +2500,64 @@ mod tests {
         f.script("open_orders", "HTTP 500");
         f.open.borrow_mut().clear();
         assert!(flatten(&f, 2, &mut || {}).is_ok());
+    }
+
+    fn gtc_stop(id: &str, qty: u32) -> Order {
+        Order {
+            order_type: Some("stop".into()),
+            time_in_force: Some("gtc".into()),
+            ..ord(id, "sell", "new", qty, 0, None)
+        }
+    }
+
+    #[test]
+    fn reconcile_finds_anything_but_a_drill_and_its_one_full_gtc_stop() {
+        let keep = [drill("SPY", 1)];
+        let held = [pos("SPY", 1)];
+        assert!(mismatches(&keep, &held, &[gtc_stop("s", 1)]).is_empty());
+        assert!(mismatches(&[], &[], &[]).is_empty());
+
+        let n = |p: &[Position], o: &[Order]| mismatches(&keep, p, o).len();
+        // a missing stop, a short stop, a day stop, a bracket leg, a limit, two stops
+        assert_eq!(n(&held, &[]), 1);
+        assert_eq!(n(&held, &[gtc_stop("s", 2)]), 2);
+        let day = Order {
+            time_in_force: Some("day".into()),
+            ..gtc_stop("s", 1)
+        };
+        assert_eq!(n(&held, &[day]), 2);
+        assert_eq!(n(&held, &[with_legs(gtc_stop("s", 1), vec![])]), 2);
+        let limit = Order {
+            order_type: Some("limit".into()),
+            ..gtc_stop("s", 1)
+        };
+        assert_eq!(n(&held, &[limit]), 2);
+        assert_eq!(n(&held, &[gtc_stop("s", 1), gtc_stop("t", 1)]), 1);
+        // a stop being cancelled or replaced, or an OCO leg returned flat
+        let going = Order {
+            status: "pending_cancel".into(),
+            ..gtc_stop("s", 1)
+        };
+        assert_eq!(n(&held, &[going]), 2);
+        let leg = Order {
+            order_class: Some("oco".into()),
+            ..gtc_stop("s", 1)
+        };
+        assert_eq!(n(&held, &[leg]), 2);
+        // an unknown order, an extra position, a wrong size, a drill with no position
+        let ok = || gtc_stop("s", 1);
+        assert_eq!(
+            n(
+                &held,
+                &[ok(), on("AAPL", ord("x", "buy", "new", 5, 0, None))]
+            ),
+            1
+        );
+        assert_eq!(n(&[pos("SPY", 1), pos("AAPL", 5)], &[ok()]), 1);
+        assert_eq!(n(&[pos("SPY", 2)], &[ok()]), 1);
+        assert_eq!(n(&[], &[ok()]), 1);
+        // no drills: anything open at all is a mismatch
+        assert_eq!(mismatches(&[], &held, &[ok()]).len(), 2);
     }
 
     fn drill(symbol: &str, qty: i64) -> Drill {
