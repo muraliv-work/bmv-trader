@@ -211,7 +211,7 @@ Three local services sit **above** the Rust engine. They can only propose; the e
 | Risk Officer | `risk::gate` plus the event filter (earnings, FOMC, CPI inside the hold), with swing limits (§9). An LLM reviewer gives advisory notes only | Code is final | Veto in code, naming the rule |
 | Trader | Rust swing executor: limit entry, GTC stop, no chasing (§8 step 5) | Code | Executes gated intents only |
 | Journal | `data/journal.jsonl` plus `data/desk.jsonl` (handoffs and proposals) | Code | Audit trail |
-| Kill switch | STOP, flatten, backstop (now scoped to the intraday book), plus Alpaca account settings | Code and broker | "A prompt is a request; a broker setting is a wall" |
+| Kill switch | STOP, flatten, backstop (closes everything but the owner's drill positions in `data/drill.json`; scoped to the intraday book once a swing book exists), plus Alpaca account settings | Code and broker | "A prompt is a request; a broker setting is a wall" |
 
 - **Desk Rules for agents** are a read-only file, `data/desk_rules.md`, generated from the Rust `Limits`. Prompts can't drift from the code.
 - **Sidecars install from pinned public releases** (PyPI, npm or a git commit), never from `REFERENCE-REPOS/`, which is reading material only and may be deleted.
@@ -998,6 +998,7 @@ More AI authority is earned one level at a time. Each level is enabled only afte
 | Journal write fails | No entries + alert. Trading state is unaffected because it comes from Alpaca |
 | Crash / restart | Startup sequence §6: snapshot from Alpaca. Any position or order without the `bmv-` prefix halts entries + alert |
 | Flatten fails | Retry; backstop process at close − 3; alert if not flat by close − 2 |
+| Drill position at the close (R13 step 3a) | The backstop spares a drill symbol only while `data/drill.json` lists it, the position is exactly that long qty, and no engine (`bmv-`) order is on it. Then it keeps that position and the owner's sell orders for at most that qty: the drill's stop must be a standalone order, not a bracket or OCO leg. Otherwise everything on the symbol is closed or cancelled. A malformed drill file spares nothing (logged to stderr). STOP and `flatten` always close everything |
 | Mac sleeps | Broker-held bracket stops protect open positions. Timers catch up from the clock on wake. Off-host dead-man alert. Laptop rule: lid open during market hours |
 | Wash-trade rejection (403) on a close | Closing goes through `close_all` with `cancel_orders` **[verify]**, which avoids a manual sell while bracket legs are still open |
 | `.env` malformed, or `TRADING_MODE` set by the shell | Refuse to start; print which source set the mode |

@@ -858,6 +858,79 @@ pub fn allowlist(home: &Path) -> Result<BTreeSet<String>, String> {
     Ok(names)
 }
 
+/// One owner drill position the backstop leaves alone (R13 step 3a): exactly this many shares,
+/// long, plus the owner's own sell orders on it (its GTC stop). `data/drill.json`, a JSON list.
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drill {
+    pub symbol: String,
+    pub qty: i64,
+}
+
+/// The drill file. Missing means no drill. Anything malformed is an error, and the backstop then
+/// flattens everything: a bad file never makes it skip a position.
+pub fn drills(home: &Path) -> Result<Vec<Drill>, String> {
+    let path = home.join("data").join("drill.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(format!("drill file {}: {e}", path.display())),
+    };
+    let list: Vec<Drill> =
+        serde_json::from_str(&text).map_err(|e| format!("drill file {}: {e}", path.display()))?;
+    let mut seen = BTreeSet::new();
+    for d in &list {
+        if !history::valid_symbol(&d.symbol) || d.qty <= 0 || !seen.insert(d.symbol.as_str()) {
+            return Err(format!(
+                "drill file: {} {} must be a ticker, listed once, with qty > 0",
+                d.qty, d.symbol
+            ));
+        }
+    }
+    Ok(list)
+}
+
+/// What the backstop must close. A drill symbol is spared only while its position is exactly the
+/// drill's qty and no engine order ("bmv-" ids) is on it; then only that position and the owner's
+/// sell orders for at most that qty survive. Anything else, on any symbol, is closed or cancelled.
+fn outside_drills<'a>(
+    keep: &[Drill],
+    positions: &'a [Position],
+    orders: &'a [Order],
+) -> (Vec<&'a Position>, Vec<&'a Order>) {
+    let spared = |s: &str| {
+        keep.iter().find(|d| {
+            d.symbol == s
+                && positions.iter().any(|p| p.symbol == s && p.qty == d.qty)
+                && !orders
+                    .iter()
+                    .any(|o| o.symbol == s && o.client_order_id.starts_with("bmv-"))
+        })
+    };
+    let p = positions
+        .iter()
+        .filter(|p| spared(&p.symbol).is_none())
+        .collect();
+    let o = orders
+        .iter()
+        .filter(|o| spared(&o.symbol).is_none_or(|d| o.side != "sell" || i64::from(o.qty) > d.qty))
+        .collect();
+    (p, o)
+}
+
+/// For logs: what is left outside the drills.
+fn describe(p: &[&Position], o: &[&Order]) -> String {
+    format!(
+        "positions {:?}, orders {:?}",
+        p.iter()
+            .map(|p| format!("{} {}", p.qty, p.symbol))
+            .collect::<Vec<_>>(),
+        o.iter()
+            .map(|o| o.client_order_id.as_str())
+            .collect::<Vec<_>>()
+    )
+}
+
 /// Every symbol the run would watch must be on the allow-list.
 pub fn check_watchlist(watch: &[String], allowed: &BTreeSet<String>) -> Result<(), String> {
     let off: Vec<&str> = watch
@@ -1056,8 +1129,9 @@ pub fn maybe_near_close(now: i64) -> bool {
 }
 
 /// The flatten backstop (DESIGN §12), run by launchd every 2 minutes: near today's real close,
-/// if anything is still open (the engine died, hung or the Mac slept), close everything.
-pub fn backstop(alpaca: &Alpaca, now: i64) -> Result<String, String> {
+/// if anything is still open (the engine died, hung or the Mac slept), close everything but the
+/// owner's drill positions in `keep`.
+pub fn backstop(alpaca: &Alpaca, now: i64, keep: &[Drill]) -> Result<String, String> {
     let today = chrono::DateTime::from_timestamp(now, 0)
         .ok_or("bad clock")?
         .with_timezone(&chrono_tz::America::New_York)
@@ -1079,8 +1153,12 @@ pub fn backstop(alpaca: &Alpaca, now: i64) -> Result<String, String> {
     if positions.is_empty() && orders.is_empty() {
         return Ok("flat".into());
     }
-    let left = require_flat(&positions, &orders).unwrap_err();
-    flatten(alpaca, 10, &mut || {
+    let (p, o) = outside_drills(keep, &positions, &orders);
+    if p.is_empty() && o.is_empty() {
+        return Ok("flat but for the drill positions".into());
+    }
+    let left = describe(&p, &o);
+    flatten_except(alpaca, keep, 10, &mut || {
         std::thread::sleep(Duration::from_secs(1))
     })
     .map(|()| format!("FLATTENED by the backstop: {left}"))
@@ -1128,6 +1206,55 @@ pub fn flatten<B: Broker>(b: &B, tries: u32, sleep: &mut dyn FnMut()) -> Result<
         };
     }
     Err(format!("not flat after {tries} checks: {left}"))
+}
+
+/// `flatten`, sparing the drill positions: cancels each order and closes each position outside them,
+/// re-reading up to `tries` times, each after a `sleep`, until nothing outside is left. Orders go
+/// first, since a stop holding the shares blocks the close. No drills is exactly `flatten`.
+pub fn flatten_except<B: Broker>(
+    b: &B,
+    keep: &[Drill],
+    tries: u32,
+    sleep: &mut dyn FnMut(),
+) -> Result<(), String> {
+    if keep.is_empty() {
+        return flatten(b, tries, sleep);
+    }
+    let mut left = String::new();
+    for i in 0..=tries {
+        let (positions, orders) = match (b.positions(), b.open_orders()) {
+            (Ok(p), Ok(o)) => (p, o),
+            (Err(e), _) | (_, Err(e)) => {
+                left = format!("unreadable: {e}");
+                if i < tries {
+                    sleep();
+                }
+                continue;
+            }
+        };
+        let (p, o) = outside_drills(keep, &positions, &orders);
+        if p.is_empty() && o.is_empty() {
+            return Ok(());
+        }
+        left = describe(&p, &o);
+        if i == tries {
+            break;
+        }
+        for x in &o {
+            if let Err(e) = b.cancel_by_client_id(&x.client_order_id) {
+                eprintln!("cancel {}: {e}", x.client_order_id);
+            }
+        }
+        for x in &p {
+            if let Err(e) = b.close_position(&x.symbol) {
+                eprintln!("close {}: {e}", x.symbol);
+            }
+        }
+        sleep();
+    }
+    Err(format!(
+        "not flat outside the drills after {tries} tries: {left}"
+    ))
 }
 
 #[cfg(test)]
@@ -2312,6 +2439,137 @@ mod tests {
         f.script("open_orders", "HTTP 500");
         f.open.borrow_mut().clear();
         assert!(flatten(&f, 2, &mut || {}).is_ok());
+    }
+
+    fn drill(symbol: &str, qty: i64) -> Drill {
+        Drill {
+            symbol: symbol.into(),
+            qty,
+        }
+    }
+
+    fn on(symbol: &str, mut o: Order) -> Order {
+        o.symbol = symbol.into();
+        o
+    }
+
+    #[test]
+    fn the_drill_file_is_missing_valid_or_an_error() {
+        let t = Tmp::new();
+        assert_eq!(drills(&t.0).unwrap(), vec![]);
+        std::fs::create_dir_all(t.0.join("data")).unwrap();
+        let write = |s: &str| std::fs::write(t.0.join("data").join("drill.json"), s).unwrap();
+        write(r#"[{"symbol":"SPY","qty":1}]"#);
+        assert_eq!(drills(&t.0).unwrap(), vec![drill("SPY", 1)]);
+        for bad in [
+            "",
+            "{",
+            r#"[{"symbol":"SPY"}]"#,
+            r#"[{"symbol":"SPY","qty":1,"why":"x"}]"#,
+            r#"[{"symbol":"SPY","qty":0}]"#,
+            r#"[{"symbol":"SPY","qty":-1}]"#,
+            r#"[{"symbol":"spy","qty":1}]"#,
+            r#"[{"symbol":"../x","qty":1}]"#,
+            r#"[{"symbol":"SPY","qty":1},{"symbol":"SPY","qty":2}]"#,
+        ] {
+            write(bad);
+            assert!(drills(&t.0).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    fn names(p: &[&Position], o: &[&Order]) -> (Vec<String>, Vec<String>) {
+        (
+            p.iter()
+                .map(|p| format!("{} {}", p.qty, p.symbol))
+                .collect(),
+            o.iter().map(|o| o.client_order_id.clone()).collect(),
+        )
+    }
+
+    #[test]
+    fn only_an_exact_drill_and_its_owner_stop_are_spared() {
+        let keep = [drill("SPY", 1)];
+        let stop = || on("SPY", ord("owner-stop", "sell", "new", 1, 0, None));
+        let positions = [pos("SPY", 1), pos("AAPL", 5)];
+        let orders = [
+            stop(),
+            on("SPY", ord("owner-buy", "buy", "new", 1, 0, None)),
+            on("SPY", ord("owner-big", "sell", "new", 2, 0, None)),
+            on("AAPL", ord("owner-aapl", "sell", "new", 5, 0, None)),
+        ];
+        let (p, o) = outside_drills(&keep, &positions, &orders);
+        assert_eq!(
+            names(&p, &o),
+            (
+                vec!["5 AAPL".into()],
+                vec!["owner-buy".into(), "owner-big".into(), "owner-aapl".into()]
+            )
+        );
+
+        // not the drill's size, or no position at all: the symbol isn't spared, so the owner's
+        // stop is cancelled too (it would hold the shares and block the close, or open a short)
+        for held in [vec![pos("SPY", 3)], vec![pos("SPY", -1)], vec![]] {
+            let stops = [stop()];
+            let (p, o) = outside_drills(&keep, &held, &stops);
+            assert_eq!((p.len(), o.len()), (held.len(), 1), "{held:?}");
+        }
+
+        // an engine order on the symbol means the position may be the engine's: nothing spared
+        let engine = [stop(), on("SPY", ord(IDX, "sell", "new", 1, 0, None))];
+        let one = [pos("SPY", 1)];
+        let (p, o) = outside_drills(&keep, &one, &engine);
+        assert_eq!(
+            names(&p, &o),
+            (vec!["1 SPY".into()], vec!["owner-stop".into(), IDX.into()])
+        );
+    }
+
+    #[test]
+    fn flatten_except_cancels_and_closes_only_outside_the_drill() {
+        let keep = [drill("SPY", 1)];
+        let f = Fake::default();
+        f.set_positions(&[("SPY", 1), ("AAPL", 5)]);
+        f.open
+            .borrow_mut()
+            .push(on("SPY", ord("owner-stop", "sell", "new", 1, 0, None)));
+        f.open
+            .borrow_mut()
+            .push(on("AAPL", ord(ID, "buy", "new", 5, 0, None)));
+        // the fake never clears, so it ends "not flat" after acting on every try
+        let err = flatten_except(&f, &keep, 2, &mut || {}).unwrap_err();
+        assert!(
+            err.contains("AAPL") && err.contains(ID) && !err.contains("owner-stop"),
+            "{err}"
+        );
+        assert_eq!(f.count("cancel bmv-"), 2);
+        assert_eq!(f.count("close AAPL"), 2);
+        assert_eq!(
+            f.count("close SPY") + f.count("close_all") + f.count("cancel owner"),
+            0
+        );
+
+        // only the drill left: nothing is touched
+        let g = Fake::default();
+        g.set_positions(&[("SPY", 1)]);
+        g.open
+            .borrow_mut()
+            .push(on("SPY", ord("owner-stop", "sell", "new", 1, 0, None)));
+        assert!(flatten_except(&g, &keep, 2, &mut || {}).is_ok());
+        assert_eq!(g.count("close") + g.count("cancel"), 0);
+
+        // unreadable on every try is an error, never success
+        let h = Fake::default();
+        for _ in 0..3 {
+            h.script("positions", "HTTP 500");
+        }
+        let err = flatten_except(&h, &keep, 2, &mut || {}).unwrap_err();
+        assert!(err.contains("unreadable"), "{err}");
+
+        // no drills is the plain flatten: close_all
+        let k = Fake::default();
+        k.set_positions(&[("SPY", 1)]);
+        assert!(flatten_except(&k, &[], 2, &mut || {}).is_ok());
+        assert_eq!(k.count("close_all"), 1);
     }
 
     #[test]

@@ -517,13 +517,22 @@ fn up(port: usize) -> Result<(), String> {
 }
 
 /// launchd runs this every 2 minutes (deploy/). Between closes it exits at once, without the
-/// network or the Keychain; near a close it flattens anything left (any mode, like `flatten`).
+/// network or the Keychain; near a close it flattens anything left but the owner's drill
+/// positions in `data/drill.json` (any mode; `flatten` itself spares nothing).
 fn backstop() -> Result<(), String> {
     let now = chrono::Utc::now().timestamp();
     if !live::maybe_near_close(now) {
         return Ok(());
     }
-    let msg = live::backstop(&connect()?, now)?;
+    // a bad drill file is reported and spares nothing
+    let keep = live::drills(&config::home()?).unwrap_or_else(|e| {
+        eprintln!(
+            "{} {e}: the backstop spares nothing",
+            chrono::Utc::now().to_rfc3339()
+        );
+        vec![]
+    });
+    let msg = live::backstop(&connect()?, now, &keep)?;
     println!("{} {msg}", chrono::Utc::now().to_rfc3339());
     Ok(())
 }
