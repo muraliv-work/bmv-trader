@@ -854,6 +854,53 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
 - **Congress trades are not in this trial** (DECISION S49). If a source proves good and affordable, they'd be a separately pre-registered trial.
 - **One run, logged once** as `swing insider-cluster`. Any changed number is a new trial.
 
+## 7k. Trial 14: AI same-day picks on the morning's movers (pre-registered 2026-11-06, before any code; DECISION R15, A14)
+
+**Question:** given the stocks moving most at the open, can a model choose same-day long trades (entry, stop, target, exit time) that beat random picks from the same list, and SPY, after costs?
+- It can't be backtested, because the model already knows how past days went. So it is tested **forward, in shadow**: calls are recorded and scored, never placed. The first session is 2026-11-16 at the earliest (R15 is in effect from 2026-11-13).
+
+**The scan, each NYSE session at 9:46 ET** (`bmv-trader intraday-pick`):
+- **Universe:** stocks whose previous close is at least $5 and whose 20-session average dollar volume is at least $20M, from trial 10's adjusted SIP daily bars (`sip-live`), excluding funds (`swing::is_fund`, §7e).
+- **Bars:** 9:30–9:45 ET IEX minute bars, 30 symbols a call, 350 ms apart.
+- **Rank:** |gap %| (9:30 open against the previous close) × the first 15 minutes' dollar volume over the 20-session average dollar volume per 15 minutes. The top **15** are the day's list; ties go by symbol.
+- If the scan can't finish by 10:15 ET (the Mac asleep, data late), the session is logged as missed. Missed sessions are never made up.
+
+**The model:** Claude Sonnet 5.5, pinned in `deploy/models.json`, through `llm.rs` (its own key, cap and ledger).
+- **Input for each candidate:** its last 20 daily bars, today's 15 minute bars, the gap, the volume ratio, and up to 5 Alpaca news headlines from the last 24 hours, marked as data and never followed as instructions.
+- **Output:** strict JSON with at most **3** picks, `{symbol, entry_limit, stop, target, exit_by}`, or none. Long only.
+- **Code checks each pick**, all of these:
+  - the symbol is on today's list, at most once
+  - stop < entry_limit < target
+  - R = entry − stop is at least max(0.15% of the entry, 5¢)
+  - the entry is within 1% of the 9:45 close
+  - exit_by is from 10:00 to 15:55 ET
+
+  A pick that fails is logged as **invalid** and counts as no trade. A reply that isn't the JSON is a failed call. Nothing is retried.
+- **Logged before spend:** a Queued line goes into `data/intraday/calls.jsonl` before the call, then the reply's SHA-256, the parsed picks and the cost (the desk.rs lifecycle).
+- **Budget:** at most $1 a day and $20 a month. A call that would pass either cap isn't made, and the session is logged as unanalysed.
+
+**Scoring, after the close** (`bmv-trader intraday-score`, 16:20 ET), on IEX minute bars from 9:46:
+- **Entry:** a buy limit fills only when a later bar trades below it (a touch is not a fill), at the limit.
+- **Exits:** as the backtester (§13): the stop wins when stop and target are in one bar, a stop gapped through fills at the bar's open, the fill bar can't hit the target, and an open trade exits at the close of the exit_by minute. `FillModel` slippage (1¢ + 2 bps on market fills) applies.
+- **Costs:** 0.05% a side on top.
+- **Unfilled:** an entry that never fills is no trade (counted, not scored).
+- **Result:** an R-multiple per filled pick.
+
+**Baselines, scored the same way:**
+1. **Random:** each session, as many picks as the model made, drawn without replacement from the same 15, for each of 5 fixed seeds. Each has entry at the 9:45 close (a market fill), stop at 1 × ATR(14, daily), target at 2R, and exit at 15:55.
+2. **SPY:** bought at the 9:46 open and sold at 15:55 each session the model made a pick, sized at 1% risk with the same stop rule as the random baseline.
+
+**The verdict, once** (`bmv-trader intraday-verdict`), at **245 filled picks** or on **2027-06-30**, whichever is first; logged once to `data/trials.jsonl` as trial 14. It passes only if all of these hold:
+- the one-sided 95% lower bound of mean R is above 0 (day-block bootstrap, as the P1 gate)
+- mean R is above the random baseline's mean over the 5 seeds
+- at 1% risk per trade, the total return is above the SPY baseline's over the same sessions
+
+A pass enables nothing by itself (A14). `intraday-report` shows counts and spend only; outcome averages stay hidden until the verdict.
+
+**Power:** one trade's R varies by about ±1.26 (§13, the R13 table), so 245 filled picks detect a true edge of 0.2R at 80% power. At up to 3 picks a session, that's about 4 months.
+
+**Runs from** a pinned binary, `/usr/local/libexec/bmv-trial14`, through `desk-ping`, with two healthchecks checks (`intraday-pick`, `intraday-score`), so later rebuilds can't change it.
+
 ## 8. Decision pipeline (one candidate)
 
 1. **Strategy** emits a `Candidate`, which is journaled.
