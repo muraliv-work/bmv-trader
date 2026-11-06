@@ -235,6 +235,31 @@ async fn evidence(Ctx(s): Desk, h: HeaderMap, Path(id): Path<i64>) -> Reply {
     Ok(Json(s.evidence(&agent, id).await?))
 }
 
+async fn peak(Ctx(s): Desk, h: HeaderMap, Path(account): Path<String>) -> Reply {
+    let agent = caller(&s, &h).await?;
+    Ok(Json(match s.peak(&agent, &account).await? {
+        Some((cents, at)) => json!({"cents": cents, "at": at}),
+        None => json!({"cents": null}),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RaisePeak {
+    cents: i64,
+}
+
+async fn raise_peak(
+    Ctx(s): Desk,
+    h: HeaderMap,
+    Path(account): Path<String>,
+    Json(b): Json<RaisePeak>,
+) -> Reply {
+    let agent = caller(&s, &h).await?;
+    Ok(Json(
+        json!({"cents": s.raise_peak(&agent, &account, b.cents).await?}),
+    ))
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Paper {
@@ -393,6 +418,7 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/v1/strategies/{id}/sign", post(sign))
         .route("/v1/strategies/{id}/halt", post(halt))
         .route("/v1/strategies/{id}/limits", get(limits).post(limit))
+        .route("/v1/peaks/{account}", get(peak).post(raise_peak))
         .route("/v1/budget", get(budget))
         .route("/v1/budget/charge", post(charge))
         .route("/v1/budgets", get(budgets))

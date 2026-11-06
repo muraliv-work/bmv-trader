@@ -82,6 +82,8 @@ Allowed abbreviations:
 | **Environment variable** | `BMV_<NOUN>`; a third party's own prefix is left alone | `BMV_HOME`, `BMV_NEW_KEY`; `PAPERCLIP_RUN_ID` |
 | **Desk agent id** | `<role abbreviation>-<n>`; a program's own login is `<program>-<n>` | `hod-1`, `res-1`, `val-1`, `stress-1`; `engine-1`, `console-1` |
 | **Console route** | pages `/<page>` and their script `/<page>.js`; data `/api/<area>` or `/api/<area>/<noun>`, kebab segments | `/desk`, `/desk.js`, `/api/keys`, `/api/desk/snapshot` |
+| **Desk API route** | `/v1/<plural noun>`, then `/{key}` and a sub-noun or verb, kebab segments | `/v1/strategies/{id}/evidence`, `/v1/peaks/{account}` |
+| **Desk table** | plural snake_case noun, append-only unless it holds current state | `equity_peaks`, `halts`, `risk_limits` |
 | **Paperclip agent name** | `<Role Name> (<id>)` | `Validator (val-1)` |
 | **OmniRoute route** | `bmv-<tier>` | `bmv-free` |
 | **OmniRoute connection** | `<provider>-<tier>` | `openrouter-free` |

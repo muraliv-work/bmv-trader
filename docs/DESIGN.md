@@ -460,7 +460,8 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - A run refuses to start if its watchlist goes beyond the list, or if the list is missing, empty or malformed.
   - `risk::Allowed` defaults to allowing nothing. Only research backtests pass `Allowed::Any`.
 - **Drawdown auto-halt (owner, 2026-11-04):** 10% below the equity high-water mark on paper, 5% live.
-  - The peak lives in `data/equity_peak.json` and moves up at each session start.
+  - The peak lives in the desk database (R13 step 3d), table `equity_peaks`: append-only, and a trigger refuses any row that isn't higher, so nothing can lower or reset it. Only the `engine` role raises it (`RecordPeak`), through `POST /v1/peaks/{account}`; `engine`, `risk_manager`, the owner and the console read it.
+  - Every paper session reads it as `engine-1` and raises it at start, whether the desk link is on or off. A session refuses to start if the desk is down or has no peak. The owner seeds it once with `bmv-trader peak-seed`. `data/equity_peak.json` is no longer read.
   - A breach engages the kill switch with the reason, and nothing trades until the owner clears it.
   - Intraday losses stay capped by the daily-loss halt.
 - **Desk link, `src/desk_link.rs`:** off until step 5 (owner, 2026-11-04).
@@ -468,7 +469,7 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
   - It trades only while the desk has that strategy in `paper_trading` (or live, on a live account).
   - Each desk limit only tightens the engine's own (`Limits::tightened`). A limit the engine can't enforce yet, such as `max_correlated_exposure_pct`, refuses the run.
   - A drawdown halt, or a run that stops on an error, is reported to the desk as an operational halt.
-- **Still open:** anything that can delete `data/equity_peak.json` resets the peak. Agents can't, being sandboxed with no shell. Moving the peak into the desk database in step 6 would close this.
+- **Closed (R13 step 3d):** deleting `data/equity_peak.json` used to reset the peak. The peak now lives in the desk database, owned by the `bmvdesk` user at mode 600, and only rises.
 
 ### Build order (the spec's §12; the owner's go-ahead after each step)
 1. The `store`, `audit`, `lifecycle` and `permissions` crates, with the spec's §11 tests.

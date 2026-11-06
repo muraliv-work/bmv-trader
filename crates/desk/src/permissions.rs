@@ -108,6 +108,10 @@ pub enum Action {
     ReadBudgets,
     /// Walking the audit hash chain (S47).
     VerifyAudit,
+    /// Raising an account's drawdown peak (R13 step 3d): code only, like evidence.
+    RecordPeak,
+    /// Reading it.
+    ReadPeak,
 }
 
 /// The policy table.
@@ -144,6 +148,8 @@ pub fn allowed(role: Role, action: Action) -> bool {
             Validator | StressLead | HeadOfDesk | Board | Engine | Console
         ),
         ReadBudgets | VerifyAudit => matches!(role, Board | Console),
+        RecordPeak => matches!(role, Engine),
+        ReadPeak => matches!(role, Engine | RiskManager | Board | Console),
     }
 }
 

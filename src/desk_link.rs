@@ -131,6 +131,91 @@ impl Link {
     }
 }
 
+/// The drawdown peak in the desk database (R13 step 3d), as the engine's own desk identity:
+/// Keychain `bmv-desk` / `engine-1`, role `engine`, the only role that may raise it. Used by every
+/// session whether the link is on or off, since a peak that could be reset protects nothing.
+pub struct Peaks {
+    addr: String,
+    token: String,
+    account: &'static str,
+    http: reqwest::blocking::Client,
+}
+
+impl Peaks {
+    /// The peak for this account: `paper` or `live`, by mode.
+    pub fn connect(mode: Mode) -> Result<Peaks, String> {
+        // parsed, not prefix-matched: "127.0.0.1:80@host" would send the token to host
+        let addr =
+            loopback(&std::env::var("DESK_ADDR").unwrap_or_else(|_| "127.0.0.1:8790".into()))?
+                .to_string();
+        let token = crate::config::keychain_in("bmv-desk", "engine-1")?.ok_or(
+            "no engine token in the Keychain (bmv-desk / engine-1); see deploy/README.md, Quant Desk evidence",
+        )?;
+        let http = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| e.to_string())?;
+        let account = match mode {
+            Mode::Paper => "paper",
+            Mode::Live => "live",
+        };
+        Ok(Peaks {
+            addr,
+            token,
+            account,
+            http,
+        })
+    }
+
+    fn call(&self, req: reqwest::blocking::RequestBuilder) -> Result<Value, String> {
+        let resp = req
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| format!("the desk: {}", e.without_url()))?;
+        let status = resp.status();
+        let v: Value = resp
+            .json()
+            .map_err(|e| format!("the desk's reply ({status}): {}", e.without_url()))?;
+        if !status.is_success() {
+            return Err(format!(
+                "the desk refused ({status}): {}",
+                v["error"].as_str().unwrap_or("no reason given")
+            ));
+        }
+        Ok(v)
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/v1/peaks/{}", self.addr, self.account)
+    }
+}
+
+impl crate::live::PeakStore for Peaks {
+    fn peak(&self) -> Result<Option<i64>, String> {
+        let v = self.call(self.http.get(self.url()))?;
+        peak_cents(&v)
+    }
+
+    fn raise(&self, cents: i64) -> Result<i64, String> {
+        let v = self.call(self.http.post(self.url()).json(&json!({"cents": cents})))?;
+        peak_cents(&v)?.ok_or_else(|| "the desk returned no peak".into())
+    }
+}
+
+/// `{"cents": n}` or `{"cents": null}`; anything else is an error, never a missing peak.
+fn peak_cents(v: &Value) -> Result<Option<i64>, String> {
+    match &v["cents"] {
+        Value::Null if v.get("cents").is_some() => Ok(None),
+        c => c
+            .as_i64()
+            .filter(|n| *n > 0)
+            .map(Some)
+            .ok_or_else(|| format!("the desk's peak isn't a positive whole number: {v}")),
+    }
+}
+
 /// The console's read-only desk login (S47): Keychain `bmv-desk` / `console-1`, role `console`,
 /// which the desk refuses every write.
 pub struct Reader {
@@ -414,6 +499,23 @@ mod tests {
             "127.0.0.1",
         ] {
             assert!(loopback(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_peak_reply_is_a_positive_number_or_an_explicit_none() {
+        assert_eq!(
+            peak_cents(&json!({"cents": 2_500_000})),
+            Ok(Some(2_500_000))
+        );
+        assert_eq!(peak_cents(&json!({"cents": null, "at": null})), Ok(None));
+        for bad in [
+            json!({}),
+            json!({"cents": 0}),
+            json!({"cents": -5}),
+            json!({"cents": "1"}),
+        ] {
+            assert!(peak_cents(&bad).is_err(), "{bad}");
         }
     }
 }

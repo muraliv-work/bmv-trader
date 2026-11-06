@@ -1116,42 +1116,40 @@ pub fn check_watchlist(watch: &[String], allowed: &BTreeSet<String>) -> Result<(
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Peak {
-    cents: i64,
-    at: String,
+/// Where the account's drawdown peak lives: the desk database (R13 step 3d,
+/// `desk_link::Peaks`), where it is append-only and only rises. Tests use a fake.
+pub trait PeakStore {
+    /// The peak in cents, or None if the desk has never had one.
+    fn peak(&self) -> Result<Option<i64>, String>;
+    /// Records `cents` if it beats the peak; returns the peak after.
+    fn raise(&self, cents: i64) -> Result<i64, String>;
 }
 
-/// The drawdown auto-halt (owner, 2026-11-04): the account's high-water mark lives in
-/// data/equity_peak.json and moves up at each session start. Equity more than the mode's limit
-/// below it engages the kill switch, so nothing trades until the owner clears it.
-pub fn check_drawdown(home: &Path, equity: Usd, limits: &Limits) -> Result<(), String> {
-    let path = home.join("data").join("equity_peak.json");
-    let peak = match std::fs::read_to_string(&path) {
-        Ok(t) => {
-            serde_json::from_str::<Peak>(&t)
-                .map_err(|e| {
-                    format!(
-                        "{}: {e} (fix or delete it to restart the peak)",
-                        path.display()
-                    )
-                })?
-                .cents
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
+/// The drawdown auto-halt (owner, 2026-11-04): the account's high-water mark lives in the desk
+/// and moves up at each session start. Equity more than the mode's limit below it engages the
+/// kill switch, so nothing trades until the owner clears it. No peak, or no desk, refuses the
+/// session: a peak that could be reset protects nothing.
+pub fn check_drawdown(
+    home: &Path,
+    peaks: &dyn PeakStore,
+    equity: Usd,
+    limits: &Limits,
+) -> Result<(), String> {
+    let peak = peaks
+        .peak()
+        .map_err(|e| format!("the drawdown peak: {e}"))?
+        .ok_or("the desk has no drawdown peak: seed it once with `bmv-trader peak-seed`")?;
     if equity.cents() > peak {
-        let tmp = path.with_extension("json.tmp");
-        let body = serde_json::to_string(&Peak {
-            cents: equity.cents(),
-            at: chrono::Utc::now().to_rfc3339(),
-        })
-        .map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(home.join("data"))
-            .and_then(|_| std::fs::write(&tmp, body))
-            .and_then(|_| std::fs::rename(&tmp, &path))
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let now = peaks
+            .raise(equity.cents())
+            .map_err(|e| format!("the drawdown peak: {e}"))?;
+        // a raise that didn't land would leave the session checking against a stale peak
+        if now < equity.cents() {
+            return Err(format!(
+                "the desk kept the drawdown peak at {} below equity {equity}",
+                Usd::from_cents(now)
+            ));
+        }
         return Ok(());
     }
     // integer cents: equity × 100 below peak × (100 − limit)
@@ -1196,6 +1194,7 @@ pub fn startup(
     settings: Settings,
     watchlist: Vec<String>,
     desk: Option<&crate::desk_link::Link>,
+    peaks: &dyn PeakStore,
 ) -> Result<Runner<Alpaca>, String> {
     refuse_live(mode)?;
     let limits = Limits::for_mode(Mode::Paper);
@@ -1209,7 +1208,7 @@ pub fn startup(
         None => limits,
     };
     check_day_pnl(&account, &limits)?;
-    check_drawdown(home, account.equity, &limits)?;
+    check_drawdown(home, peaks, account.equity, &limits)?;
     let clock: Clock = alpaca.get(Api::Trading, "/v2/clock")?;
     check_skew(&clock.timestamp, chrono::Utc::now().timestamp_millis())?;
     let today = chrono::Utc::now()
@@ -1532,6 +1531,23 @@ mod tests {
             symbol: symbol.into(),
             qty,
             avg_entry_price: p(10_000),
+        }
+    }
+
+    /// The desk's peak in memory; `.1` makes every call fail, as a desk that's down.
+    struct Peaks(RefCell<Option<i64>>, bool);
+
+    impl PeakStore for Peaks {
+        fn peak(&self) -> Result<Option<i64>, String> {
+            if self.1 {
+                return Err("desk down".into());
+            }
+            Ok(*self.0.borrow())
+        }
+        fn raise(&self, cents: i64) -> Result<i64, String> {
+            let mut p = self.0.borrow_mut();
+            *p = Some(p.unwrap_or(0).max(cents));
+            Ok(p.unwrap())
         }
     }
 
@@ -2309,14 +2325,31 @@ mod tests {
 
         let paper = Limits::for_mode(Mode::Paper);
         let usd = |d: i64| Usd::from_cents(d * 100);
-        check_drawdown(home, usd(25_000), &paper).unwrap();
-        check_drawdown(home, usd(26_000), &paper).unwrap(); // a new peak
-        check_drawdown(home, usd(23_500), &paper).unwrap(); // 9.6% down: inside 10%
+        // no peak in the desk refuses the session, and so does a desk that can't be read
+        let none = Peaks(RefCell::new(None), false);
+        let e = check_drawdown(home, &none, usd(25_000), &paper).unwrap_err();
+        assert!(e.contains("peak-seed"), "{e}");
+        let e = check_drawdown(home, &Peaks(RefCell::new(None), true), usd(1), &paper).unwrap_err();
+        assert!(e.contains("desk down"), "{e}");
+        let peaks = Peaks(RefCell::new(Some(2_500_000)), false);
+        check_drawdown(home, &peaks, usd(25_000), &paper).unwrap();
+        check_drawdown(home, &peaks, usd(26_000), &paper).unwrap(); // a new peak
+        assert_eq!(*peaks.0.borrow(), Some(2_600_000));
+        check_drawdown(home, &peaks, usd(23_500), &paper).unwrap(); // 9.6% down: inside 10%
+        assert_eq!(*peaks.0.borrow(), Some(2_600_000), "a fall never lowers it");
+        // the old file is ignored: deleting or faking it changes nothing
+        std::fs::create_dir_all(home.join("data")).unwrap();
+        std::fs::write(
+            home.join("data/equity_peak.json"),
+            r#"{"cents":1,"at":"x"}"#,
+        )
+        .unwrap();
+        check_drawdown(home, &peaks, usd(23_500), &paper).unwrap();
         assert_eq!(
             safety::kill_switch(&safety::stop_path(home)),
             KillSwitch::Clear
         );
-        let e = check_drawdown(home, usd(23_300), &paper).unwrap_err(); // 10.4% down
+        let e = check_drawdown(home, &peaks, usd(23_300), &paper).unwrap_err(); // 10.4% down
         assert!(e.contains("drawdown halt"), "{e}");
         assert!(matches!(
             safety::kill_switch(&safety::stop_path(home)),
@@ -2325,8 +2358,9 @@ mod tests {
         // live is tighter: 5%
         let live = Limits::for_mode(Mode::Live);
         let t2 = Tmp::new();
-        check_drawdown(&t2.0, usd(1_000), &live).unwrap();
-        assert!(check_drawdown(&t2.0, usd(940), &live).is_err());
+        let peaks = Peaks(RefCell::new(Some(100_000)), false);
+        check_drawdown(&t2.0, &peaks, usd(1_000), &live).unwrap();
+        assert!(check_drawdown(&t2.0, &peaks, usd(940), &live).is_err());
     }
 
     #[test]

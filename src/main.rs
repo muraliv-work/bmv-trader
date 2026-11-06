@@ -17,6 +17,7 @@ const USAGE: &str = "usage:
   bmv-trader backstop                     for launchd: near the close, flatten anything left (deploy/)
   bmv-trader desk-reconcile               for launchd: check the account holds only the drills and their stops; a mismatch halts (STOP, entries cancelled) and exits 1
   bmv-trader desk-ping <check> <program> [args...]   for launchd: run the program, then ping its healthchecks check
+  bmv-trader peak-seed                    ONCE: record today's equity as the desk's first drawdown peak
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
   bmv-trader universe                     list every US stock, active and delisted (for the scan)
   bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD [--adjusted | --raw-sip]   daily bars for the universe
@@ -209,6 +210,7 @@ fn main() {
             Some("flatten") => flatten(),
             Some("backstop") => backstop(),
             Some("desk-reconcile") => desk_reconcile(),
+            Some("peak-seed") => peak_seed(),
             Some("run") => run(&args.symbols()?, args.has("--trend"), orb_params(&args)),
             Some("fetch") => {
                 let (from, to) = args.dates()?;
@@ -610,6 +612,36 @@ fn desk_reconcile() -> Result<(), String> {
         Err(e) => format!("; desk link: {e}"),
     };
     Err(format!("{stamp} {reason}\n{stamp} {halt}{desk}"))
+}
+
+/// Once, by the owner (R13 step 3d): the desk's first drawdown peak, today's equity. Every paper
+/// session refuses to start until it exists; after this only a session raises it.
+fn peak_seed() -> Result<(), String> {
+    use bmv_trader::live::PeakStore;
+    let a = connect()?;
+    let peaks = bmv_trader::desk_link::Peaks::connect(config::load()?.mode())?;
+    if let Some(p) = peaks.peak()? {
+        return Err(format!(
+            "the desk already has a drawdown peak, {}; only a session raises it",
+            bmv_trader::money::Usd::from_cents(p)
+        ));
+    }
+    // the old file's peak, if there is one, so seeding in a drawdown doesn't lower the mark
+    let path = config::home()?.join("data/equity_peak.json");
+    let old = match std::fs::read_to_string(&path) {
+        Ok(t) => serde_json::from_str::<serde_json::Value>(&t)
+            .ok()
+            .and_then(|v| v["cents"].as_i64())
+            .ok_or_else(|| format!("{}: unreadable; fix or remove it first", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let set = peaks.raise(a.account()?.equity.cents().max(old))?;
+    println!(
+        "drawdown peak seeded: {}",
+        bmv_trader::money::Usd::from_cents(set)
+    );
+    Ok(())
 }
 
 /// The emergency exit, allowed in both modes.
@@ -3506,6 +3538,7 @@ fn run(symbols: &[String], trend: bool, orb: OrbParams) -> Result<(), String> {
         trend_filter: trend,
     };
     let desk = bmv_trader::desk_link::Link::from_env()?;
+    let peaks = bmv_trader::desk_link::Peaks::connect(mode)?;
     // a halt the desk should know about: the drawdown halt at startup, or a run that stopped
     let report = |why: &str| {
         if let Some(d) = &desk
@@ -3521,6 +3554,7 @@ fn run(symbols: &[String], trend: bool, orb: OrbParams) -> Result<(), String> {
         settings,
         symbols.to_vec(),
         desk.as_ref(),
+        &peaks,
     )
     .inspect_err(|e| {
         if e.starts_with("drawdown halt") {

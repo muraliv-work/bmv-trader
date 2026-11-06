@@ -20,7 +20,8 @@ use sqlx::{Sqlite, Transaction};
 use std::str::FromStr;
 
 /// Tables whose rows are history: never updated, never deleted.
-const APPEND_ONLY: [&str; 11] = [
+const APPEND_ONLY: [&str; 12] = [
+    "equity_peaks",
     "evidence",
     "signatures",
     "owner_key",
@@ -83,6 +84,12 @@ CREATE TABLE IF NOT EXISTS signatures (
   strategy_id INTEGER NOT NULL REFERENCES strategies(id), version INTEGER NOT NULL, to_state TEXT NOT NULL,
   agent_id TEXT NOT NULL REFERENCES agents(id), at TEXT NOT NULL,
   UNIQUE (strategy_id, version, to_state, agent_id));
+CREATE TABLE IF NOT EXISTS equity_peaks (
+  id INTEGER PRIMARY KEY, account TEXT NOT NULL CHECK (account IN ('paper', 'live')),
+  cents INTEGER NOT NULL CHECK (cents > 0), agent_id TEXT NOT NULL REFERENCES agents(id), at TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS equity_peaks_rise BEFORE INSERT ON equity_peaks
+  WHEN NEW.cents <= (SELECT COALESCE(MAX(cents), 0) FROM equity_peaks WHERE account = NEW.account)
+  BEGIN SELECT RAISE(ABORT, 'equity_peaks only rises'); END;
 CREATE TABLE IF NOT EXISTS audit_log (
   seq INTEGER PRIMARY KEY, at TEXT NOT NULL, agent_id TEXT NOT NULL, action TEXT NOT NULL,
   detail TEXT NOT NULL, prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
@@ -850,6 +857,57 @@ impl Store {
         Ok(reproduces)
     }
 
+    /// An account's drawdown peak in cents and when it was set (R13 step 3d), or None before the
+    /// first. `account` is "paper" or "live".
+    pub async fn peak(&self, agent_id: &str, account: &str) -> Result<Option<(i64, String)>> {
+        self.authorize(agent_id, Action::ReadPeak).await?;
+        peak_account(account)?;
+        Ok(sqlx::query_as(
+            "SELECT cents, at FROM equity_peaks WHERE account = ? ORDER BY cents DESC LIMIT 1",
+        )
+        .bind(account)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Records `cents` as the account's peak if it beats the current one, and returns the peak
+    /// after. The table only rises (a trigger refuses anything else) and is append-only, so no
+    /// call can lower or reset it. The engine only, from code.
+    pub async fn raise_peak(&self, agent_id: &str, account: &str, cents: i64) -> Result<i64> {
+        self.authorize(agent_id, Action::RecordPeak).await?;
+        peak_account(account)?;
+        if cents <= 0 {
+            return Err(DeskError::Denied(format!(
+                "peak {cents} cents isn't positive"
+            )));
+        }
+        let mut tx = self.pool.begin().await?;
+        let (best,): (i64,) =
+            sqlx::query_as("SELECT COALESCE(MAX(cents), 0) FROM equity_peaks WHERE account = ?")
+                .bind(account)
+                .fetch_one(&mut *tx)
+                .await?;
+        if cents <= best {
+            return Ok(best);
+        }
+        sqlx::query("INSERT INTO equity_peaks (account, cents, agent_id, at) VALUES (?, ?, ?, ?)")
+            .bind(account)
+            .bind(cents)
+            .bind(agent_id)
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
+        append(
+            &mut tx,
+            agent_id,
+            "raise_peak",
+            json!({"account": account, "cents": cents, "was": best}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(cents)
+    }
+
     /// What a signer needs for a strategy: its state, version and criteria, the latest evidence
     /// for the current version, each criterion checked against it in code, and the signatures
     /// already on the next step. Only roles with `ReadEvidence`.
@@ -1483,6 +1541,13 @@ async fn official_run(
     .fetch_one(&mut **tx)
     .await?;
     Ok(n > 0 && mismatched == 0)
+}
+
+fn peak_account(account: &str) -> Result<()> {
+    match account {
+        "paper" | "live" => Ok(()),
+        _ => Err(DeskError::NotFound(format!("account {account:?}"))),
+    }
 }
 
 /// Appends one audit entry, chained to the last, inside the caller's transaction.
@@ -2239,5 +2304,71 @@ mod tests {
             s.verify_audit().await,
             Err(DeskError::Tampered(3))
         ));
+    }
+
+    #[tokio::test]
+    async fn the_peak_only_rises_and_only_the_engine_raises_it() {
+        let s = desk().await;
+        s.add_agent("board", "engine-1", Role::Engine, Some(proof()))
+            .await
+            .unwrap();
+        assert_eq!(s.peak("engine-1", "paper").await.unwrap(), None);
+        assert_eq!(
+            s.raise_peak("engine-1", "paper", 2_500_000).await.unwrap(),
+            2_500_000
+        );
+        // lower or equal keeps the peak, writes nothing
+        assert_eq!(
+            s.raise_peak("engine-1", "paper", 2_400_000).await.unwrap(),
+            2_500_000
+        );
+        assert_eq!(
+            s.raise_peak("engine-1", "paper", 2_500_000).await.unwrap(),
+            2_500_000
+        );
+        assert_eq!(
+            s.raise_peak("engine-1", "paper", 2_600_000).await.unwrap(),
+            2_600_000
+        );
+        let (cents, _) = s.peak("risk-1", "paper").await.unwrap().unwrap();
+        assert_eq!(cents, 2_600_000);
+        // accounts are kept apart
+        assert_eq!(s.peak("engine-1", "live").await.unwrap(), None);
+        assert!(matches!(
+            s.peak("engine-1", "margin").await,
+            Err(DeskError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.raise_peak("engine-1", "paper", 0).await,
+            Err(DeskError::Denied(_))
+        ));
+        // no agent but the engine raises it, and readers are limited
+        for who in ["ops-1", "risk-1", "board", "dev-1"] {
+            assert!(
+                matches!(
+                    s.raise_peak(who, "paper", 9_000_000).await,
+                    Err(DeskError::Denied(_))
+                ),
+                "{who}"
+            );
+        }
+        assert!(matches!(
+            s.peak("dev-1", "paper").await,
+            Err(DeskError::Denied(_))
+        ));
+        // even raw SQL can't lower, change or delete it
+        for sql in [
+            "INSERT INTO equity_peaks (account, cents, agent_id, at) VALUES ('paper', 100, 'engine-1', 'x')",
+            "UPDATE equity_peaks SET cents = 1",
+            "DELETE FROM equity_peaks",
+        ] {
+            assert!(sqlx::raw_sql(sql).execute(&s.pool).await.is_err(), "{sql}");
+        }
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM equity_peaks")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        assert!(s.verify_audit().await.is_ok());
     }
 }

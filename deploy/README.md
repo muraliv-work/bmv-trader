@@ -243,3 +243,23 @@ security add-generic-password -s bmv-desk -a engine-1 -w
 
 Post a trial's stress result to a strategy with `target/release/bmv-trader desk-evidence --strategy N --trial T`. The trial needs a recent `bmv-trader stress-battery` run, which records the deflated Sharpe.
 
+### The drawdown peak in the desk (R13 step 3d)
+
+Every paper session reads the drawdown peak from the desk as `engine-1` and raises it at start, so the
+desk must be up and must have a peak; deleting `data/equity_peak.json` changes nothing. Once, after the
+desk binary with the `equity_peaks` table is installed:
+
+```sh
+CARGO_TARGET_DIR=target/desk cargo build --release -p desk   # as you
+scripts/build-desk-sign.sh target/desk/release               # as you
+sudo scripts/desk-setup.sh target/desk/release               # installs the binaries, restarts com.bmv.desk
+cargo build --release
+target/release/bmv-trader peak-seed                          # today's paper equity becomes the first peak
+```
+
+`peak-seed` refuses if the desk already has a peak. It seeds the higher of today's equity and the old
+`data/equity_peak.json`, if that exists. After that only a session raises it, and no request or
+agent can lower it. There is no reset: a wrong seed, or a withdrawal that leaves equity for good
+below the peak, keeps every session halted until a reset path is built (an owner-signed one is
+the follow-up).
+
