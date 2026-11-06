@@ -45,12 +45,15 @@ Owner's decision S44 (2026-11-05). `tests/naming.rs` checks the parts that can b
 | `call`, `put` | which right a contract gives, the enum `Right::{Call, Put}` | long/short; a model or HTTP request is a `request` in contract code |
 | `expiry` | the date a contract ends | expiration, maturity |
 | `strike` | the price a contract's right is at | strike_price |
+| `insider` | a company's Section 16 reporting owner (officer, director, 10% holder) who files Form 4 | the desk's own agents or staff |
+| `filing` | one document filed with the SEC, dated by its filing date | report, which is the owner's 30 November report |
 
 Allowed abbreviations:
 - `hod` (Head of Desk), `res` (Researcher), `val` (Validator), `stress` (Stress Lead)
 - `llm` (the engine's model module)
 - `mcp`, `api`, `ui` (the standard meanings)
 - `occ` (the Options Clearing Corporation's contract symbol, `OccSymbol`)
+- `sec` (the US Securities and Exchange Commission; `data/sec_contact`)
 
 ## By kind
 
@@ -70,7 +73,7 @@ Allowed abbreviations:
 | **macOS user** | `bmv<component>` or `bmv<agent>`, no separator, at most 12 characters | `bmvdesk`, `bmvclip`, `bmvval`, `bmvhod` |
 | **Installed paths** | binaries `/usr/local/libexec/bmv-<component>`, config `/usr/local/etc/bmv-<component>`, state `/usr/local/var/bmv-<component>`, logs `/usr/local/var/log/bmv-<component>`; an agent user's own folder `/usr/local/var/<user>` | `/usr/local/var/bmv-clip`, `/usr/local/var/bmvval` |
 | **Repo config** | `deploy/<noun>.json`, snake_case fields | `deploy/models.json`, `deploy/agents.json` |
-| **Data files** | `data/<area>[_<noun>].<ext>`, snake_case; a folder per area once it has more than one file | `data/tier2_spend.jsonl`, `data/desk/analyses.jsonl` |
+| **Data files** | `data/<area>[_<noun>].<ext>`, snake_case; a folder per area once it has more than one file; downloaded originals keep their source's file names | `data/tier2_spend.jsonl`, `data/desk/analyses.jsonl`, `data/insider/2024q1_form345.zip` |
 | **Data file kinds** | `.jsonl` append-only log; `.json` current state; `.log` a job's output; `.lock` a lock | `free_keys.jsonl`, `keys.json`, `keys.log`, `free_keys.lock` |
 | **Keychain service** | `bmv-trader` for the engine and owner; `bmv-desk-models` for the desk agents' model keys; `bmv-desk` for desk tokens the owner's own programs hold | |
 | **Keychain account** | under `bmv-trader`: UPPER_SNAKE, the name it would have as an environment variable (`<PROVIDER>_<PURPOSE>_KEY`); under `bmv-desk-models`: `<provider>-<scope>` kebab; under `bmv-desk`: the desk agent id | `OPENROUTER_MANAGEMENT_KEY`; `anthropic-desk`; `engine-1`, `console-1` |

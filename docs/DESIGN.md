@@ -792,6 +792,60 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
   - Adjusted prices carry later splits, which changes scale only.
   - This uses up the untouched year.
 
+## 7j. Trial 13: insider cluster buys (pre-registered 2026-11-05, before any SEC data or code)
+
+**Question:** do stocks rise after several company insiders buy them on the open market with their own money? Insiders file SEC Form 4 within 2 business days. Studies have found a drift after cluster buys for decades. This trial tests it on our data, with our fills and costs. No AI is used: the filings are structured data, so code reads them (DECISION S49).
+
+- **Data:**
+  - The SEC's Insider Transactions Data Sets: one ZIP per quarter, flattened from the XML of Forms 3, 4 and 5, cached in `data/insider/`.
+  - Trial 7's adjusted SIP daily bars and universe (§13c), delisted names included.
+- **Event (a qualifying purchase):**
+  - A Form 4 (amendments, 4/A, are ignored) non-derivative transaction with code `P` (open-market or private purchase), acquired, more than 0 shares and a price above $0.
+  - Its dollars are shares × price.
+  - Its **day is the filing date,** never the trade date, so nothing is used before it was public.
+  - Its ticker is the issuer's trading symbol as filed, trimmed and upper-cased. A purchase whose ticker isn't in the universe is dropped, counted and reported per quarter.
+  - The owner is the filing's first reporting owner. A joint filing counts once.
+- **Signal at session s:**
+  - Within the 10 sessions ending at s (s included), the ticker has qualifying purchases from **2 or more distinct owners totalling $100,000 or more**.
+  - It fires only on a session where this holds and didn't hold the session before, so one cluster gives one signal.
+  - **Filters (trial 9's, §7e):**
+    - the §7d liquidity universe
+    - at least 250 bars of history
+    - ATR(14) at the close of s at least 1.5% of that close
+    - the stocks-only name filter
+- **Entry:** long at the open of s+1.
+  - Skipped if that open is more than 0.5% above close(s).
+  - Skipped if the ticker is already held.
+  - At most 5 positions open. When more fire on a day, they're ranked by the cluster's dollars, largest first, then by symbol.
+- **Exits:**
+  - **Stop:** entry − 2 × ATR(s), which is 1R.
+  - **No target.**
+  - **Time:** the open of the 21st session, counting the entry session as the 1st, so at most 20 sessions held.
+  - A gap through the stop fills at the open. A delisted position exits at its last close.
+- **Costs, baseline, benchmark and statistics:** §7d's.
+  - Costs: 0.2% a side, in R.
+  - Baseline: random entries from the same filtered pool on the same days, with the same exits, over 5 seeds.
+  - Benchmark: SPY at 1% risk per trade.
+  - Day-block bootstrap, and 63-session walk-forward windows.
+- **Research period:** entries from 2017-01-03. Every trade exits by 2025-10-01.
+- **Gate:** the §13 P1 gate, with the Bonferroni count taken from `data/trials.jsonl` at run time. It requires:
+  - the expectancy's lower bound above 0 and above the baseline
+  - at least 60% of windows profitable
+  - a profit factor above 1.2
+  - a max drawdown under 10R
+  - at least 100 trades
+  - plus CAGR and Sharpe above SPY
+- **If it passes:**
+  - the stress battery and `desk_evidence`
+  - then the holdout, 2025-10-02 → 2026-10-30, run once: at least 30 trades with positive expectancy
+  - The holdout was trial 12's untouched year, but no insider rule has looked at it.
+- **Known limits:**
+  - The quarterly data sets come out about a quarter late, so a live version would read EDGAR's daily filings instead. That's a separate build.
+  - A reused ticker can attach a filing to the wrong company.
+  - Insiders' own purchase prices aren't our fills.
+- **Congress trades are not in this trial** (DECISION S49). If a source proves good and affordable, they'd be a separately pre-registered trial.
+- **One run, logged once** as `swing insider-cluster`. Any changed number is a new trial.
+
 ## 8. Decision pipeline (one candidate)
 
 1. **Strategy** emits a `Candidate`, which is journaled.
