@@ -40,11 +40,17 @@ Owner's decision S44 (2026-11-05). `tests/naming.rs` checks the parts that can b
 | `job` | a scheduled launchd task | cron, task |
 | `notes` | Tier-2 text for the owner (briefs, digests) | reports |
 | `console` | the local web page `bmv-trader ui` serves (Overview, Desk, Services, Help) | dashboard, admin; Anthropic's site is always "Anthropic Console" |
+| `contract` | one listed option (S48), named by its OCC symbol; quantities are whole contracts | option contract, option (Rust's `Option` is taken) |
+| `premium` | a contract's price; premium × 100 × contracts is the dollars paid and the most a bought contract can lose | price, which stays the stock's price |
+| `call`, `put` | which right a contract gives, the enum `Right::{Call, Put}` | long/short; a model or HTTP request is a `request` in contract code |
+| `expiry` | the date a contract ends | expiration, maturity |
+| `strike` | the price a contract's right is at | strike_price |
 
 Allowed abbreviations:
 - `hod` (Head of Desk), `res` (Researcher), `val` (Validator), `stress` (Stress Lead)
 - `llm` (the engine's model module)
 - `mcp`, `api`, `ui` (the standard meanings)
+- `occ` (the Options Clearing Corporation's contract symbol, `OccSymbol`)
 
 ## By kind
 

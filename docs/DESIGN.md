@@ -481,6 +481,17 @@ IDEA → HYPOTHESIS_APPROVED (Strategist) → SPEC_FROZEN (Product Owner; criter
 
 The 30 November feedback report draws on whatever exists by then: trial 12, the stress battery, deflated Sharpe, the cost check.
 
+### Options (S48, planned; built after step 6)
+Buy-only long calls and puts on Alpaca paper. Alpaca takes contract orders on the same Orders API (whole contracts, `day` or `gtc`, no extended hours, no bracket orders), reports them in the same Positions API, and reports expiry, exercise and assignment as non-trade activities, which on paper appear the next day. The engine is built for a long stock bracket today, so each phase below has the owner's go-ahead.
+1. **Types** (`src/contract.rs`): an `OccSymbol` parser (underlying, expiry, call or put, strike) with its own validator. The stock validators (`broker::valid_symbol`, `history::valid_symbol`, `Candidate::long`) stay stock-only. The ×100 multiplier lives in one function, `premium_usd(price, contracts)`, which every caller uses; a test pins it, since a missed multiplier under-sizes risk 100-fold.
+2. **Risk** (`src/risk.rs`): a contract gate where risk is the full premium, never entry minus stop. Premium within `max_risk_per_trade`, open premium within a new `max_open_premium_usd` (which `Limits::tightened` accepts, so the desk can only lower it), and the shared position limit and daily loss halt. `cluster_of` keys on the underlying.
+3. **Data:** contract lookup (`/v2/options/contracts`) filtered to 21 to 60 days from expiry, near the money, open interest and spread; option bars and quotes, cached like stock history.
+4. **Backtest:** a contract fill model (buy at the ask, sell at the bid, from indicative data plus a spread estimate, and a per-contract fee) and a forced exit 7 days before expiry. The stress battery and `desk_evidence` work on R-multiples and are reused as they are.
+5. **Orders and positions** (`src/broker.rs`, `src/live.rs`): buy-to-open and sell-to-close limit bodies, with exits managed by the engine on daily bars. Positions are parsed with their asset class and OCC symbol, and `reconcile` handles contracts. The daily flatten at the close stays stock-only. Non-trade activities are polled each morning, and any assignment halts trading.
+6. **Desk:** an `asset_class` on strategies (`us_equity` or `us_option`); the approval text shows the contract, its expiry and the most it can lose.
+7. **News label** (`src/news_label.rs`): Claude reads a day's headlines for one ticker as data and replies exactly `good`, `bad` or `none`; anything else counts as `none` and is logged. Labels are cached by ticker, date and headline hash, so a backtest reproduces. History comes from Alpaca's news API, whose depth is checked first; the labelling cost is estimated and approved by the owner before the backtest runs.
+8. **Trial:** pre-registered like trials 7 and 12: the news-label rule with the contract filter, backtested from February 2024, then 20 or more paper days and 30 or more trades.
+
 ## 5. Components → files
 
 | Module | Responsibility |
