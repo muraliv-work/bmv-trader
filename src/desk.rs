@@ -186,7 +186,7 @@ pub fn signals_path(home: &Path, date: &str) -> PathBuf {
 
 /// Every line, in file order. A final line without its newline was cut off mid-write (the
 /// process died); it is dropped with a warning, since that run never finished.
-pub(crate) fn read_lines(path: &Path) -> Result<Vec<Analysis>, String> {
+pub(crate) fn read_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -281,22 +281,30 @@ pub fn all_runs(home: &Path) -> Result<Vec<Analysis>, String> {
 /// Only one trial 10 command at a time, so two can't both spend today's budget or analyse one
 /// signal twice. Held until dropped.
 pub fn lock(home: &Path) -> Result<std::fs::File, String> {
-    let dir = desk_dir(home);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let path = dir.join("run.lock");
+    try_lock(&desk_dir(home).join("run.lock"), "trial 10")
+}
+
+/// An exclusive lock on `path` for one `trial`'s commands, refused at once if another holds it.
+pub(crate) fn try_lock(path: &Path, trial: &str) -> Result<std::fs::File, String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
-        .map_err(|e| format!("desk lock {}: {e}", path.display()))?;
+        .open(path)
+        .map_err(|e| format!("{trial} lock {}: {e}", path.display()))?;
     match f.try_lock() {
         Ok(()) => Ok(f),
         Err(std::fs::TryLockError::WouldBlock) => Err(format!(
-            "another trial 10 command is running ({} is locked)",
+            "another {trial} command is running ({} is locked)",
             path.display()
         )),
-        Err(std::fs::TryLockError::Error(e)) => Err(format!("desk lock {}: {e}", path.display())),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(format!("{trial} lock {}: {e}", path.display()))
+        }
     }
 }
 
@@ -1324,13 +1332,13 @@ mod tests {
             .unwrap();
         f.write_all(b"{\"when\":\"cut").unwrap();
         assert_eq!(
-            read_lines(&path).unwrap().len(),
+            read_lines::<Analysis>(&path).unwrap().len(),
             1,
             "a cut-off last line is ignored"
         );
         append(&path, &q("B")).unwrap();
         assert!(
-            read_lines(&path).is_err(),
+            read_lines::<Analysis>(&path).is_err(),
             "once followed by a full line, the torn one is an error, not silently lost"
         );
         std::fs::remove_dir_all(&dir).unwrap();

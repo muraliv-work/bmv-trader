@@ -82,6 +82,39 @@ cp deploy/com.bmv-trader.desk.plist ~/Library/LaunchAgents/
 launchctl bootout gui/$(id -u)/com.bmv-trader.desk; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.desk.plist
 ```
 
+# Trial 14: AI same-day picks (launchd, DESIGN §7k)
+
+Two weekday jobs, both shadow only (nothing in trial 14 can place an order):
+- `com.bmv-trader.intradaypick`, at 8:46 Mac time (9:46 ET), scans the movers and asks Claude
+  Sonnet 5.5 once for up to 3 same-day picks.
+- `com.bmv-trader.intradayscore`, at 15:20 Mac time (16:20 ET), scores them on minute bars.
+
+The calls are logged in `data/intraday/calls.jsonl`, the scores in `data/intraday/scores.jsonl`, and
+both jobs log to `data/intraday/run.log`. Claude uses the engine's key (`ANTHROPIC_API_KEY`) and the
+`intraday` line of `deploy/models.json`, at most $20 a month. If the Mac sleeps past 10:15 ET, the
+session is logged as missed and never made up, so keep it awake on mains power:
+`sudo pmset -c sleep 0`.
+
+The healthchecks.io checks: `intraday-pick` with schedule `46 8 * * 1-5` and `intraday-score`
+with `20 15 * * 1-5`, both time zone `America/Chicago`, grace 30 minutes. A missed, failed or
+over-budget session pings `/fail`; on a holiday the run prints "not a session" and pings success.
+
+Install on or after 2026-11-13 (R15 takes effect then; the first session is 2026-11-16):
+
+```sh
+cargo build --release
+sudo cp target/release/bmv-trader /usr/local/libexec/bmv-trial14
+shasum -a 256 /usr/local/libexec/bmv-trial14   # write the hash into docs/REPORT-2026-11.md
+mkdir -p data/intraday
+for j in intradaypick intradayscore; do
+  cp deploy/com.bmv-trader.$j.plist ~/Library/LaunchAgents/
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.$j.plist
+done
+```
+
+`bmv-trader intraday-report` shows counts and spend only; outcomes stay hidden until
+`bmv-trader intraday-verdict`, which runs once, at 245 filled picks or on 2027-06-30.
+
 # Reconciliation every 15 minutes (launchd, R13 step 3b)
 
 `bmv-trader desk-ping reconcile` runs `bmv-trader desk-reconcile` from `target/release` at 8:00–14:45 Mac

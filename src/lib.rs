@@ -10,6 +10,7 @@ pub mod engine;
 pub mod free_keys;
 pub mod history;
 pub mod insider;
+pub mod intraday;
 pub mod keys;
 pub mod lab;
 pub mod live;

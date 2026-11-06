@@ -901,6 +901,21 @@ A pass enables nothing by itself (A14). `intraday-report` shows counts and spend
 
 **Runs from** a pinned binary, `/usr/local/libexec/bmv-trial14`, through `desk-ping`, with two healthchecks checks (`intraday-pick`, `intraday-score`), so later rebuilds can't change it.
 
+**Amendment 1 (owner, 2026-11-06, before any session ran; DECISION R15).** The code review found five holes in the text above. Where this list differs from the text above, this list governs:
+1. **No fill before the pick existed.** Scoring starts with the first whole minute after the picks are logged, not at 9:46. The random picks and SPY buy at that same bar's open, plus slippage. A random pick's stop is that open less 1 ATR(14) and its target that open plus 2 ATR, instead of the 9:45 close.
+2. **SPY per trade.** The third check is mean R per filled pick above SPY's mean R per session held, instead of total return. Up to 3 picks a session against one SPY trade would otherwise pass on trade count alone.
+3. **Bounded picks.** Two more code checks: risk (entry − stop) is at most 3 × the stock's ATR(14), and target − entry is at most 10R. A far stop would otherwise make every R near 0.
+4. **No split gaps.** Stocks whose |gap| is over 30% are left out of the list (the gap scan's limit, §7). A split or buyout on the day would otherwise look like the biggest mover.
+5. **A fixed sample.** The verdict uses sessions in date order up to and including the one where filled picks reach 245, so the day it is run can't change it.
+
+The amendment also adds rules where the text above was silent:
+- The scan needs the 9:30 bar and a bar at 9:44 or later.
+- `exit_by` must be exactly HH:MM.
+- The price checks allow a billionth of a dollar of floating-point slack, so that 5.00 − 4.95 counts as 5¢.
+- The model must be `claude-sonnet-5-5` in `deploy/models.json`, or the session is missed.
+- A pick symbol, random pick or SPY with no bars after the picks is a scoring error, never an unfilled entry.
+- A session still Queued from a cut-off run is logged as failed, and the verdict waits until none is left.
+
 ## 8. Decision pipeline (one candidate)
 
 1. **Strategy** emits a `Candidate`, which is journaled.

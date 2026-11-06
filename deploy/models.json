@@ -7,7 +7,8 @@
   },
   "engine": {
     "notes":     { "claude": true,  "claude_model": "claude-haiku-5-5", "free_model": null,       "budget_usd": "2" },
-    "lab_ideas": { "claude": false, "claude_model": "claude-haiku-5-5", "free_model": "bmv-free", "budget_usd": "1" }
+    "lab_ideas": { "claude": false, "claude_model": "claude-haiku-5-5", "free_model": "bmv-free", "budget_usd": "1" },
+    "intraday":  { "claude": true,  "claude_model": "claude-sonnet-5-5", "free_model": null,      "budget_usd": "20" }
   },
   "free_keys": {
     "rotate_every_hours": 168,

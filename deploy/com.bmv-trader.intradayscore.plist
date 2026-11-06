@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Trial 14 (DESIGN §7k): `bmv-trader intraday-score` on weekdays at 15:20 Mac time, which is
+     16:20 ET: scores the day's logged picks and the baselines on minute bars.
+     Shadow only: nothing in trial 14 can place an order. `bmv-trader desk-ping intraday-score`
+     runs the pinned binary /usr/local/libexec/bmv-trial14, then pings its healthchecks check, so a
+     rebuild of target/release changes only the ping wrapper. Assumes a Mac set to US Central time.
+     Install: deploy/README.md -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bmv-trader.intradayscore</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/target/release/bmv-trader</string>
+    <string>desk-ping</string>
+    <string>intraday-score</string>
+    <string>/usr/local/libexec/bmv-trial14</string>
+    <string>intraday-score</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BMV_HOME</key>
+    <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>20</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>20</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>20</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>20</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>20</integer></dict>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/data/intraday/run.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/data/intraday/run.log</string>
+</dict>
+</plist>

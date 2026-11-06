@@ -40,6 +40,10 @@ const USAGE: &str = "usage:
   bmv-trader desk-report                  trial 10 so far: signals, ratings, spend, outcomes
   bmv-trader desk-analyse --symbols X --date YYYY-MM-DD  one analyst run outside the trial (measures cost)
   bmv-trader desk-verdict                 trial 10's pre-registered verdict, once it is due (logged once)
+  bmv-trader intraday-pick                trial 14 at 9:46 ET: scan the movers, ask Claude for up to 3 same-day picks, log them (never ordered)
+  bmv-trader intraday-score               trial 14 after the close: score logged picks and baselines on minute bars
+  bmv-trader intraday-report              trial 14 so far: counts and spend only, outcomes hidden until the verdict
+  bmv-trader intraday-verdict             trial 14's pre-registered verdict, once it is due (logged once)
   bmv-trader notes                        Tier 2: write any due notes (desk brief, analyst digest, session, Sunday digest)
   bmv-trader llm-health                   check Ollama, OmniRoute, a Tier-2 probe, key age and Claude spend
   bmv-trader llm-rotate                   regenerate the OmniRoute key, store it, re-apply its policy
@@ -267,6 +271,10 @@ fn main() {
                 trial.and(reconciled).and(health)
             }
             Some("desk-verdict") => desk_verdict(),
+            Some("intraday-pick") => intraday_pick(),
+            Some("intraday-score") => intraday_score(),
+            Some("intraday-report") => intraday_report(),
+            Some("intraday-verdict") => intraday_verdict(),
             Some("desk-analyse") => {
                 let symbol = args.symbols()?;
                 match (symbol.as_slice(), args.get("--date")) {
@@ -3804,6 +3812,455 @@ fn run(symbols: &[String], trend: bool, orb: OrbParams) -> Result<(), String> {
 
 fn data_dir() -> Result<std::path::PathBuf, String> {
     Ok(config::home()?.join("data"))
+}
+
+/// Alpaca's sessions in [from, to]; it knows holidays and half-days.
+fn sessions(
+    alpaca: &broker::Alpaca,
+    from: &str,
+    to: &str,
+) -> Result<Vec<history::Session>, String> {
+    let rows: Vec<history::CalendarRow> = alpaca.get(
+        broker::Api::Trading,
+        &format!("/v2/calendar?start={from}&end={to}"),
+    )?;
+    history::parse_calendar(&rows)
+}
+
+/// One morning's scan for trial 14, ready to send.
+struct IntradayScan {
+    list: Vec<bmv_trader::intraday::Candidate>,
+    spy_atr: Option<f64>,
+    universe: usize,
+    headlines_failed: usize,
+    facts: String,
+}
+
+/// Trial 14 at 9:46 ET (DESIGN §7k). Shadow only: it reads market data, asks Claude once, and
+/// never orders. Every session that reaches the scan is logged: Missed if anything stops the scan,
+/// Queued before any money is spent, then its result. Nothing is retried.
+fn intraday_pick() -> Result<(), String> {
+    use bmv_trader::intraday::{self as id, Call, Status};
+    use bmv_trader::llm;
+    let home = config::home()?;
+    let _lock = id::lock(&home)?;
+    let et = et_now();
+    let today = et.date_naive().to_string();
+    if today.as_str() < id::FIRST_SESSION || today.as_str() > id::LAST_SESSION {
+        // not an error: launchd may run it before the start or after the end
+        println!(
+            "{today}: trial 14 runs from {} to {} (DESIGN §7k)",
+            id::FIRST_SESSION,
+            id::LAST_SESSION
+        );
+        return Ok(());
+    }
+    let alpaca = connect()?;
+    let week_ago = (et.date_naive() - chrono::Days::new(10)).to_string();
+    let cal = sessions(&alpaca, &week_ago, &today)?;
+    let Some(s) = cal.iter().find(|s| s.date == today) else {
+        println!("{today}: not a session");
+        return Ok(());
+    };
+    let log = |date: &str, scan: Option<&IntradayScan>, status| {
+        id::record(
+            &home,
+            &Call {
+                when: et_now().to_rfc3339(),
+                date: date.into(),
+                candidates: scan.map(|x| x.list.clone()).unwrap_or_default(),
+                spy_atr: scan.and_then(|x| x.spy_atr),
+                universe: scan.map_or(0, |x| x.universe),
+                headlines_failed: scan.map_or(0, |x| x.headlines_failed),
+                status,
+            },
+        )
+    };
+    let cut_off = || Status::Failed {
+        reason: "cut off after it was queued; never retried".into(),
+        model: None,
+        reply: None,
+        cost_usd: None,
+    };
+    for c in id::read_calls(&home)? {
+        if c.status != Status::Queued {
+            if c.date == today {
+                println!("{today}: already logged");
+                return Ok(());
+            }
+            continue;
+        }
+        // the call may have been paid for: never ask twice
+        log(&c.date, None, cut_off())?;
+        if c.date == today {
+            return Err(format!(
+                "{today}: cut off after it was queued; logged as failed"
+            ));
+        }
+        eprintln!("{}: was still queued; logged as failed", c.date);
+    }
+    if et.timestamp() < s.open + id::SCAN_SECS + 30 {
+        return Err("too early: run after 9:45:30 ET, once the first 15 minutes are in".into());
+    }
+    let job = llm::Tier2Task::IntradayPick.job();
+    let ledger = llm::spend_path(&home);
+    let scanned = intraday_scan(&alpaca, &home, s, &cal).and_then(|scan| {
+        let before = llm::month_spend(&ledger, Some(job))?;
+        Ok((scan, before))
+    });
+    let (scan, before) = match scanned {
+        Ok((Some(scan), before)) => (scan, before),
+        Ok((None, _)) => {
+            let reason = "no stock passed the scan".to_string();
+            log(
+                &today,
+                None,
+                Status::Unanalysed {
+                    reason: reason.clone(),
+                },
+            )?;
+            println!("{today}: {reason}");
+            return Ok(());
+        }
+        Err(e) => {
+            log(&today, None, Status::Missed { reason: e.clone() })?;
+            return Err(format!("{today} missed: {e}"));
+        }
+    };
+    log(&today, Some(&scan), Status::Queued)?;
+    let reply = llm::complete(llm::Tier2Task::IntradayPick, &scan.facts);
+    // the call is paid for now: nothing below may stop its line being written
+    let cost_usd = match llm::month_spend(&ledger, Some(job)) {
+        Ok(after) => Some(after - before),
+        Err(e) => {
+            eprintln!("cost unknown (it is in the ledger): {e}");
+            None
+        }
+    };
+    let model = Some(id::MODEL.to_string());
+    let status = match reply {
+        // refused before sending (llm::claude_with), so nothing was spent
+        Err(e) if e.starts_with("Tier 2 budget") || e.starts_with("Claude budget") => {
+            Status::Unanalysed { reason: e }
+        }
+        Err(e) => Status::Failed {
+            reason: e,
+            model,
+            reply: None,
+            cost_usd,
+        },
+        Ok(note) => match id::parse_picks(&note.0) {
+            Err(e) => Status::Failed {
+                reason: e,
+                model,
+                reply: Some(note.0),
+                cost_usd,
+            },
+            Ok(picks) => Status::Picked {
+                model: id::MODEL.into(),
+                reply_sha256: id::sha256(&note.0),
+                reply: note.0,
+                picks: id::check_all(&picks, &scan.list, &today),
+                cost_usd,
+            },
+        },
+    };
+    if let Err(e) = log(&today, Some(&scan), status.clone()) {
+        // the run log keeps what the calls log couldn't
+        eprintln!("{today}: couldn't log the result: {status:?}");
+        return Err(e);
+    }
+    let cost = cost_usd.map_or("unknown".into(), |c| format!("${c:.4}"));
+    match status {
+        Status::Picked { picks, .. } => {
+            let valid = picks.iter().filter(|p| p.invalid.is_none()).count();
+            println!(
+                "{today}: {} movers of {}, {} picks ({valid} valid), headlines failed for {}, {cost}",
+                scan.list.len(),
+                scan.universe,
+                picks.len(),
+                scan.headlines_failed
+            );
+            Ok(())
+        }
+        Status::Failed { reason, .. } | Status::Unanalysed { reason } => {
+            Err(format!("{today}: no picks: {reason}"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The scan for session `s`, up to the facts for the model; None when no stock passes. Any error
+/// means the session is missed.
+fn intraday_scan(
+    alpaca: &broker::Alpaca,
+    home: &Path,
+    s: &history::Session,
+    cal: &[history::Session],
+) -> Result<Option<IntradayScan>, String> {
+    use bmv_trader::intraday::{self as id, Item};
+    use bmv_trader::scan::{self, ADJUSTED_SIP_LIVE};
+    let dir = data_dir()?;
+    let late = |what: &str| {
+        if et_now().timestamp() > s.open + id::DEADLINE_SECS {
+            Err(format!("{what} after 10:15 ET"))
+        } else {
+            Ok(())
+        }
+    };
+    late("the scan started")?;
+    let model = bmv_trader::llm::job_model(home, bmv_trader::llm::Tier2Task::IntradayPick)?;
+    if model != id::MODEL {
+        return Err(format!(
+            "deploy/models.json names {model} for intraday; trial 14 is pinned to {}",
+            id::MODEL
+        ));
+    }
+    let prev = cal
+        .iter()
+        .rev()
+        .find(|x| x.date < s.date)
+        .ok_or("no session before today in the calendar")?
+        .date
+        .clone();
+    let spy = scan::read_daily(&dir, ADJUSTED_SIP_LIVE, "SPY")?;
+    let newest = spy.last().map(|b| b.date.clone()).unwrap_or_default();
+    if newest != prev {
+        return Err(format!(
+            "the daily bars end {newest}, not {prev}: desk-run hasn't refreshed them"
+        ));
+    }
+    let mut daily = BTreeMap::new();
+    for sym in live_symbols(&dir)? {
+        if sym == "SPY" {
+            continue;
+        }
+        let bars = scan::read_daily(&dir, ADJUSTED_SIP_LIVE, &sym)?;
+        if bars.last().is_some_and(|b| b.date == prev) && id::eligible(&bars) {
+            daily.insert(sym, bars);
+        }
+    }
+    let symbols: Vec<String> = daily.keys().cloned().collect();
+    eprintln!("{} stocks in the universe", symbols.len());
+    let window = history::Session {
+        date: s.date.clone(),
+        open: s.open,
+        close: s.open + id::SCAN_SECS,
+    };
+    let mut first = id::fetch_bars(alpaca, &symbols, &window)?;
+    late("the scan's bars came")?;
+    let list = id::rank_movers(
+        daily
+            .iter()
+            .filter_map(|(sym, d)| id::candidate(sym, d, first.get(sym)?, s.open))
+            .collect(),
+    );
+    if list.is_empty() {
+        return Ok(None);
+    }
+    let since = et_now().timestamp() - 24 * 3600;
+    let mut headlines_failed = 0;
+    let mut items = Vec::new();
+    for c in &list {
+        std::thread::sleep(std::time::Duration::from_millis(history::CALL_SPACING_MS));
+        let headlines = id::headlines(alpaca, &c.symbol, since);
+        if let Err(e) = &headlines {
+            headlines_failed += 1;
+            eprintln!("{}: headlines unavailable: {e}", c.symbol);
+        }
+        items.push(Item {
+            cand: c.clone(),
+            daily: daily
+                .remove(&c.symbol)
+                .ok_or("a listed stock lost its daily bars")?,
+            first: first
+                .remove(&c.symbol)
+                .ok_or("a listed stock lost its bars")?,
+            headlines,
+        });
+    }
+    let facts = id::facts(&s.date, &items)?;
+    late("the facts were ready")?;
+    Ok(Some(IntradayScan {
+        spy_atr: id::atr(&spy),
+        universe: symbols.len(),
+        headlines_failed,
+        list,
+        facts,
+    }))
+}
+
+/// Trial 14 after the close: scores each Picked session once, on minute bars kept beside it.
+/// A session that can't be scored is reported and left for the next run; the others go on.
+fn intraday_score() -> Result<(), String> {
+    use bmv_trader::intraday::{self as id, Status};
+    let home = config::home()?;
+    let _lock = id::lock(&home)?;
+    let calls = id::read_calls(&home)?;
+    let scored: std::collections::BTreeSet<String> = id::read_scores(&home)?
+        .into_iter()
+        .map(|s| s.date)
+        .collect();
+    let todo: Vec<_> = calls
+        .iter()
+        .filter(|c| matches!(c.status, Status::Picked { .. }) && !scored.contains(&c.date))
+        .collect();
+    let (Some(first), Some(last)) = (todo.first(), todo.last()) else {
+        println!("trial 14: nothing to score");
+        return Ok(());
+    };
+    let alpaca = connect()?;
+    let cal = sessions(&alpaca, &first.date, &last.date)?;
+    let now = et_now().timestamp();
+    let (mut done, mut waiting, mut failed) = (0, 0, Vec::new());
+    for c in todo {
+        let Some(s) = cal.iter().find(|s| s.date == c.date) else {
+            failed.push(format!("{} isn't a session in Alpaca's calendar", c.date));
+            continue;
+        };
+        // the free plan's bars for the last 15 minutes come late
+        if now < s.close + 20 * 60 {
+            waiting += 1;
+            continue;
+        }
+        let path = id::bars_path(&home, &c.date);
+        let scored = if path.exists() {
+            history::read_json(&path).and_then(|b| id::score_session(c, &b))
+        } else {
+            let mut symbols: Vec<String> = c.candidates.iter().map(|x| x.symbol.clone()).collect();
+            symbols.push("SPY".into());
+            // the bars are kept only once they score, so a bad download is fetched again
+            id::fetch_bars(&alpaca, &symbols, s).and_then(|b| {
+                let score = id::score_session(c, &b)?;
+                history::write_json(&path, &b)?;
+                Ok(score)
+            })
+        };
+        match scored.and_then(|score| id::record_score(&home, &score)) {
+            Ok(()) => done += 1,
+            Err(e) => failed.push(format!("{}: {e}", c.date)),
+        }
+    }
+    println!(
+        "trial 14: scored {done} session(s), {waiting} waiting for the close, {} failed",
+        failed.len()
+    );
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("\n"))
+    }
+}
+
+/// Trial 14 so far: counts and spend only. Outcome averages stay hidden until the verdict.
+fn intraday_report() -> Result<(), String> {
+    use bmv_trader::intraday as id;
+    let home = config::home()?;
+    let t = id::tally(&id::read_calls(&home)?, &id::read_scores(&home)?);
+    let month = bmv_trader::llm::month_spend(
+        &bmv_trader::llm::spend_path(&home),
+        Some(bmv_trader::llm::Tier2Task::IntradayPick.job()),
+    )?;
+    println!(
+        "trial 14: {} sessions logged: {} picked, {} failed, {} missed, {} unanalysed, {} queued",
+        t.sessions, t.picked, t.failed, t.missed, t.unanalysed, t.queued
+    );
+    println!(
+        "  picks: {} valid, {} invalid; {} sessions scored: {} filled of {} needed, {} unfilled",
+        t.valid,
+        t.invalid,
+        t.scored,
+        t.filled,
+        id::PICKS_NEEDED,
+        t.unfilled
+    );
+    println!(
+        "  spend: ${:.2} logged on picks, ${month:.2} this month (cap $20); verdict at {} filled or on {}",
+        t.cost_usd,
+        id::PICKS_NEEDED,
+        id::LAST_SESSION
+    );
+    Ok(())
+}
+
+/// Trial 14's verdict, once (DESIGN §7k): logged to trials.jsonl and never run again.
+fn intraday_verdict() -> Result<(), String> {
+    use bmv_trader::intraday::{self as id, Status};
+    let (home, dir) = (config::home()?, data_dir()?);
+    let _lock = id::lock(&home)?;
+    let today = et_now().date_naive().to_string();
+    let log = dir.join("trials.jsonl");
+    if logged_trials(&log)?.iter().any(|t| t == id::TRIAL_NAME) {
+        return Err("trial 14 is already logged".into());
+    }
+    let calls = id::read_calls(&home)?;
+    let scores = id::read_scores(&home)?;
+    let t = id::tally(&calls, &scores);
+    if !id::due(t.filled, &today) {
+        return Err(format!(
+            "not due: {} of {} filled picks, or on {}",
+            t.filled,
+            id::PICKS_NEEDED,
+            id::LAST_SESSION
+        ));
+    }
+    let scored: std::collections::BTreeSet<&str> = scores.iter().map(|s| s.date.as_str()).collect();
+    if calls
+        .iter()
+        .any(|c| matches!(c.status, Status::Picked { .. }) && !scored.contains(c.date.as_str()))
+    {
+        return Err("some picked sessions aren't scored yet: run intraday-score first".into());
+    }
+    if let Some(c) = calls.iter().find(|c| c.status == Status::Queued) {
+        return Err(format!(
+            "{} is still queued: run intraday-pick once to log it as failed",
+            c.date
+        ));
+    }
+    let (o, gate) = id::verdict(&scores);
+    let sample = id::sample(&scores);
+    let period = format!(
+        "{}..{}",
+        sample.first().map_or("", |s| s.date.as_str()),
+        sample.last().map_or("", |s| s.date.as_str())
+    );
+    let trial = stats::Trial {
+        when: chrono::Utc::now().to_rfc3339(),
+        strategy: id::TRIAL_NAME.into(),
+        params: format!(
+            "trial 14: Claude Sonnet 5.5 picks up to 3 same-day longs from the top 15 movers at 9:46 ET; {} sessions, {} valid picks ({} filled); baselines: random from the list (5 seeds), SPY; units: expectancy_r = mean R, ci_low = one-sided 95% lower bound",
+            t.sessions, t.valid, t.filled
+        ),
+        period,
+        trades: o.filled,
+        expectancy_r: o.mean_r.unwrap_or(0.0),
+        profit_factor: None,
+        max_drawdown_r: 0.0,
+        ci_low: o.lower,
+    };
+    let logged = stats::record_trial(&log, &trial)?;
+    println!(
+        "trial {logged}: {}; {} filled picks",
+        id::TRIAL_NAME,
+        o.filled
+    );
+    for c in &gate.checks {
+        println!(
+            "  [{}] {}: {}",
+            if c.passed { "pass" } else { "FAIL" },
+            c.name,
+            c.detail
+        );
+    }
+    println!(
+        "verdict: {}",
+        if gate.passed() {
+            "the AI's picks earn a next step (A14: this enables nothing by itself)"
+        } else {
+            "the AI's picks add nothing measurable after costs"
+        }
+    );
+    Ok(())
 }
 
 fn fetch(from: &str, to: &str, symbols: &[String], allow_gaps: bool) -> Result<(), String> {
