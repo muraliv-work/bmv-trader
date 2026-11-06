@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Reconciliation (DESIGN §12, R13 step 3b): `bmv-trader desk-reconcile` through
-     scripts/reconcile.sh every 15 minutes, 8:00 to 14:45 Mac time, which is 9:00 to 15:45 ET on a
+     `desk-ping reconcile` every 15 minutes, 8:00 to 14:45 Mac time, which is 9:00 to 15:45 ET on a
      Mac set to US Central time (tests/deploy.rs checks this). Every day, market open or not, since
      positions and GTC stops live at any hour. Report only; it never places or cancels an order.
      It runs target/release, never trial 10's pinned copy. Install: deploy/README.md -->
@@ -11,7 +11,11 @@
   <string>com.bmv-trader.reconcile</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/scripts/reconcile.sh</string>
+    <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/target/release/bmv-trader</string>
+    <string>desk-ping</string>
+    <string>reconcile</string>
+    <string>/Users/balamuralivallappa/Documents/projects/bmv/bmv-trader/target/release/bmv-trader</string>
+    <string>desk-reconcile</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

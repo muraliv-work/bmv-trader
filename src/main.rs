@@ -16,6 +16,7 @@ const USAGE: &str = "usage:
   bmv-trader flatten                      close every position and confirm (any mode)
   bmv-trader backstop                     for launchd: near the close, flatten anything left (deploy/)
   bmv-trader desk-reconcile               for launchd: check the account holds only the drills and their stops (exit 1 on a mismatch)
+  bmv-trader desk-ping <check> <program> [args...]   for launchd: run the program, then ping its healthchecks check
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
   bmv-trader universe                     list every US stock, active and delisted (for the scan)
   bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD [--adjusted | --raw-sip]   daily bars for the universe
@@ -186,6 +187,18 @@ impl Args {
 
 fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
+    // before Args::parse: the program and its args are passed on as they are
+    if all.first().map(String::as_str) == Some("desk-ping") {
+        match all.as_slice() {
+            [_, check, program, args @ ..] => {
+                exit(bmv_trader::ping::run_and_ping(check, program, args))
+            }
+            _ => {
+                eprintln!("usage: bmv-trader desk-ping <check> <program> [args...]");
+                exit(2)
+            }
+        }
+    }
     let result = Args::parse(all.get(1..).unwrap_or_default()).and_then(|args| {
         match all.first().map(String::as_str) {
             Some("account") => account(),
@@ -540,7 +553,7 @@ fn backstop() -> Result<(), String> {
 }
 
 /// launchd runs this every 15 minutes from 9:00 to 15:45 ET (deploy/, R13 step 3b), through
-/// scripts/reconcile.sh, which pings healthchecks after it. Report only: the halt is step 3c.
+/// `desk-ping reconcile`, which pings healthchecks after it. Report only: the halt is step 3c.
 /// It checks whether the market is open or not: positions and GTC stops live at any hour.
 /// A mismatch, a bad drill file or a failed read exits 1, so the ping goes to reconcile/fail.
 fn desk_reconcile() -> Result<(), String> {

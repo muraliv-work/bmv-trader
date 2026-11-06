@@ -67,8 +67,11 @@ Install, check and remove work like the backstop above, with `com.bmv-trader.des
 `data/desk/run.log`; `bmv-trader desk-report` shows progress at any time.
 
 **Pinned binary (R13 step 0b, 2026-11-06).** Trial 10 runs a pinned copy, never `target/release`, so
-rebuilds can't change it. `scripts/desk-run.sh` runs it, then pings the healthchecks.io check
-`desk-run` (or `desk-run/fail`) with the Keychain item `bmv-trader` / `HEALTHCHECKS_PING_KEY`:
+rebuilds can't change it. `bmv-trader desk-ping desk-run` runs it, then pings the healthchecks.io
+check `desk-run` (or `desk-run/fail`, with the run's output) with the Keychain item `bmv-trader` /
+`HEALTHCHECKS_PING_KEY`. launchd starts `target/release/bmv-trader`, never a script: macOS won't let
+launchd run bash scripts in `~/Documents` ("Operation not permitted", exit 126), even with Full Disk
+Access for `/bin/bash`, while the binary and its children can read the project:
 
 ```sh
 sudo mkdir -p /usr/local/libexec
@@ -81,7 +84,7 @@ launchctl bootout gui/$(id -u)/com.bmv-trader.desk; launchctl bootstrap gui/$(id
 
 # Reconciliation every 15 minutes (launchd, R13 step 3b)
 
-`scripts/reconcile.sh` runs `bmv-trader desk-reconcile` from `target/release` at 8:00–14:45 Mac
+`bmv-trader desk-ping reconcile` runs `bmv-trader desk-reconcile` from `target/release` at 8:00–14:45 Mac
 time (9:00–15:45 ET), every day, market open or not (positions and GTC stops live at any hour). It
 checks that the account holds only the drills in `data/drill.json`, each with one working,
 standalone GTC sell stop for its full qty, and no other order. It only reports: nothing is

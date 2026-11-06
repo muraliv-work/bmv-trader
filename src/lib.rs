@@ -18,6 +18,7 @@ pub mod market_data;
 pub mod momentum;
 pub mod money;
 pub mod notes;
+pub mod ping;
 pub mod power;
 pub mod retro;
 pub mod risk;
