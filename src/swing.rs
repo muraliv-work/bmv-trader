@@ -36,6 +36,20 @@ pub struct Rules {
     pub min_atr_fraction: f64,
     /// Leave out funds by Alpaca asset name.
     pub stocks_only: bool,
+    /// The time stop: sold at the open of session entry + max_hold.
+    pub max_hold: usize,
+    /// The profit target in ATRs; none in trial 13 (§7j).
+    pub target_atr: Option<f64>,
+    pub signal: Source,
+}
+
+/// What makes a day a signal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Source {
+    /// The Desk Signal (§7d), ranked by volume ratio.
+    DeskSignal,
+    /// Insider cluster buys (§7j), ranked by the cluster's dollars.
+    Insider,
 }
 
 pub const TRIAL_8: Rules = Rules {
@@ -43,12 +57,27 @@ pub const TRIAL_8: Rules = Rules {
     name: "swing desk-signal",
     min_atr_fraction: 0.0,
     stocks_only: false,
+    max_hold: MAX_HOLD,
+    target_atr: Some(TARGET_ATR),
+    signal: Source::DeskSignal,
 };
 pub const TRIAL_9: Rules = Rules {
     trial: 9,
     name: "swing desk-signal vol-stocks",
     min_atr_fraction: 0.015,
     stocks_only: true,
+    max_hold: MAX_HOLD,
+    target_atr: Some(TARGET_ATR),
+    signal: Source::DeskSignal,
+};
+/// Trial 9's filters, stop and costs on insider cluster buys; no target, 20 sessions (§7j).
+pub const TRIAL_13: Rules = Rules {
+    trial: 13,
+    name: "swing insider-cluster",
+    max_hold: 20,
+    target_atr: None,
+    signal: Source::Insider,
+    ..TRIAL_9
 };
 
 /// A fund by its Alpaca asset name (DESIGN §7e); case-insensitive.
@@ -163,9 +192,10 @@ pub struct Cand {
 /// Entered at the open of `e` with stop and target from `atr`: the first of stop, target or
 /// the time stop. Stop first on a day touching both; gaps fill at the open; a symbol with no
 /// later bar exits at its last close.
-fn simulate_trade(on: &[Option<&DailyBar>], e: usize, atr: f64) -> Option<Outcome> {
+fn simulate_trade(on: &[Option<&DailyBar>], e: usize, atr: f64, rules: &Rules) -> Option<Outcome> {
     let entry = on[e]?.open;
-    let (stop, target) = (entry - STOP_ATR * atr, entry + TARGET_ATR * atr);
+    let stop = entry - STOP_ATR * atr;
+    let target = rules.target_atr.map_or(f64::INFINITY, |t| entry + t * atr);
     if !(stop > 0.0 && atr > 0.0) {
         return None;
     }
@@ -176,10 +206,11 @@ fn simulate_trade(on: &[Option<&DailyBar>], e: usize, atr: f64) -> Option<Outcom
         stop_fraction: (entry - stop) / entry,
         at_data_end: false,
     };
-    let last = (e + MAX_HOLD).min(on.len() - 1);
+    let max_hold = rules.max_hold;
+    let last = (e + max_hold).min(on.len() - 1);
     for (j, b) in on.iter().enumerate().take(last + 1).skip(e) {
         let Some(b) = b else { continue };
-        if j == e + MAX_HOLD {
+        if j == e + max_hold {
             return Some(r(b.open, j));
         }
         if j > e && b.open <= stop {
@@ -274,11 +305,13 @@ impl<'a> Series<'a> {
 }
 
 /// Every eligible day of one symbol, keyed by signal session.
+/// For `Source::Insider`, `events` holds the symbol's cluster signals (session → dollars).
 pub fn candidates(
     symbol: usize,
     bars: &[DailyBar],
     cal: &Calendar,
     rules: &Rules,
+    events: &BTreeMap<usize, f64>,
 ) -> Vec<(usize, Cand)> {
     let ser = Series::new(bars, cal);
     let mut out = Vec::new();
@@ -292,14 +325,18 @@ pub fn candidates(
         if next.open > ser.own[k].close * (1.0 + MAX_CHASE) {
             continue;
         }
-        let Some(trade) = simulate_trade(&ser.on, s + 1, a) else {
+        let Some(trade) = simulate_trade(&ser.on, s + 1, a, rules) else {
             continue;
+        };
+        let ratio = match rules.signal {
+            Source::DeskSignal => ser.signal(k),
+            Source::Insider => events.get(&s).copied(),
         };
         out.push((
             s,
             Cand {
                 symbol,
-                ratio: ser.signal(k),
+                ratio,
                 out: trade,
             },
         ));
@@ -388,7 +425,7 @@ pub fn score_forward(bars: &[DailyBar], cal: &Calendar, signal: &Signal) -> Scor
         return Scored::Skipped("chased: opened > 0.5% above the close".into());
     }
     let newest_bar = ser.idx.last().copied().unwrap_or(0);
-    match simulate_trade(&ser.on, e, atr) {
+    match simulate_trade(&ser.on, e, atr, &TRIAL_9) {
         Some(o) if o.at_data_end && newest_bar + DELISTED_AFTER > last => Scored::Pending,
         Some(o) => Scored::Done {
             r: o.r,
@@ -794,11 +831,52 @@ mod tests {
 
     fn outcome(days: &[(f64, f64, f64, f64)]) -> Outcome {
         let (bars, cal) = path(days);
-        simulate_trade(&cal.aligned(&bars), 5, 1.0).unwrap()
+        simulate_trade(&cal.aligned(&bars), 5, 1.0, &TRIAL_8).unwrap()
     }
 
     fn net(entry: f64, exit: f64) -> f64 {
         (exit - entry - COST_PER_SIDE * (entry + exit)) / 2.0
+    }
+
+    #[test]
+    fn trial_13_has_no_target_and_sells_at_the_21st_open() {
+        let (bars, cal) = path(&[(100.0, 120.0, 99.5, 110.0)]);
+        let o = simulate_trade(&cal.aligned(&bars), 5, 1.0, &TRIAL_13).unwrap();
+        assert_eq!(
+            (o.exit, o.r),
+            (25, net(100.0, 100.0)),
+            "a run far past 3 ATR isn't sold"
+        );
+        let stop = {
+            let (bars, cal) = path(&[(100.0, 101.0, 99.0, 100.0), (100.0, 100.0, 97.0, 98.0)]);
+            simulate_trade(&cal.aligned(&bars), 5, 1.0, &TRIAL_13).unwrap()
+        };
+        assert_eq!(
+            (stop.exit, stop.r),
+            (6, net(100.0, 98.0)),
+            "the stop still works"
+        );
+        assert_eq!(
+            (TRIAL_13.min_atr_fraction, TRIAL_13.stocks_only),
+            (TRIAL_9.min_atr_fraction, TRIAL_9.stocks_only),
+            "trial 9's filters"
+        );
+    }
+
+    #[test]
+    fn insider_days_are_signals_only_where_a_cluster_fired() {
+        let n = 400;
+        let (bars, cal) = (breakout_bars(n, n - 5), cal(n));
+        let all = candidates(0, &bars, &cal, &TRIAL_13, &BTreeMap::new());
+        assert!(!all.is_empty() && all.iter().all(|(_, c)| c.ratio.is_none()));
+        let s = all[all.len() / 2].0;
+        let events = BTreeMap::from([(s, 250_000.0)]);
+        let fired: Vec<(usize, Option<f64>)> = candidates(0, &bars, &cal, &TRIAL_13, &events)
+            .into_iter()
+            .filter(|(_, c)| c.ratio.is_some())
+            .map(|(d, c)| (d, c.ratio))
+            .collect();
+        assert_eq!(fired, [(s, Some(250_000.0))]);
     }
 
     #[test]
@@ -840,7 +918,7 @@ mod tests {
 
         let (bars, cal) = path(&[(100.0, 100.5, 99.5, 101.0)]);
         let gone: Vec<DailyBar> = bars[..8].to_vec();
-        let d = simulate_trade(&cal.aligned(&gone), 5, 1.0).unwrap();
+        let d = simulate_trade(&cal.aligned(&gone), 5, 1.0, &TRIAL_8).unwrap();
         assert_eq!(
             (d.exit, d.r),
             (7, net(100.0, 100.0)),
@@ -873,7 +951,7 @@ mod tests {
     fn desk_signal_fires_on_a_breakout_in_an_uptrend_only() {
         let (n, k) = (320, 300);
         let cal = cal(n);
-        let c = candidates(0, &breakout_bars(n, k), &cal, &TRIAL_8);
+        let c = candidates(0, &breakout_bars(n, k), &cal, &TRIAL_8, &BTreeMap::new());
         let at = |s: usize| c.iter().find(|(d, _)| *d == s).map(|(_, x)| x.ratio);
         assert!(at(k).flatten().is_some_and(|r| r >= 3.0), "{:?}", at(k));
         assert_eq!(
@@ -885,7 +963,7 @@ mod tests {
 
         let mut weak = breakout_bars(n, k);
         weak[k].volume = 1_200_000;
-        let c = candidates(0, &weak, &cal, &TRIAL_8);
+        let c = candidates(0, &weak, &cal, &TRIAL_8, &BTreeMap::new());
         assert_eq!(
             c.iter().find(|(d, _)| *d == k).unwrap().1.ratio,
             None,
@@ -894,7 +972,7 @@ mod tests {
 
         let mut chase = breakout_bars(n, k);
         chase[k + 1].open = chase[k].close * 1.01;
-        let c = candidates(0, &chase, &cal, &TRIAL_8);
+        let c = candidates(0, &chase, &cal, &TRIAL_8, &BTreeMap::new());
         assert!(
             c.iter().all(|(d, _)| *d != k),
             "an entry > 0.5% above the close is skipped"
@@ -908,7 +986,7 @@ mod tests {
             })
             .collect();
         assert!(
-            candidates(0, &thin, &cal, &TRIAL_8).is_empty(),
+            candidates(0, &thin, &cal, &TRIAL_8, &BTreeMap::new()).is_empty(),
             "under $20M a day"
         );
     }
@@ -1007,7 +1085,7 @@ mod tests {
         let (n, k) = (320, 300);
         let cal = cal(n);
         let young: Vec<DailyBar> = breakout_bars(n, k)[100..].to_vec();
-        let c = candidates(0, &young, &cal, &TRIAL_8);
+        let c = candidates(0, &young, &cal, &TRIAL_8, &BTreeMap::new());
         assert!(
             c.iter().all(|(s, _)| *s >= 100 + MIN_HISTORY - 1),
             "under 250 bars: not even in the baseline pool"
@@ -1046,14 +1124,14 @@ mod tests {
         let (n, k) = (320, 300);
         let cal = cal(n);
         let bars = breakout_bars(n, k);
-        assert!(!candidates(0, &bars, &cal, &TRIAL_8).is_empty());
+        assert!(!candidates(0, &bars, &cal, &TRIAL_8, &BTreeMap::new()).is_empty());
         // the fixture's ATR is about 1-2% of an ~80 price at the breakout, well under 15%
         let strict = Rules {
             min_atr_fraction: 0.15,
             ..TRIAL_9
         };
         assert!(
-            candidates(0, &bars, &cal, &strict).is_empty(),
+            candidates(0, &bars, &cal, &strict, &BTreeMap::new()).is_empty(),
             "under the floor"
         );
         for f in [
@@ -1091,7 +1169,7 @@ mod tests {
         )
         .unwrap();
         let sig = signal_today("X", &full[..=k], &tonight, &TRIAL_8).unwrap();
-        let back = candidates(0, &full, &cal(n), &TRIAL_8);
+        let back = candidates(0, &full, &cal(n), &TRIAL_8, &BTreeMap::new());
         let then = back.iter().find(|(d, _)| *d == k).unwrap().1;
         assert_eq!(Some(sig.ratio), then.ratio, "same signal as the backtest");
         assert_eq!(sig.date, ds[k]);

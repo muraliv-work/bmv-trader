@@ -52,6 +52,14 @@ pub const ADJUSTED_SIP: DailySet = DailySet {
     folder: "sip-all",
     listed: false,
 };
+/// Unadjusted SIP prices, from 2016: what a share really cost that day, for trial 13's price
+/// check on insider purchases (DESIGN §7j).
+pub const RAW_SIP: DailySet = DailySet {
+    feed: "sip",
+    adjustment: "raw",
+    folder: "sip-raw",
+    listed: false,
+};
 /// The last ~420 days of the same adjusted bars for trial 10 (DESIGN §7f), downloaded fresh each
 /// night so every bar shares today's split and dividend adjustment.
 pub const ADJUSTED_SIP_LIVE: DailySet = DailySet {

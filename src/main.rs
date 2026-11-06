@@ -17,7 +17,7 @@ const USAGE: &str = "usage:
   bmv-trader backstop                     for launchd: near the close, flatten anything left (deploy/)
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
   bmv-trader universe                     list every US stock, active and delisted (for the scan)
-  bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD [--adjusted]   daily bars for the universe
+  bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD [--adjusted | --raw-sip]   daily bars for the universe
                       (raw IEX for the scan; --adjusted: split- and dividend-adjusted SIP, for momentum)
   bmv-trader momentum                     trial 7: 12-1 month momentum on the adjusted daily bars (DESIGN §13c)
   bmv-trader power                        the smallest effect trials 11 and 12 could detect (spreads from trial 7)
@@ -49,7 +49,8 @@ const USAGE: &str = "usage:
   bmv-trader free-keys --record PROVIDER  log a key pasted with scripts/free-key-add.sh, for its expiry
   bmv-trader free-keys --connection PROVIDER  a pasted provider's OmniRoute connection, and new|existing
   bmv-trader asset-names                  Alpaca's name for each universe symbol (for trial 9's fund filter)
-  bmv-trader backtest-swing --trial 8|9   the Desk Signal swing strategy on the adjusted daily bars (DESIGN §7d, §7e)
+  bmv-trader insider-fetch                the SEC's quarterly insider data sets into data/insider/ (trial 13, DESIGN §7j)
+  bmv-trader backtest-swing --trial 8|9|13  a swing trial on the adjusted daily bars (DESIGN §7d, §7e, §7j)
   bmv-trader scan     --from YYYY-MM-DD --to YYYY-MM-DD   each day's gappers, and their minute bars
   bmv-trader backtest --from YYYY-MM-DD --to YYYY-MM-DD [--strategy orb|gap|vwap] [--scan] [--symbols ...] [--fold-days 21]
                       [--seeds 5] [--holdout] [--holdout-again] [--trend] [--marketable]
@@ -84,10 +85,11 @@ const VALUE_FLAGS: [&str; 15] = [
     "--record",
     "--connection",
 ];
-const SWITCHES: [&str; 9] = [
+const SWITCHES: [&str; 10] = [
     "--renew",
     "--notify",
     "--adjusted",
+    "--raw-sip",
     "--scan",
     "--holdout",
     "--holdout-again",
@@ -200,7 +202,16 @@ fn main() {
             Some("universe") => universe(),
             Some("fetch-daily") => {
                 let (from, to) = args.dates()?;
-                fetch_daily(&from, &to, args.has("--adjusted"))
+                use bmv_trader::scan::{ADJUSTED_SIP, RAW_IEX, RAW_SIP};
+                let set = match (args.has("--adjusted"), args.has("--raw-sip")) {
+                    (true, true) => {
+                        return Err("--adjusted and --raw-sip are different sets".into());
+                    }
+                    (true, false) => ADJUSTED_SIP,
+                    (false, true) => RAW_SIP,
+                    (false, false) => RAW_IEX,
+                };
+                fetch_daily(&from, &to, set)
             }
             Some("momentum") => momentum(),
             Some("power") => power(),
@@ -259,10 +270,20 @@ fn main() {
                 println!("names for {n} symbols");
                 Ok(())
             }
+            Some("insider-fetch") => {
+                let dir = data_dir()?;
+                let n = bmv_trader::insider::fetch(&dir, &bmv_trader::insider::contact(&dir)?)?;
+                println!("{n} quarters fetched into data/insider/");
+                // counts only, never an outcome: the trial's one run is backtest-swing --trial 13
+                let found = bmv_trader::insider::purchases(&dir)?.0.len();
+                println!("{found} purchases in the data sets");
+                Ok(())
+            }
             Some("backtest-swing") => backtest_swing(match args.get("--trial") {
                 Some("8") => bmv_trader::swing::TRIAL_8,
                 Some("9") => bmv_trader::swing::TRIAL_9,
-                other => return Err(format!("--trial must be 8 or 9, got {other:?}")),
+                Some("13") => bmv_trader::swing::TRIAL_13,
+                other => return Err(format!("--trial must be 8, 9 or 13, got {other:?}")),
             }),
             Some("scan") => {
                 let (from, to) = args.dates()?;
@@ -524,9 +545,7 @@ fn universe() -> Result<(), String> {
     Ok(())
 }
 
-fn fetch_daily(from: &str, to: &str, adjusted: bool) -> Result<(), String> {
-    use bmv_trader::scan::{ADJUSTED_SIP, RAW_IEX};
-    let set = if adjusted { ADJUSTED_SIP } else { RAW_IEX };
+fn fetch_daily(from: &str, to: &str, set: bmv_trader::scan::DailySet) -> Result<(), String> {
     let n =
         bmv_trader::scan::fetch_daily(&connect()?, &data_dir()?, set, from, to, &mut |d, n| {
             eprintln!("  {d}/{n} symbols")
@@ -1099,6 +1118,15 @@ fn swing_days(
     } else {
         BTreeMap::new()
     };
+    let insider = rules.signal == sw::Source::Insider;
+    let buys = if insider {
+        insider_buys(dir)?
+    } else {
+        BTreeMap::new()
+    };
+    // per quarter: [outside the universe or a fund, off the market price or no raw bar, kept]
+    let mut drops: BTreeMap<String, [usize; 3]> = BTreeMap::new();
+    let mut signals = 0;
     let mut funds = 0;
     let mut names: Vec<String> = Vec::new();
     let mut days: Vec<Vec<Cand>> = vec![Vec::new(); cal.sessions.len()];
@@ -1107,7 +1135,25 @@ fn swing_days(
             funds += 1;
             return Ok(());
         }
-        for (d, c) in sw::candidates(names.len(), &bars, &cal, rules) {
+        let mut events = BTreeMap::new();
+        if let Some(mine) = buys.get(s) {
+            let raw = bmv_trader::scan::read_daily(dir, bmv_trader::scan::RAW_SIP, s)?;
+            let kept: Vec<_> = mine
+                .iter()
+                .filter_map(|p| {
+                    let k = bmv_trader::insider::near_market(p, &raw);
+                    drops
+                        .entry(bmv_trader::insider::quarter(&p.filed))
+                        .or_default()[if k.is_some() { 2 } else { 1 }] += 1;
+                    k
+                })
+                .collect();
+            events = bmv_trader::insider::clusters(&kept, &cal.sessions)
+                .remove(s)
+                .unwrap_or_default();
+            signals += events.len();
+        }
+        for (d, c) in sw::candidates(names.len(), &bars, &cal, rules, &events) {
             days[d].push(c);
         }
         names.push(s.to_string());
@@ -1116,6 +1162,29 @@ fn swing_days(
         }
         Ok(())
     })?;
+    if insider {
+        let known: std::collections::BTreeSet<&String> = names.iter().collect();
+        for (ticker, mine) in &buys {
+            if !known.contains(ticker) {
+                for p in mine {
+                    drops
+                        .entry(bmv_trader::insider::quarter(&p.filed))
+                        .or_default()[0] += 1;
+                }
+            }
+        }
+        eprintln!(
+            "purchases per quarter: outside the universe or a fund / off the market price or no bar / kept"
+        );
+        let rows: Vec<String> = drops
+            .iter()
+            .map(|(q, [out, off, kept])| format!("{q} {out}/{off}/{kept}"))
+            .collect();
+        eprintln!("  {}", rows.join(", "));
+        eprintln!(
+            "{signals} cluster signals on universe stocks (before the chase skip and the filters)"
+        );
+    }
     let first = |d: &str| cal.sessions.iter().position(|s| s.as_str() >= d);
     let start = first(sw::RESEARCH_FROM).ok_or("no session after the research start")?;
     let cut = first(cut_date).ok_or("no session at the holdout start")?;
@@ -1123,6 +1192,33 @@ fn swing_days(
         eprintln!("{funds} funds left out by name");
     }
     Ok((cal, names, days, start, cut))
+}
+
+/// Trial 13's purchases by ticker (DESIGN §7j), after checking the unadjusted bars cover the
+/// pinned range, with the purchases found per quarter.
+fn insider_buys(
+    dir: &Path,
+) -> Result<BTreeMap<String, Vec<bmv_trader::insider::Purchase>>, String> {
+    use bmv_trader::momentum as mo;
+    let (from, to) = bmv_trader::scan::daily_range(dir, bmv_trader::scan::RAW_SIP)?;
+    if (from.as_str(), to.as_str()) != (mo::DATA_FROM, mo::DATA_TO) {
+        return Err(format!(
+            "unadjusted bars cover {from}..{to}, but trial 13 checks prices on {}..{}",
+            mo::DATA_FROM,
+            mo::DATA_TO
+        ));
+    }
+    let (all, per_quarter) = bmv_trader::insider::purchases(dir)?;
+    let counts: Vec<String> = per_quarter
+        .iter()
+        .map(|(q, n)| format!("{q} {n}"))
+        .collect();
+    eprintln!("insider purchases found per quarter: {}", counts.join(", "));
+    let mut by_ticker: BTreeMap<String, Vec<bmv_trader::insider::Purchase>> = BTreeMap::new();
+    for p in all {
+        by_ticker.entry(p.ticker.clone()).or_default().push(p);
+    }
+    Ok(by_ticker)
 }
 
 /// Trial 12's sample (DESIGN §7i): each untouched-year session's top trial 9 signal, frozen once.
@@ -1612,9 +1708,13 @@ fn rerun(
                 "monthly return",
             )
         }
-        8 | 9 => {
+        8 | 9 | 13 => {
             no_params(orb)?;
-            let rules = if trial == 8 { sw::TRIAL_8 } else { sw::TRIAL_9 };
+            let rules = match trial {
+                8 => sw::TRIAL_8,
+                9 => sw::TRIAL_9,
+                _ => sw::TRIAL_13,
+            };
             let (cal, names, days, start, cut) = swing_days(&c.dir, &rules, &c.cut_date)?;
             let (taken, _) = sw::portfolio(&days, &names, start, cut);
             let cost_r = |o: &sw::Outcome| 2.0 * sw::COST_PER_SIDE / o.stop_fraction.max(1e-9);
@@ -1633,7 +1733,10 @@ fn rerun(
                         // shortcut: exit kind from the gross R (stop -1R, target +1.5R), approximate on gaps
                         exit: if o.at_data_end {
                             "data end"
-                        } else if g >= sw::TARGET_ATR / sw::STOP_ATR - 0.01 {
+                        } else if rules
+                            .target_atr
+                            .is_some_and(|t| g >= t / sw::STOP_ATR - 0.01)
+                        {
                             "target"
                         } else if g <= -0.99 {
                             "stop"
@@ -2323,19 +2426,32 @@ fn backtest_swing(rules: bmv_trader::swing::Rules) -> Result<(), String> {
     let trial = stats::Trial {
         when: chrono::Utc::now().to_rfc3339(),
         strategy: rules.name.into(),
-        params: format!(
-            "EMA {:?} stack, {}-day high, volume {}x, RSI > {}, ATR < p{}; stop {}xATR, target {}xATR, {} sessions; max {} open; {}% per side",
-            sw::EMAS,
-            sw::BREAKOUT,
-            sw::VOLUME_RATIO,
-            sw::RSI_MIN,
-            sw::ATR_MAX_PERCENTILE * 100.0,
-            sw::STOP_ATR,
-            sw::TARGET_ATR,
-            sw::MAX_HOLD,
-            sw::MAX_OPEN,
-            sw::COST_PER_SIDE * 100.0
-        ),
+        params: match rules.signal {
+            sw::Source::DeskSignal => format!(
+                "EMA {:?} stack, {}-day high, volume {}x, RSI > {}, ATR < p{}; stop {}xATR, target {}xATR, {} sessions; max {} open; {}% per side",
+                sw::EMAS,
+                sw::BREAKOUT,
+                sw::VOLUME_RATIO,
+                sw::RSI_MIN,
+                sw::ATR_MAX_PERCENTILE * 100.0,
+                sw::STOP_ATR,
+                sw::TARGET_ATR,
+                sw::MAX_HOLD,
+                sw::MAX_OPEN,
+                sw::COST_PER_SIDE * 100.0
+            ),
+            sw::Source::Insider => format!(
+                "Form 4 code P clusters: {}+ owners, ${} in {} sessions, by filing date; ATR >= {}% of close, stocks only; stop {}xATR, no target, {} sessions; max {} open; {}% per side",
+                bmv_trader::insider::MIN_OWNERS,
+                bmv_trader::insider::MIN_DOLLARS,
+                bmv_trader::insider::WINDOW,
+                rules.min_atr_fraction * 100.0,
+                sw::STOP_ATR,
+                rules.max_hold,
+                sw::MAX_OPEN,
+                sw::COST_PER_SIDE * 100.0
+            ),
+        },
         period: period.clone(),
         trades: st.trades.len(),
         expectancy_r: st.expectancy(),
@@ -2366,7 +2482,7 @@ fn backtest_swing(rules: bmv_trader::swing::Rules) -> Result<(), String> {
     let late = st
         .trades
         .iter()
-        .filter(|t| t.out.exit > t.out.entry + sw::MAX_HOLD)
+        .filter(|t| t.out.exit > t.out.entry + rules.max_hold)
         .count();
     println!(
         "{late} trades exited after the time stop (missing bars or delisted); peak gross exposure {:.0}% of equity",
