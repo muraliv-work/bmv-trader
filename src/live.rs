@@ -27,6 +27,8 @@ pub trait Broker {
     fn submit_bracket(&self, b: Bracket) -> Result<(Order, Exits), BracketError>;
     fn submit_oco(&self, x: &Exits, entry: &Order) -> Result<Order, SubmitError>;
     fn cancel_by_client_id(&self, id: &str) -> Result<Cancel, String>;
+    /// By Alpaca's order id: the halt cancels orders that aren't ours too.
+    fn cancel(&self, order_id: &str) -> Result<Cancel, String>;
     fn close_position(&self, symbol: &str) -> Result<(), String>;
     fn close_all(&self) -> Result<(), String>;
     fn positions(&self) -> Result<Vec<Position>, String>;
@@ -49,6 +51,9 @@ impl Broker for Alpaca {
     }
     fn cancel_by_client_id(&self, id: &str) -> Result<Cancel, String> {
         Alpaca::cancel_by_client_id(self, id)
+    }
+    fn cancel(&self, order_id: &str) -> Result<Cancel, String> {
+        Alpaca::cancel(self, order_id)
     }
     fn close_position(&self, symbol: &str) -> Result<(), String> {
         Alpaca::close_position(self, symbol)
@@ -986,6 +991,114 @@ pub fn mismatches(keep: &[Drill], positions: &[Position], orders: &[Order]) -> V
     out
 }
 
+/// The entry orders an operational halt cancels (R13 step 3c): every unfilled order except one
+/// that protects a held position, meaning a sell on a symbol held long or a buy on one held short.
+/// A protecting order stays even when it isn't a stop: cancelling one leg of an OCO or bracket
+/// cancels its stop too. A partly filled order is kept (see `partly_filled`): cancelling a
+/// bracket parent could take its legs, the filled shares' stop, with it.
+pub fn entries<'a>(positions: &[Position], orders: &'a [Order]) -> Vec<&'a Order> {
+    orders
+        .iter()
+        .filter(|o| o.filled_qty == 0 && o.status != "filled")
+        .filter(|o| {
+            !positions.iter().any(|p| {
+                p.symbol == o.symbol
+                    && ((o.side == "sell" && p.qty > 0) || (o.side == "buy" && p.qty < 0))
+            })
+        })
+        .collect()
+}
+
+/// Partly filled orders, which the halt leaves for the owner to check by hand.
+pub fn partly_filled(orders: &[Order]) -> Vec<&Order> {
+    orders
+        .iter()
+        .filter(|o| o.filled_qty > 0 && o.status != "filled")
+        .collect()
+}
+
+/// The operational halt (R13 step 3c, DESIGN §12): engage STOP with `why`, so nothing new is
+/// entered, then cancel every entry order and re-read up to `tries` times, each after a `sleep`,
+/// re-sending the cancel for any still open, until none is. Protective orders and positions are
+/// kept; only the owner clears STOP. Ok says what was cancelled. Err if STOP didn't engage, the
+/// account can't be read, an entry is still open after the last read, or a partly filled order
+/// was left for the owner.
+pub fn halt<B: Broker>(
+    b: &B,
+    stop: &Path,
+    why: &str,
+    tries: u32,
+    sleep: &mut dyn FnMut(),
+) -> Result<String, String> {
+    let (engaged, stop_ok) = match safety::engage(stop, why) {
+        Ok(safety::Engaged::Already) => ("STOP was already engaged".to_string(), true),
+        Ok(safety::Engaged::Now) => ("STOP engaged".to_string(), true),
+        Ok(safety::Engaged::NowWithoutReason(e)) => {
+            (format!("STOP engaged (reason not saved: {e})"), true)
+        }
+        // keep going: cancelling the entries still matters
+        Err(e) => (format!("STOP FAILED: {e}"), false),
+    };
+    // orders first: a buy that fills between the reads then shows its position, so its new stop
+    // is never taken for a naked sell
+    let read = || b.open_orders().and_then(|o| b.positions().map(|p| (p, o)));
+    let (positions, orders) =
+        read().map_err(|e| format!("{engaged}; cancelled nothing: can't read the account: {e}"))?;
+    let mut sent = BTreeSet::new();
+    let mut notes = vec![];
+    let mut left = entries(&positions, &orders);
+    let mut partly: Vec<String> = partly_filled(&orders)
+        .iter()
+        .map(|o| o.client_order_id.clone())
+        .collect();
+    let mut snapshot;
+    for i in 0..=tries {
+        if left.is_empty() {
+            break;
+        }
+        for o in &left {
+            sent.insert(o.client_order_id.clone());
+            match b.cancel(&o.id) {
+                Ok(Cancel::Requested) => {}
+                Ok(other) => notes.push(format!("cancel {}: {other:?}", o.client_order_id)),
+                Err(e) => notes.push(format!("cancel {}: {e}", o.client_order_id)),
+            }
+        }
+        if i == tries {
+            break;
+        }
+        sleep();
+        snapshot = read().map_err(|e| {
+            format!(
+                "{engaged}; sent cancels for {}; can't re-read the account: {e}",
+                sent.len()
+            )
+        })?;
+        let (positions, orders) = &snapshot;
+        partly = partly_filled(orders)
+            .iter()
+            .map(|o| o.client_order_id.clone())
+            .collect();
+        left = entries(positions, orders);
+    }
+    let mut msg = format!("{engaged}; cancelled {} entry order(s)", sent.len());
+    if !notes.is_empty() {
+        notes.dedup();
+        msg += &format!(" ({})", notes.join("; "));
+    }
+    let left: Vec<&str> = left.iter().map(|o| o.client_order_id.as_str()).collect();
+    if !left.is_empty() {
+        msg += &format!("; still open: {}", left.join(", "));
+    }
+    if !partly.is_empty() {
+        msg += &format!("; partly filled, left for you: {}", partly.join(", "));
+    }
+    if stop_ok && left.is_empty() && partly.is_empty() {
+        Ok(msg)
+    } else {
+        Err(msg)
+    }
+}
 /// Every symbol the run would watch must be on the allow-list.
 pub fn check_watchlist(watch: &[String], allowed: &BTreeSet<String>) -> Result<(), String> {
     let off: Vec<&str> = watch
@@ -1496,6 +1609,9 @@ mod tests {
                 Some("notfound") => Ok(Cancel::NotFound),
                 Some(e) => Err(e.into()),
             }
+        }
+        fn cancel(&self, order_id: &str) -> Result<Cancel, String> {
+            self.cancel_by_client_id(order_id)
         }
         fn close_position(&self, symbol: &str) -> Result<(), String> {
             self.call("close", symbol).map_or(Ok(()), Err)
@@ -2508,6 +2624,141 @@ mod tests {
             time_in_force: Some("gtc".into()),
             ..ord(id, "sell", "new", qty, 0, None)
         }
+    }
+
+    /// The halt cancels by Alpaca's id; here it's the client id, so the calls read clearly.
+    fn own(mut o: Order) -> Order {
+        o.id = o.client_order_id.clone();
+        o
+    }
+
+    #[test]
+    fn a_halt_cancels_entries_and_keeps_whatever_protects_a_held_position() {
+        let held = [pos("SPY", 1), pos("TSLA", -2)];
+        let orders = [
+            gtc_stop("drill-stop", 1),
+            on(
+                "SPY",
+                with_legs(ord("oco", "sell", "new", 1, 0, None), vec![]),
+            ),
+            on("SPY", ord("too-big", "sell", "new", 5, 0, None)),
+            on("TSLA", ord("cover", "buy", "new", 2, 0, None)),
+            ord("far-buy", "buy", "new", 1, 0, None),
+            on("AAPL", ord("naked-sell", "sell", "new", 2, 0, None)),
+            on("MSFT", ord("bracket", "buy", "accepted", 3, 0, None)),
+            on("NVDA", ord("stuck", "sell", "pending_cancel", 1, 0, None)),
+            ord("done", "buy", "filled", 1, 1, Some(10_000)),
+            on(
+                "AMD",
+                ord("partly", "buy", "partially_filled", 4, 1, Some(10_000)),
+            ),
+        ];
+        let ids = |v: Vec<&Order>| -> Vec<String> {
+            v.iter().map(|o| o.client_order_id.clone()).collect()
+        };
+        assert_eq!(
+            ids(entries(&held, &orders)),
+            ["far-buy", "naked-sell", "bracket", "stuck"]
+        );
+        assert_eq!(ids(partly_filled(&orders)), ["partly"]);
+        // flat: a sell stop has nothing to protect and would open a short
+        assert_eq!(entries(&[], &orders[..1]).len(), 1);
+    }
+
+    #[test]
+    fn a_halt_engages_stop_then_cancels_until_the_entries_are_gone() {
+        let dir = std::env::temp_dir().join(format!("bmv-halt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stop = dir.join("STOP");
+        let f = Fake::default();
+        f.set_positions(&[("SPY", 1)]);
+        f.open.borrow_mut().push(own(gtc_stop("drill-stop", 1)));
+        f.open
+            .borrow_mut()
+            .push(own(ord("far-buy", "buy", "new", 1, 0, None)));
+        let mut sleeps = 0;
+        let ok = halt(&f, &stop, "reconcile: test", 5, &mut || {
+            sleeps += 1;
+            f.open.borrow_mut().retain(|o| o.side == "sell"); // Alpaca finished the cancel
+        })
+        .unwrap();
+        assert_eq!(ok, "STOP engaged; cancelled 1 entry order(s)");
+        assert_eq!(sleeps, 1);
+        assert_eq!(f.count("cancel far-buy"), 1);
+        assert_eq!(f.count("cancel drill-stop") + f.count("close"), 0);
+        // orders are read before positions, so a fill in between can't make a stop look naked
+        let reads: Vec<String> = f
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("open_orders") || c.starts_with("positions"))
+            .cloned()
+            .collect();
+        assert_eq!(reads[..2], ["open_orders ", "positions "]);
+        assert!(
+            std::fs::read_to_string(&stop)
+                .unwrap()
+                .contains("reconcile: test")
+        );
+
+        // a cancel that never clears is re-sent each pass, then fails; STOP keeps its first reason
+        f.open
+            .borrow_mut()
+            .push(own(ord("stuck", "buy", "pending_cancel", 1, 0, None)));
+        let mut sleeps = 0;
+        let err = halt(&f, &stop, "reconcile: again", 5, &mut || sleeps += 1).unwrap_err();
+        assert!(
+            err.starts_with("STOP was already engaged") && err.ends_with("still open: stuck"),
+            "{err}"
+        );
+        assert_eq!((sleeps, f.count("cancel stuck")), (5, 6));
+        assert!(!std::fs::read_to_string(&stop).unwrap().contains("again"));
+
+        // unreadable: STOP is still engaged, nothing is cancelled
+        std::fs::remove_file(&stop).unwrap();
+        let g = Fake::default();
+        g.script("open_orders", "HTTP 500");
+        let err = halt(&g, &stop, "reconcile: blind", 5, &mut || {}).unwrap_err();
+        assert!(
+            err.contains("cancelled nothing: can't read the account: HTTP 500"),
+            "{err}"
+        );
+        assert!(stop.exists() && g.count("cancel") == 0);
+
+        // a failed cancel is retried on the next pass and then succeeds
+        let h = Fake::default();
+        h.open
+            .borrow_mut()
+            .push(own(ord("b", "buy", "new", 1, 0, None)));
+        h.script("cancel", "HTTP 503");
+        let mut n = 0;
+        let ok = halt(&h, &stop, "x", 5, &mut || {
+            n += 1;
+            if n == 2 {
+                h.open.borrow_mut().clear();
+            }
+        })
+        .unwrap();
+        assert!(
+            ok.contains("cancel b: HTTP 503") && h.count("cancel b") == 2,
+            "{ok}"
+        );
+
+        // a partly filled order is left for the owner, which is an error
+        let k = Fake::default();
+        k.open
+            .borrow_mut()
+            .push(own(ord("p", "buy", "partially_filled", 4, 1, None)));
+        let err = halt(&k, &stop, "x", 5, &mut || {}).unwrap_err();
+        assert!(
+            err.ends_with("partly filled, left for you: p") && k.count("cancel") == 0,
+            "{err}"
+        );
+
+        // STOP that can't be written is an error even when nothing needs cancelling
+        let err = halt(&Fake::default(), &dir.join("no/STOP"), "x", 1, &mut || {}).unwrap_err();
+        assert!(err.starts_with("STOP FAILED"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

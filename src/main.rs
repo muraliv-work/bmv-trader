@@ -15,7 +15,7 @@ const USAGE: &str = "usage:
   bmv-trader run      [--symbols ...] [--trend] [--marketable]   one paper session (PAPER ONLY; live is P5)
   bmv-trader flatten                      close every position and confirm (any mode)
   bmv-trader backstop                     for launchd: near the close, flatten anything left (deploy/)
-  bmv-trader desk-reconcile               for launchd: check the account holds only the drills and their stops (exit 1 on a mismatch)
+  bmv-trader desk-reconcile               for launchd: check the account holds only the drills and their stops; a mismatch halts (STOP, entries cancelled) and exits 1
   bmv-trader desk-ping <check> <program> [args...]   for launchd: run the program, then ping its healthchecks check
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
   bmv-trader universe                     list every US stock, active and delisted (for the scan)
@@ -552,27 +552,64 @@ fn backstop() -> Result<(), String> {
     Ok(())
 }
 
-/// launchd runs this every 15 minutes from 9:00 to 15:45 ET (deploy/, R13 step 3b), through
-/// `desk-ping reconcile`, which pings healthchecks after it. Report only: the halt is step 3c.
-/// It checks whether the market is open or not: positions and GTC stops live at any hour.
-/// A mismatch, a bad drill file or a failed read exits 1, so the ping goes to reconcile/fail.
+/// launchd runs this every 15 minutes from 9:00 to 15:45 ET (deploy/, R13 steps 3b and 3c),
+/// through `desk-ping reconcile`, which pings healthchecks after it. It checks whether the market
+/// is open or not: positions and GTC stops live at any hour. A mismatch, a bad drill file or a
+/// failed read is an operational halt: STOP is engaged, entry orders are cancelled within 5 s and
+/// protective stops are kept (`live::halt`), the desk is told if the link is on, and it exits 1,
+/// so the ping goes to reconcile/fail. Only the owner resumes, with `rm data/STOP`.
 fn desk_reconcile() -> Result<(), String> {
-    let a = connect()?;
+    let home = config::home()?;
     let stamp = chrono::Utc::now().to_rfc3339();
-    let keep = live::drills(&config::home()?)?;
-    let found = live::mismatches(&keep, &a.positions()?, &live::open_orders(&a)?);
-    if !found.is_empty() {
-        return Err(format!(
-            "{stamp} reconcile: {} mismatch(es): {}",
-            found.len(),
-            found.join("; ")
-        ));
-    }
-    println!(
-        "{stamp} reconciled: {} drill(s) and nothing else",
-        keep.len()
-    );
-    Ok(())
+    let a = connect();
+    let checked = a.as_ref().map_err(Clone::clone).and_then(|a| {
+        let keep = live::drills(&home)?;
+        let found = live::mismatches(&keep, &a.positions()?, &live::open_orders(a)?);
+        Ok((keep.len(), found))
+    });
+    let why = match checked {
+        Ok((n, found)) if found.is_empty() => {
+            println!("{stamp} reconciled: {n} drill(s) and nothing else");
+            return Ok(());
+        }
+        Ok((_, found)) => format!("{} mismatch(es): {}", found.len(), found.join("; ")),
+        Err(e) => format!("can't check the account: {e}"),
+    };
+    // broker text goes into STOP, the log and the ping: no control characters, bounded
+    let reason: String = format!("reconcile: {why}")
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .take(2000)
+        .collect();
+    let stop = bmv_trader::safety::stop_path(&home);
+    let started = std::time::Instant::now();
+    let done = match &a {
+        Ok(a) => live::halt(a, &stop, &reason, 5, &mut || {
+            std::thread::sleep(std::time::Duration::from_secs(1))
+        }),
+        Err(e) => match bmv_trader::safety::engage(&stop, &reason) {
+            Ok(bmv_trader::safety::Engaged::NowWithoutReason(r)) => Err(format!(
+                "STOP engaged (reason not saved: {r}); no broker to cancel on: {e}"
+            )),
+            Ok(_) => Err(format!("STOP engaged; no broker to cancel on: {e}")),
+            Err(s) => Err(format!("STOP FAILED: {s}; no broker to cancel on: {e}")),
+        },
+    };
+    let ms = started.elapsed().as_millis();
+    let halt = match done {
+        Ok(m) if ms <= 5000 => format!("halt in {ms} ms: {m}"),
+        Ok(m) => format!("HALT TOO SLOW, {ms} ms (over 5000): {m}"),
+        Err(m) => format!("HALT INCOMPLETE after {ms} ms: {m}"),
+    };
+    let desk = match bmv_trader::desk_link::Link::from_env() {
+        Ok(Some(link)) => match link.report_halt(&reason) {
+            Ok(()) => "; reported to the desk".to_string(),
+            Err(e) => format!("; desk report failed: {e}"),
+        },
+        Ok(None) => String::new(),
+        Err(e) => format!("; desk link: {e}"),
+    };
+    Err(format!("{stamp} {reason}\n{stamp} {halt}{desk}"))
 }
 
 /// The emergency exit, allowed in both modes.

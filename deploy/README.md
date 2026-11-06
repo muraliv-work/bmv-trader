@@ -87,8 +87,8 @@ launchctl bootout gui/$(id -u)/com.bmv-trader.desk; launchctl bootstrap gui/$(id
 `bmv-trader desk-ping reconcile` runs `bmv-trader desk-reconcile` from `target/release` at 8:00–14:45 Mac
 time (9:00–15:45 ET), every day, market open or not (positions and GTC stops live at any hour). It
 checks that the account holds only the drills in `data/drill.json`, each with one working,
-standalone GTC sell stop for its full qty, and no other order. It only reports: nothing is
-cancelled or closed. Then it pings the healthchecks.io check `reconcile`, or `reconcile/fail` on a
+standalone GTC sell stop for its full qty, and no other order. A mismatch, or an account it can't
+read, is an operational halt (step 3c, below). Then it pings the healthchecks.io check `reconcile`, or `reconcile/fail` on a
 mismatch or an error, with the run's output as the ping body, so the email says what was wrong.
 The log is `data/reconcile.log`.
 
@@ -106,6 +106,20 @@ tail -3 data/reconcile.log
 
 Then un-pause the `reconcile` check on healthchecks.io and confirm its page shows that ping: a
 wrong key or slug only shows up as a missed ping.
+
+**The operational halt (R13 step 3c).** On a mismatch the run engages `data/STOP` (reason
+`reconcile: ...`), cancels every unfilled entry order by Alpaca's id, yours too (anything but a sell on a symbol held
+long, or a buy on one held short), and keeps every order that protects a position, so the drill's stop stays. The log and the
+fail email give the halt's time, from the first cancel to the last re-read: `halt in N ms` (at most
+5000), `HALT TOO SLOW` or `HALT INCOMPLETE`. A partly filled order is never cancelled (cancelling a
+bracket parent could take its stop): the halt names it and you deal with it by hand.
+No position is closed. Nothing trades until you check the account and `rm data/STOP`; while the
+mismatch is there, every run halts again. Trial 10's `desk-run` doesn't read STOP, so it goes on.
+
+Halt drill (Level A item 4), with the drill position and its stop open: write the drill entry
+first, place a 1-share limit buy far below the market in the Alpaca paper page, then
+`launchctl kickstart -k gui/$(id -u)/com.bmv-trader.reconcile`. Pass: the log says `halt in` at
+most 5000 ms, the limit buy is gone and the drill stop is still at Alpaca. Then `rm data/STOP`.
 
 # Tier 2: local Ollama through OmniRoute (DECISION A13, S22)
 
