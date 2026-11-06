@@ -66,6 +66,19 @@ target/release/bmv-trader desk-analyse --symbols AAPL --date 2026-11-03
 Install, check and remove work like the backstop above, with `com.bmv-trader.desk.plist`. The log is
 `data/desk/run.log`; `bmv-trader desk-report` shows progress at any time.
 
+**Pinned binary (R13 step 0b, 2026-11-06).** Trial 10 runs a pinned copy, never `target/release`, so
+rebuilds can't change it. `scripts/desk-run.sh` runs it, then pings the healthchecks.io check
+`desk-run` (or `desk-run/fail`) with the Keychain item `bmv-trader` / `HEALTHCHECKS_PING_KEY`:
+
+```sh
+sudo mkdir -p /usr/local/libexec
+sudo cp target/release/bmv-trader /usr/local/libexec/bmv-trial10
+shasum -a 256 /usr/local/libexec/bmv-trial10   # must be ecf992de...0bd7c (docs/REPORT-2026-11.md)
+security add-generic-password -s bmv-trader -a HEALTHCHECKS_PING_KEY -w   # healthchecks.io project ping key
+cp deploy/com.bmv-trader.desk.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.bmv-trader.desk; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmv-trader.desk.plist
+```
+
 # Tier 2: local Ollama through OmniRoute (DECISION A13, S22)
 
 Low-risk notes for you (desk brief, analyst digest, session summary, Sunday digest) come from a
