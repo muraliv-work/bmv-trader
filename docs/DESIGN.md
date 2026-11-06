@@ -804,6 +804,10 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
   - Its dollars are shares × price.
   - Its **day is the filing date,** never the trade date, so nothing is used before it was public.
   - Its ticker is the issuer's trading symbol as filed, trimmed and upper-cased. A purchase whose ticker isn't in the universe is dropped, counted and reported per quarter.
+  - **Price near the market** (amended 2026-11-05, before any run, on the owner's word): the purchase's price per share must be within 0.5× to 2× of the stock's **unadjusted** close on the last session on or before the filing date. That close comes from SIP bars with `adjustment=raw` (`data/daily/sip-raw/`), so a later split can't move it. A purchase with no such bar, or outside the band, is dropped, counted and reported per quarter.
+    - Why: the review before the run found 958 code-`P` rows above $200M, e.g. 3,600,000 shares at $2,724,490. One typo plus any second buyer would fake a cluster.
+    - It uses only a close known at filing time.
+    - It drops the rare real purchase far from the market price, and a filing made long after its trade.
   - The owner is the filing's first reporting owner. A joint filing counts once.
 - **Signal at session s:**
   - Within the 10 sessions ending at s (s included), the ticker has qualifying purchases from **2 or more distinct owners totalling $100,000 or more**.
@@ -842,6 +846,9 @@ Trial 8 failed because its rules had no volatility floor. Cash-like T-bill ETFs 
 - **Known limits:**
   - The quarterly data sets come out about a quarter late, so a live version would read EDGAR's daily filings instead. That's a separate build.
   - A reused ticker can attach a filing to the wrong company.
+  - Tickers filed in other forms ("N/A", "(SIRI)", "NYSE: KRC", "LEN, LEN.B") don't match and are lost. This biases against dual-class and exchange-prefixed issuers.
+  - One purchase reported by an executive and, separately, by their trust or fund counts as 2 owners.
+  - 10% holders, such as funds, count as insiders, as Section 16 defines them.
   - Insiders' own purchase prices aren't our fills.
 - **Congress trades are not in this trial** (DECISION S49). If a source proves good and affordable, they'd be a separately pre-registered trial.
 - **One run, logged once** as `swing insider-cluster`. Any changed number is a new trial.
