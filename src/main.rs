@@ -18,6 +18,7 @@ const USAGE: &str = "usage:
   bmv-trader desk-reconcile               for launchd: check the account holds only the drills and their stops; a mismatch halts (STOP, entries cancelled) and exits 1
   bmv-trader desk-ping <check> <program> [args...]   for launchd: run the program, then ping its healthchecks check
   bmv-trader peak-seed                    ONCE: record today's equity as the desk's first drawdown peak
+  bmv-trader drill-start --check <halt|mismatch|stop-check|dead-man|stop> --minutes N (max 120)   BEFORE a drill: its mismatches and missed runs count as expected
   bmv-trader fetch    --from YYYY-MM-DD --to YYYY-MM-DD [--symbols SPY,QQQ,...] [--allow-gaps]
   bmv-trader universe                     list every US stock, active and delisted (for the scan)
   bmv-trader fetch-daily --from YYYY-MM-DD --to YYYY-MM-DD [--adjusted | --raw-sip]   daily bars for the universe
@@ -71,7 +72,8 @@ const MAX_SEEDS: usize = 50;
 
 /// Flags taking a value, and switches. Anything else is an error, so a typo can't silently
 /// fall back to a default.
-const VALUE_FLAGS: [&str; 15] = [
+const VALUE_FLAGS: [&str; 16] = [
+    "--check",
     "--date",
     "--trial",
     "--strategy",
@@ -211,6 +213,11 @@ fn main() {
             Some("backstop") => backstop(),
             Some("desk-reconcile") => desk_reconcile(),
             Some("peak-seed") => peak_seed(),
+            Some("drill-start") => drill_start(
+                args.get("--check")
+                    .ok_or("drill-start needs --check and --minutes")?,
+                args.num("--minutes", 0, 1..=120)?,
+            ),
             Some("run") => run(&args.symbols()?, args.has("--trend"), orb_params(&args)),
             Some("fetch") => {
                 let (from, to) = args.dates()?;
@@ -250,7 +257,8 @@ fn main() {
             Some("desk-run") => desk_run(),
             Some("desk-report") => {
                 let (home, dir) = (config::home()?, data_dir()?);
-                desk_report(&home, &live_calendar(&dir)?).map(|_| ())
+                desk_report(&home, &live_calendar(&dir)?)?;
+                reconcile_report(&home)
             }
             Some("desk-verdict") => desk_verdict(),
             Some("desk-analyse") => {
@@ -563,14 +571,33 @@ fn backstop() -> Result<(), String> {
 fn desk_reconcile() -> Result<(), String> {
     let home = config::home()?;
     let stamp = chrono::Utc::now().to_rfc3339();
+    use bmv_trader::reconcile::{self, Run};
+    let at = chrono::Utc::now().timestamp();
+    // every run is recorded for the clean-session count (step 3e); a lost record is a failed run
+    let record = |drills, mismatches, halt| {
+        reconcile::append(
+            &reconcile::runs_path(&home),
+            &Run {
+                at,
+                drills,
+                mismatches,
+                halt,
+            },
+        )
+    };
     let a = connect();
     let checked = a.as_ref().map_err(Clone::clone).and_then(|a| {
         let keep = live::drills(&home)?;
         let found = live::mismatches(&keep, &a.positions()?, &live::open_orders(a)?);
         Ok((keep.len(), found))
     });
+    let (drills, found) = match &checked {
+        Ok((n, found)) => (*n, found.clone()),
+        Err(e) => (0, vec![format!("can't check the account: {e}")]),
+    };
     let why = match checked {
         Ok((n, found)) if found.is_empty() => {
+            record(n, vec![], None)?;
             println!("{stamp} reconciled: {n} drill(s) and nothing else");
             return Ok(());
         }
@@ -611,7 +638,84 @@ fn desk_reconcile() -> Result<(), String> {
         Ok(None) => String::new(),
         Err(e) => format!("; desk link: {e}"),
     };
-    Err(format!("{stamp} {reason}\n{stamp} {halt}{desk}"))
+    let kept = match record(drills, found, Some(halt.clone())) {
+        Ok(()) => String::new(),
+        Err(e) => format!("\n{stamp} the run wasn't recorded: {e}"),
+    };
+    Err(format!("{stamp} {reason}\n{stamp} {halt}{desk}{kept}"))
+}
+
+/// Level A's reconciliation lines (R13 step 3e): the clean sessions in a row, the missed runs and
+/// the last run, from data/reconcile/. The NYSE calendar comes from Alpaca (read-only).
+fn reconcile_report(home: &Path) -> Result<(), String> {
+    use bmv_trader::reconcile;
+    let runs: Vec<reconcile::Run> = reconcile::read(&reconcile::runs_path(home))?;
+    let windows: Vec<reconcile::DrillWindow> = reconcile::read(&reconcile::windows_path(home))?;
+    let Some(last) = runs.iter().max_by_key(|r| r.at) else {
+        println!("reconcile: no runs recorded yet (data/reconcile/runs.jsonl)");
+        return Ok(());
+    };
+    let et = |t: i64| {
+        chrono::DateTime::from_timestamp(t, 0)
+            .map(|d| d.with_timezone(&chrono_tz::America::New_York))
+            .ok_or_else(|| format!("bad time {t} in the reconcile record"))
+    };
+    let first = runs.iter().map(|r| r.at).min().unwrap_or(last.at);
+    let (start, end) = (
+        et(first)?.format("%Y-%m-%d").to_string(),
+        et_now().format("%Y-%m-%d").to_string(),
+    );
+    let rows: Vec<bmv_trader::history::CalendarRow> = connect()?.get(
+        broker::Api::Trading,
+        &format!("/v2/calendar?start={start}&end={end}"),
+    )?;
+    let sessions = bmv_trader::history::parse_calendar(&rows)?;
+    let now = chrono::Utc::now().timestamp();
+    let (n, reset) = reconcile::clean_count(&sessions, &runs, &windows, now)?;
+    println!(
+        "reconcile: {n} of {} clean sessions in a row; {} runs since {start}, {} missed, {} drill window(s)",
+        reconcile::SESSIONS_NEEDED,
+        runs.len(),
+        reconcile::missed_runs(&sessions, &runs, &windows, now)?,
+        windows.len()
+    );
+    if let Some(why) = reset {
+        println!("  count last reset by {why}");
+    }
+    println!(
+        "  last run {} ({} min ago): {} drill(s), {}",
+        et(last.at)?.format("%Y-%m-%d %H:%M ET"),
+        (now - last.at) / 60,
+        last.drills,
+        if last.mismatches.is_empty() {
+            "clean".to_string()
+        } else {
+            format!(
+                "{} mismatch(es), {}",
+                last.mismatches.len(),
+                last.halt.as_deref().unwrap_or("no halt")
+            )
+        }
+    );
+    Ok(())
+}
+
+/// Logs a drill window before the owner starts a drill (R13 step 3e, Level A): from now, for
+/// `minutes`. Inside it, reconcile's mismatches and missed runs are "drill, expected" and don't
+/// reset the clean-session count. Code stamps the time, so a window can't start in the past.
+fn drill_start(check: &str, minutes: usize) -> Result<(), String> {
+    use bmv_trader::reconcile;
+    let home = config::home()?;
+    let w = reconcile::window(check, minutes as i64, chrono::Utc::now().timestamp())?;
+    reconcile::append(&reconcile::windows_path(&home), &w)?;
+    println!(
+        "drill window logged: {check} for {minutes} min, now until {}; start the drill now",
+        chrono::DateTime::from_timestamp(w.to, 0).map_or(w.to.to_string(), |d| d
+            .with_timezone(&chrono_tz::America::New_York)
+            .format("%H:%M ET")
+            .to_string())
+    );
+    Ok(())
 }
 
 /// Once, by the owner (R13 step 3d): the desk's first drawdown peak, today's equity. Every paper

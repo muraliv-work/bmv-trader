@@ -103,6 +103,7 @@ name, so it stays until a migration script replaces it.
 | `scripts/desk-wave1.sh` | names a rollout phase, not an action | its commands (`agents`, `tokens`, `budgets`) are in the owner's runbook; rename it when wave 2 changes it |
 | `com.bmv-trader.llm` runs `llm-daily` | the label names the job, the command its action | that's the rule: labels name jobs |
 | Console route `/api/desk` | it serves trial 10's progress, but `desk` now means the Quant Desk | the Overview page reads it; rename when trial 10's view is next changed |
+| `data/reconcile.log` | the reconcile area has a folder, `data/reconcile/`, so the log belongs in it | moving it means reinstalling `com.bmv-trader.reconcile`; move it when that plist next changes |
 | `scripts/*.py` | Rust-first (`.claude/rules/rust-first.md`) | ported when next changed |
 
 ## Adding a name

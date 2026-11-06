@@ -20,6 +20,7 @@ pub mod money;
 pub mod notes;
 pub mod ping;
 pub mod power;
+pub mod reconcile;
 pub mod retro;
 pub mod risk;
 pub mod safety;

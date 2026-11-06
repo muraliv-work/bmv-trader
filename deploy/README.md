@@ -116,8 +116,23 @@ bracket parent could take its stop): the halt names it and you deal with it by h
 No position is closed. Nothing trades until you check the account and `rm data/STOP`; while the
 mismatch is there, every run halts again. Trial 10's `desk-run` doesn't read STOP, so it goes on.
 
-Halt drill (Level A item 4), with the drill position and its stop open: write the drill entry
-first, place a 1-share limit buy far below the market in the Alpaca paper page, then
+**The clean-session count (R13 step 3e).** Every run also appends a line to
+`data/reconcile/runs.jsonl`. `bmv-trader desk-report` shows how many NYSE sessions in a row were
+clean, out of the 10 Level A needs. A session is clean when every 15-minute slot from 9:00 ET to its
+close ran, every run held a drill position, and every mismatch fell inside a drill window you
+logged first. A missed run, an unexplained mismatch, or an empty account sets the count back to 0;
+the session the record started in partway is skipped. If a run's line can't be written, the run
+exits 1 and pings `reconcile/fail` even with nothing to halt.
+
+Before every drill, log its window, which starts now: `target/release/bmv-trader drill-start --check
+<halt|mismatch|stop-check|dead-man|stop> --minutes N` (at most 120). It appends to
+`data/reconcile/drill_windows.jsonl`. A window can't be logged after the drill has started. Windows
+may cover at most 120 minutes of a session, or the session doesn't count, and runs inside a window
+must still hold the drill position, except during the STOP drill, which closes it. Any mismatch in
+a window is excused, whatever its check; a drill's leftovers after the window ends reset the count.
+
+Halt drill (Level A item 4), with the drill position and its stop open: run `drill-start --check halt --minutes 30`
+first, then place a 1-share limit buy far below the market in the Alpaca paper page, then
 `launchctl kickstart -k gui/$(id -u)/com.bmv-trader.reconcile`. Pass: the log says `halt in` at
 most 5000 ms, the limit buy is gone and the drill stop is still at Alpaca. Then `rm data/STOP`.
 
